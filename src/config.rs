@@ -1424,6 +1424,7 @@ pub const SUPPORTED_FEATURE_FLAGS: &[&str] = &[
     // Autofill Team
     "ssh-agent",
     "ssh-agent-v2",
+    "windows-desktop-autotype",
     // Key Management Team
     "ssh-key-vault-item",
     "pm-25373-windows-biometrics-v2",

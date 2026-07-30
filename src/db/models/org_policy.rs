@@ -46,7 +46,11 @@ pub enum OrgPolicyType {
     RemoveUnlockWithPin = 14,
     RestrictedItemTypes = 15,
     UriMatchDefaults = 16,
-    // AutotypeDefaultSetting = 17, // Not supported yet
+    // Purely a client side default, the desktop client reads the enabled flag and pre-selects
+    // autotype for its users. There is nothing to enforce on the server, upstream only added the
+    // enum value as well. The clients hide the policy behind the `windows-desktop-autotype`
+    // feature flag, so it needs to be set via `EXPERIMENTAL_CLIENT_FEATURE_FLAGS` to show up.
+    AutotypeDefaultSetting = 17,
     // AutoConfirm = 18, // Not supported (not implemented yet)
     // BlockClaimedDomainAccountCreation = 19, // Not supported (Not AGPLv3 Licensed)
 }
@@ -364,3 +368,17 @@ impl OrgPolicy {
 
 #[derive(Clone, Debug, AsRef, DieselNewType, From, FromForm, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OrgPolicyId(String);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use num_traits::FromPrimitive;
+
+    // The policy endpoints reject anything `from_i32` does not know, so the number the clients send
+    // has to keep matching the one upstream assigned.
+    #[test]
+    fn autotype_default_setting_policy_is_type_17() {
+        assert_eq!(OrgPolicyType::AutotypeDefaultSetting as i32, 17);
+        assert!(OrgPolicyType::from_i32(17).is_some_and(|p| p == OrgPolicyType::AutotypeDefaultSetting));
+    }
+}
