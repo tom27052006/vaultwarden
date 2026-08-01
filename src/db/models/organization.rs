@@ -494,7 +494,17 @@ impl Membership {
             "resetPasswordEnrolled": self.reset_password_key.is_some(),
             "useResetPassword": CONFIG.mail_enabled(),
             "ssoBound": false, // Not supported
-            "useSso": false, // Not supported
+            // `useSso` stays false: SSO is not configured per organization here, and announcing it
+            // would offer the clients an organization SSO settings page that does not exist.
+            // The two below say how a member of this organization signs in and unlocks, which is
+            // what decides whether device approvals are on the table at all.
+            "useSso": false,
+            "ssoEnabled": CONFIG.sso_enabled(),
+            "ssoMemberDecryptionType": if CONFIG.sso_trusted_device_encryption() {
+                2 // MemberDecryptionType.TrustedDeviceEncryption
+            } else {
+                0 // MemberDecryptionType.MasterPassword
+            },
             "useKeyConnector": false,
             "useSecretsManager": false, // Not supported (Not AGPLv3 Licensed)
             "usePasswordManager": true,
