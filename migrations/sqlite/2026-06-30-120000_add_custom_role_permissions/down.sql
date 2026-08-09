@@ -17,33 +17,42 @@ WHERE NOT EXISTS (
 );
 DROP TABLE __vw_custom_role_downgrade_guard;
 
--- Present on every database that ran the rewritten up migration; created empty for a ledger that
--- recorded an earlier revision of it. Empty means "no membership is on record as a legacy Manager",
--- which the mapping below resolves in the safe direction.
-CREATE TABLE IF NOT EXISTS __vw_custom_role_legacy_manager (
+-- Convert Custom members back to a role the older server can load -- it cannot represent type 4 and
+-- masquerades Manager as Custom in API responses. Which role each one gets is a decision about its
+-- authority *now*, and it is not symmetric with the upgrade.
+--
+-- Deliberately not driven by `__vw_custom_role_legacy_manager`. That records who held the Manager
+-- role before the *first* upgrade and is never updated afterwards, so a member whose Manager powers
+-- an owner has since reduced -- or who was demoted to User and later re-created as a limited Custom
+-- member -- would be handed the whole legacy role back. Historical provenance is evidence, not
+-- authorization. Use a list written for this downgrade instead.
+--
+-- Absent, or empty, means "nobody", and everything below becomes a plain User. That is the safe
+-- direction: the legacy Manager role is not a subset of what a Custom member holds -- it manages, and
+-- deletes, every collection reachable through `users_collections.manage`,
+-- `collections_groups.manage` or `groups.access_all`, and reads member and collection ACL details
+-- through `ManagerHeadersLoose`, none of which needs a permission flag in the old schema. To keep the
+-- historical mapping, copy it over deliberately before reverting:
+--
+--     CREATE TABLE __vw_rollback_manager_allowlist (users_organizations_uuid TEXT NOT NULL PRIMARY KEY);
+--     INSERT INTO __vw_rollback_manager_allowlist (users_organizations_uuid)
+--     SELECT users_organizations_uuid FROM __vw_custom_role_legacy_manager;
+CREATE TABLE IF NOT EXISTS __vw_rollback_manager_allowlist (
     users_organizations_uuid TEXT NOT NULL PRIMARY KEY
 );
 
--- Convert Custom members back to a role the older server can load -- it cannot represent type 4 and
--- masquerades Manager as Custom in API responses. Which role depends on where the membership came
--- from, because the two directions are not symmetric.
---
--- A membership recorded as a legacy Manager becomes Manager again: that is exactly the role it held
--- before the upgrade, so the round trip preserves its authority.
 UPDATE users_organizations SET atype = 3
 WHERE atype = 4
-  AND uuid IN (SELECT users_organizations_uuid FROM __vw_custom_role_legacy_manager);
+  AND uuid IN (SELECT users_organizations_uuid FROM __vw_rollback_manager_allowlist);
 
--- Every other Custom member was created *after* the upgrade and never was a Manager. The legacy
--- Manager role is not a subset of what a Custom member holds: it manages -- and deletes -- every
--- collection reachable through `users_collections.manage`, `collections_groups.manage` or
--- `groups.access_all`, and reads member and collection ACL details through `ManagerHeadersLoose`,
--- none of which requires a permission flag in the old schema. Mapping such a member to Manager would
--- therefore *grant* authority during a downgrade, including collection deletion to a member whose
--- `delete_any_collection` is FALSE. Map to plain User instead: `users_collections` and
--- `collections_groups` are untouched, so the member keeps every per-collection grant and loses only
--- the organization-wide powers the old schema cannot express.
-UPDATE users_organizations SET atype = 2 WHERE atype = 4;
+-- Everything still on the Custom role becomes a plain User, and `access_all` has to be cleared with
+-- it. 2026-07-16-120000/down.sql sets that flag for every Custom member holding all three collection
+-- permissions, on the assumption they are about to become a Manager; left behind on a User it
+-- produces `User + access_all`, the one legacy state the upgrade refuses outright -- which would
+-- leave the database unable to move forward again. `users_collections` and `collections_groups` are
+-- untouched, so these members keep every per-collection grant and lose only the organization-wide
+-- powers the old schema cannot express.
+UPDATE users_organizations SET atype = 2, access_all = FALSE WHERE atype = 4;
 
 ALTER TABLE users_organizations DROP COLUMN manage_users;
 ALTER TABLE users_organizations DROP COLUMN manage_groups;
@@ -51,6 +60,9 @@ ALTER TABLE users_organizations DROP COLUMN manage_policies;
 
 -- Oldest lossy step of the chain: nothing below this can lose Custom-role data any more, so the
 -- acknowledgement is consumed here. It authorized *this* downgrade, not every future one. The
--- legacy-Manager record has served its purpose too -- the roles it describes are back.
+-- Custom-role bookkeeping goes with it -- the roles it describes are back, and a later re-upgrade
+-- rebuilds all of it from the restored `atype = 3` rows.
 DROP TABLE IF EXISTS __vw_allow_custom_role_downgrade;
+DROP TABLE IF EXISTS __vw_rollback_manager_allowlist;
 DROP TABLE IF EXISTS __vw_custom_role_legacy_manager;
+DROP TABLE IF EXISTS __vw_custom_role_history_verified;

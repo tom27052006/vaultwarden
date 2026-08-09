@@ -17,38 +17,47 @@
 -- members -- turning Create-only into Create+Edit+Delete, Edit-only into Edit+Delete, and a flagless
 -- Custom into Edit+Delete, the last of which also implies `has_full_access()`.
 --
+-- What this materialization *means* -- a group-bound capability becoming a permanent membership
+-- permission -- is confirmed by an owner in 2026-08-10-120000, which runs immediately after it.
+--
 -- Idempotent: on a database that ran the rewritten 2026-07-23-120000 every affected row already
 -- holds these values. It only reads `groups` / `groups_users` and the record table and writes the two
 -- permission columns, so it is also safe after `access_all` has been dropped.
 --
 -- Deliberately not `create_new_collections`: collection creation historically required
 -- membership-level `access_all`.
-
--- Present on every database that ran the rewritten 2026-06-30-120000. Created empty here for the one
--- history that cannot have it: a ledger carrying 20260630120000 from an *earlier* revision of that
--- file, which is exactly the case the guard below refuses to guess about.
-CREATE TABLE IF NOT EXISTS __vw_custom_role_legacy_manager (
-    users_organizations_uuid CHAR(36) NOT NULL PRIMARY KEY
-);
-
--- Fail closed on a database whose legacy provenance was never recorded.
---
--- If a Custom member sits in an organization-local `access_all` group but is not on record as a
--- legacy Manager, one of two things is true and this file cannot tell them apart: either the
--- membership really is a converted legacy Manager whose record was never written (a ledger from an
--- earlier revision of this feature branch), or it is an ordinary modern Custom member who must not
--- gain anything. Granting is a silent privilege escalation; skipping silently drops a real
--- capability. So stop, and let an owner decide -- the exception below lists what to review.
---
--- The acknowledgement only lifts this stop; it never grants anything by itself. The update further
--- down is always driven by the record table, so an unrecorded membership keeps exactly the
--- permissions it has. The table is dropped at the end of this file, so one decision covers one
--- upgrade.
 DO $$
 DECLARE
     undecidable int := 0;
 BEGIN
-    IF to_regclass('__vw_ack_legacy_group_collection_authority') IS NULL THEN
+    -- The legacy-Manager record has to exist already; see 2026-07-23-120000 for why this refuses
+    -- rather than creating it.
+    IF to_regclass('__vw_custom_role_legacy_manager') IS NULL THEN
+        RAISE EXCEPTION
+            'Upgrade refused, nothing was changed: __vw_custom_role_legacy_manager does not exist, '
+            'so which memberships were legacy Managers before the upgrade is unknown. Start '
+            'Vaultwarden once to get the full recovery instructions, or see '
+            'tools/custom_role_rollback/README.md.';
+    END IF;
+
+    -- Fail closed on a database whose legacy provenance was never recorded.
+    --
+    -- If a Custom member sits in an organization-local `access_all` group but is not on record as a
+    -- legacy Manager, one of two things is true and this file cannot tell them apart: either the
+    -- membership really is a converted legacy Manager whose record was never written (a ledger from
+    -- an earlier revision of this feature branch), or it is an ordinary modern Custom member who must
+    -- not gain anything. Granting is a silent privilege escalation; skipping silently drops a real
+    -- capability.
+    --
+    -- `__vw_custom_role_history_verified` settles it: 2026-06-30-120000 creates it, and an operator
+    -- creates it after auditing an older history, so its presence means the unrecorded memberships
+    -- are unrecorded *on purpose*. Its absence means nobody has looked, and this stops. The startup
+    -- preflight refuses that state before any migration runs; this is the backstop for a bare
+    -- migration runner.
+    --
+    -- The marker never grants anything by itself: the update below is always driven by the record
+    -- table, so an unrecorded membership keeps exactly the permissions it has.
+    IF to_regclass('__vw_custom_role_history_verified') IS NULL THEN
         SELECT count(*) INTO undecidable
         FROM users_organizations uo
         WHERE uo.atype = 4
@@ -66,17 +75,15 @@ BEGIN
     IF undecidable <> 0 THEN
         RAISE EXCEPTION
             'Upgrade refused, nothing was changed: % Custom membership(s) belong to an access_all '
-            'group but are not on record as legacy Managers, so this migration cannot tell a '
-            'converted legacy Manager from an ordinary Custom member. Review them with: SELECT '
-            'uo.uuid, uo.org_uuid, uo.status, uo.create_new_collections, uo.edit_any_collection, '
-            'uo.delete_any_collection FROM users_organizations uo JOIN groups_users gu ON '
-            'gu.users_organizations_uuid = uo.uuid JOIN "groups" g ON g.uuid = gu.groups_uuid AND '
-            'g.organizations_uuid = uo.org_uuid WHERE uo.atype = 4 AND g.access_all AND uo.uuid NOT '
-            'IN (SELECT users_organizations_uuid FROM __vw_custom_role_legacy_manager); record each '
-            'one that really was a Manager before the upgrade with INSERT INTO '
-            '__vw_custom_role_legacy_manager (users_organizations_uuid) VALUES (...); then, with '
-            'every Vaultwarden instance stopped, acknowledge once with CREATE TABLE '
-            '__vw_ack_legacy_group_collection_authority (acknowledged INTEGER NOT NULL PRIMARY KEY);',
+            'group but are not on record as legacy Managers, and this database''s Custom-role '
+            'history has never been audited, so a converted legacy Manager cannot be told from an '
+            'ordinary Custom member. Review them with: SELECT uo.uuid, uo.org_uuid, uo.status, '
+            'uo.create_new_collections, uo.edit_any_collection, uo.delete_any_collection FROM '
+            'users_organizations uo JOIN groups_users gu ON gu.users_organizations_uuid = uo.uuid '
+            'JOIN "groups" g ON g.uuid = gu.groups_uuid AND g.organizations_uuid = uo.org_uuid '
+            'WHERE uo.atype = 4 AND g.access_all AND uo.uuid NOT IN (SELECT '
+            'users_organizations_uuid FROM __vw_custom_role_legacy_manager); Start Vaultwarden once '
+            'for the full recovery instructions.',
             undecidable;
     END IF;
 END $$;
@@ -94,6 +101,3 @@ WHERE atype = 4
       AND g.organizations_uuid = users_organizations.org_uuid
       AND g.access_all = TRUE
   );
-
--- Consume the acknowledgement, so consent is never inherited by a later upgrade.
-DROP TABLE IF EXISTS __vw_ack_legacy_group_collection_authority;

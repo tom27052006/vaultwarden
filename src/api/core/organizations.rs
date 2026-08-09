@@ -1427,9 +1427,14 @@ async fn send_invite(
         }
     }
 
-    let mut user_created: bool = false;
     for email in &data.emails {
         let mut member_status = MembershipStatus::Invited as i32;
+        // Scoped to this iteration on purpose. A single flag hoisted out of the loop stays `true`
+        // for every later recipient once any account has been created, so a failing invite mail to
+        // an address that already had an account would delete that *existing* global user -- their
+        // personal ciphers, devices, 2FA, emergency access and memberships in unrelated
+        // organizations -- instead of only the membership this request just made.
+        let mut user_created: bool = false;
         let user = match User::find_by_mail(email, &conn).await {
             None => {
                 if !CONFIG.invitations_allowed() {

@@ -23,14 +23,27 @@ WHERE atype = 2
 LIMIT 1;
 DROP TABLE __vw_legacy_user_access_all_guard;
 
--- A database that reaches this file with memberships still at `atype = 3` never ran the rewritten
--- 2026-06-30-120000 -- for instance because a runner applied the files out of order, or because its
--- ledger recorded an earlier revision of that file. Those rows are unambiguously legacy Managers
--- *right now*, so record them before the conversion at the end of this file makes them
--- indistinguishable from modern Custom members. Idempotent, and a no-op on the normal path.
-CREATE TABLE IF NOT EXISTS __vw_custom_role_legacy_manager (
-    users_organizations_uuid CHAR(36) NOT NULL PRIMARY KEY
+-- The legacy-Manager record has to exist already: 2026-06-30-120000 writes it, and the startup
+-- preflight refuses a database whose ledger carries that version without it. Creating it here would
+-- manufacture an empty, apparently valid history for precisely the databases that need an operator
+-- to look at them, so refuse instead -- this guard exists for a bare migration runner that never
+-- consulted the preflight.
+--
+-- The duplicate key aborts the migration. It is only inserted while the record table is absent.
+CREATE TEMPORARY TABLE __vw_legacy_manager_record_guard (
+    blocked INTEGER NOT NULL PRIMARY KEY
 );
+INSERT INTO __vw_legacy_manager_record_guard (blocked) VALUES (1);
+INSERT INTO __vw_legacy_manager_record_guard (blocked)
+SELECT 1
+WHERE to_regclass('__vw_custom_role_legacy_manager') IS NULL;
+DROP TABLE __vw_legacy_manager_record_guard;
+
+-- A database that reaches this file with memberships still at `atype = 3` never ran the rewritten
+-- 2026-06-30-120000 -- for instance because a runner applied the files out of order. Those rows are
+-- unambiguously legacy Managers *right now*, so record them before the conversion at the end of this
+-- file makes them indistinguishable from modern Custom members. Idempotent, and a no-op on the
+-- normal path.
 INSERT INTO __vw_custom_role_legacy_manager (users_organizations_uuid)
 SELECT uuid FROM users_organizations WHERE atype = 3
 ON CONFLICT DO NOTHING;

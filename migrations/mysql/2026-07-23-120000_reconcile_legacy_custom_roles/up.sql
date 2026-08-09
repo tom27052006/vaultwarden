@@ -23,18 +23,31 @@ WHERE atype = 2
 LIMIT 1;
 DROP TEMPORARY TABLE __vw_legacy_user_access_all_guard;
 
--- A database that reaches this file with memberships still at `atype = 3` never ran the rewritten
--- 2026-06-30-120000 -- for instance because a runner applied the files out of order, or because its
--- ledger recorded an earlier revision of that file. Those rows are unambiguously legacy Managers
--- *right now*, so record them before the conversion at the end of this file makes them
--- indistinguishable from modern Custom members. Idempotent, and a no-op on the normal path.
+-- The legacy-Manager record has to exist already: 2026-06-30-120000 writes it, and the startup
+-- preflight refuses a database whose ledger carries that version without it. Creating it here would
+-- manufacture an empty, apparently valid history for precisely the databases that need an operator
+-- to look at them, so refuse instead -- this guard exists for a bare migration runner that never
+-- consulted the preflight. Refusing also keeps this file free of DDL, which on MySQL/MariaDB would
+-- commit implicitly and break this migration out of its transaction.
 --
--- This CREATE implicitly commits on MySQL/MariaDB, but it is the first statement of the migration:
--- the only transaction it can end is the empty one Diesel just opened, and every permission update
--- below still commits together with the ledger insert.
-CREATE TABLE IF NOT EXISTS __vw_custom_role_legacy_manager (
-    users_organizations_uuid CHAR(36) NOT NULL PRIMARY KEY
+-- The duplicate key aborts the migration. It is only inserted while the record table is absent.
+CREATE TEMPORARY TABLE __vw_legacy_manager_record_guard (
+    blocked INTEGER NOT NULL PRIMARY KEY
 );
+INSERT INTO __vw_legacy_manager_record_guard (blocked) VALUES (1);
+INSERT INTO __vw_legacy_manager_record_guard (blocked)
+SELECT 1 FROM DUAL
+WHERE NOT EXISTS (
+    SELECT 1 FROM information_schema.tables
+    WHERE table_schema = DATABASE() AND table_name = '__vw_custom_role_legacy_manager'
+);
+DROP TEMPORARY TABLE __vw_legacy_manager_record_guard;
+
+-- A database that reaches this file with memberships still at `atype = 3` never ran the rewritten
+-- 2026-06-30-120000 -- for instance because a runner applied the files out of order. Those rows are
+-- unambiguously legacy Managers *right now*, so record them before the conversion at the end of this
+-- file makes them indistinguishable from modern Custom members. Idempotent, and a no-op on the
+-- normal path.
 INSERT IGNORE INTO __vw_custom_role_legacy_manager (users_organizations_uuid)
 SELECT uuid FROM users_organizations WHERE atype = 3;
 

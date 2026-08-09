@@ -81,7 +81,7 @@ WHERE c.n <> 9;
 
 -- 3) All eight Custom-role migrations have to be recorded.
 SELECT CONCAT(
-    'REFUSED, nothing was changed: expected all eight Custom-role migrations in ',
+    'REFUSED, nothing was changed: expected all nine Custom-role migrations in ',
     '__diesel_schema_migrations, found ', c.n, '. Schema and ledger disagree, so restore the backup ',
     'taken before the upgrade and start over.'
 ) AS rollback_precondition_failure
@@ -96,10 +96,11 @@ FROM (
         '20260724120000',
         '20260724130000',
         '20260724140000',
-        '20260809120000'
+        '20260809120000',
+        '20260810120000'
     )
 ) AS c
-WHERE c.n <> 8;
+WHERE c.n <> 9;
 INSERT INTO __vw_rollback_precondition (ok)
 SELECT 1
 FROM (
@@ -113,13 +114,14 @@ FROM (
         '20260724120000',
         '20260724130000',
         '20260724140000',
-        '20260809120000'
+        '20260809120000',
+        '20260810120000'
     )
 ) AS c
-WHERE c.n <> 8;
+WHERE c.n <> 9;
 
 -- 4) No migration newer than the Custom-role change may be recorded: this script does not know what
---    such a migration changed, and removing only the eight versions below would leave the ledger
+--    such a migration changed, and removing only the nine versions below would leave the ledger
 --    claiming a migration whose schema objects this script may have undone.
 SELECT CONCAT(
     'REFUSED, nothing was changed: ', c.n, ' migration(s) newer than the Custom-role change are ',
@@ -128,7 +130,7 @@ SELECT CONCAT(
 FROM (
     SELECT COUNT(*) AS n
     FROM __diesel_schema_migrations
-    WHERE version > '20260809120000'
+    WHERE version > '20260810120000'
 ) AS c
 WHERE c.n <> 0;
 INSERT INTO __vw_rollback_precondition (ok)
@@ -136,23 +138,23 @@ SELECT 1
 FROM (
     SELECT COUNT(*) AS n
     FROM __diesel_schema_migrations
-    WHERE version > '20260809120000'
+    WHERE version > '20260810120000'
 ) AS c
 WHERE c.n <> 0;
 
--- 5) The legacy-Manager record written by 2026-06-30-120000 has to exist. Without it, which
---    memberships were Managers before the upgrade is unknown; mapping every Custom member to plain
---    User would be safe but would demote people who were Managers all along.
+-- 5) The upgrade records that this database's Custom-role history is accounted for. Without that
+--    marker the database was migrated by an earlier revision of the change, whose migrations had
+--    different effects.
 SELECT CONCAT(
-    'REFUSED, nothing was changed: __vw_custom_role_legacy_manager does not exist, so which ',
-    'memberships were legacy Managers before the upgrade is unknown. See README.md, section ',
-    '"Databases upgraded before the legacy-Manager record existed".'
+    'REFUSED, nothing was changed: __vw_custom_role_history_verified does not exist, so this ',
+    'database was migrated by an earlier revision of the Custom-role change. Start Vaultwarden once ',
+    'and follow the recovery it prints before rolling back.'
 ) AS rollback_precondition_failure
 FROM (
     SELECT COUNT(*) AS n
     FROM information_schema.tables
     WHERE table_schema = DATABASE()
-      AND table_name = '__vw_custom_role_legacy_manager'
+      AND table_name = '__vw_custom_role_history_verified'
 ) AS c
 WHERE c.n <> 1;
 INSERT INTO __vw_rollback_precondition (ok)
@@ -161,9 +163,69 @@ FROM (
     SELECT COUNT(*) AS n
     FROM information_schema.tables
     WHERE table_schema = DATABASE()
-      AND table_name = '__vw_custom_role_legacy_manager'
+      AND table_name = '__vw_custom_role_history_verified'
 ) AS c
 WHERE c.n <> 1;
+
+-- 6) Which memberships come back as legacy Manager has to be decided for *this* rollback. An empty
+--    list is a valid answer and maps every Custom member to plain User.
+SELECT CONCAT(
+    'REFUSED, nothing was changed: __vw_rollback_manager_allowlist does not exist. See README.md, ',
+    'section "Choosing which members come back as Manager".'
+) AS rollback_precondition_failure
+FROM (
+    SELECT COUNT(*) AS n
+    FROM information_schema.tables
+    WHERE table_schema = DATABASE()
+      AND table_name = '__vw_rollback_manager_allowlist'
+) AS c
+WHERE c.n <> 1;
+INSERT INTO __vw_rollback_precondition (ok)
+SELECT 1
+FROM (
+    SELECT COUNT(*) AS n
+    FROM information_schema.tables
+    WHERE table_schema = DATABASE()
+      AND table_name = '__vw_rollback_manager_allowlist'
+) AS c
+WHERE c.n <> 1;
+
+-- 7) ...and it has to have the shape the role mapping reads. Existence alone is not enough: a
+--    hand-written or colliding table without a usable `users_organizations_uuid` column would pass
+--    every check above and then fail on the first SELECT against it -- which happens *after* the
+--    `ADD COLUMN` below has already committed implicitly, leaving a half-converted database.
+--    Require exactly one non-nullable, uniquely indexed column of that name.
+SELECT CONCAT(
+    'REFUSED, nothing was changed: __vw_rollback_manager_allowlist must have exactly one column ',
+    'named users_organizations_uuid, NOT NULL and uniquely indexed. Create it as documented in ',
+    'README.md.'
+) AS rollback_precondition_failure
+FROM (
+    SELECT
+        (SELECT COUNT(*) FROM information_schema.columns
+          WHERE table_schema = DATABASE() AND table_name = '__vw_rollback_manager_allowlist') AS cols,
+        (SELECT COUNT(*) FROM information_schema.columns
+          WHERE table_schema = DATABASE() AND table_name = '__vw_rollback_manager_allowlist'
+            AND column_name = 'users_organizations_uuid' AND is_nullable = 'NO') AS usable,
+        (SELECT COUNT(*) FROM information_schema.statistics
+          WHERE table_schema = DATABASE() AND table_name = '__vw_rollback_manager_allowlist'
+            AND column_name = 'users_organizations_uuid' AND non_unique = 0) AS uniq
+) AS c
+WHERE c.cols <> 1 OR c.usable <> 1 OR c.uniq < 1;
+INSERT INTO __vw_rollback_precondition (ok)
+SELECT 1
+FROM (
+    SELECT
+        (SELECT COUNT(*) FROM information_schema.columns
+          WHERE table_schema = DATABASE() AND table_name = '__vw_rollback_manager_allowlist') AS cols,
+        (SELECT COUNT(*) FROM information_schema.columns
+          WHERE table_schema = DATABASE() AND table_name = '__vw_rollback_manager_allowlist'
+            AND column_name = 'users_organizations_uuid' AND is_nullable = 'NO') AS usable,
+        (SELECT COUNT(*) FROM information_schema.statistics
+          WHERE table_schema = DATABASE() AND table_name = '__vw_rollback_manager_allowlist'
+            AND column_name = 'users_organizations_uuid' AND non_unique = 0) AS uniq
+) AS c
+WHERE c.cols <> 1 OR c.usable <> 1 OR c.uniq < 1;
 
 -- `DROP TEMPORARY TABLE`, not `DROP TABLE`: the latter is one more statement that commits implicitly,
 -- and it would happily drop a permanent table of the same name.
@@ -175,25 +237,27 @@ DROP TEMPORARY TABLE __vw_rollback_precondition;
 
 ALTER TABLE users_organizations ADD COLUMN access_all BOOLEAN NOT NULL DEFAULT FALSE;
 
--- The role mapping is asymmetric on purpose. A membership recorded as a legacy Manager becomes
--- Manager again -- that is the role it held before the upgrade, so the round trip preserves its
--- authority. Every other Custom member was created *after* the upgrade and never was a Manager, and
--- the old Manager role is not a subset of what such a member holds: it manages -- and deletes --
--- every collection reachable through `users_collections.manage`, `collections_groups.manage` or
--- `groups.access_all`, and reads member and collection ACL details through `ManagerHeadersLoose`,
--- none of which requires a permission flag in the old schema. Mapping those to Manager would *grant*
--- authority during a downgrade, so they become plain User. Per-collection assignments are untouched,
--- so they keep every grant those carry.
+-- Only a membership on the allowlist comes back as Manager. The legacy Manager role is not a subset
+-- of what a Custom member holds -- it manages, and deletes, every collection reachable through
+-- `users_collections.manage`, `collections_groups.manage` or `groups.access_all`, and reads member
+-- and collection ACL details through `ManagerHeadersLoose`, none of which needs a permission flag in
+-- the old schema -- so handing it out on anything less than a current, deliberate decision would
+-- *grant* authority during a downgrade. `__vw_custom_role_legacy_manager` is not that decision: it
+-- records who was a Manager before the first upgrade and is never updated afterwards, so a member
+-- whose powers an owner has since reduced would get all of them back.
+--
+-- Everything else becomes a plain User and keeps its per-collection assignments.
 --
 -- `access_all` follows the same mapping the down migrations use: everyone who reached every
 -- collection keeps that reach, and a Custom member has to hold all three collection permissions --
 -- Edit-only must not silently turn into the legacy "manage all collections" authority, which in that
--- older schema also carried collection deletion.
+-- older schema also carried collection deletion. A member mapped to plain User never keeps it:
+-- `User + access_all` is the one legacy state the upgrade refuses.
 UPDATE users_organizations SET access_all = TRUE WHERE atype IN (0, 1);
 UPDATE users_organizations
 SET access_all = TRUE
 WHERE atype = 4
-  AND uuid IN (SELECT users_organizations_uuid FROM __vw_custom_role_legacy_manager)
+  AND uuid IN (SELECT users_organizations_uuid FROM __vw_rollback_manager_allowlist)
   AND create_new_collections = TRUE
   AND edit_any_collection = TRUE
   AND delete_any_collection = TRUE;
@@ -201,8 +265,8 @@ WHERE atype = 4
 -- The old server cannot load type 4.
 UPDATE users_organizations SET atype = 3
 WHERE atype = 4
-  AND uuid IN (SELECT users_organizations_uuid FROM __vw_custom_role_legacy_manager);
-UPDATE users_organizations SET atype = 2 WHERE atype = 4;
+  AND uuid IN (SELECT users_organizations_uuid FROM __vw_rollback_manager_allowlist);
+UPDATE users_organizations SET atype = 2, access_all = FALSE WHERE atype = 4;
 
 -- One ALTER, not nine. Every `ALTER TABLE` commits implicitly here, so nine statements mean eight
 -- intermediate states an interruption could leave behind; one statement is the closest this backend
@@ -223,8 +287,11 @@ ALTER TABLE users_organizations
 -- converges.
 DROP TABLE IF EXISTS __vw_custom_role_same_run_0716;
 DROP TABLE IF EXISTS __vw_allow_custom_role_downgrade;
-DROP TABLE IF EXISTS __vw_ack_legacy_group_collection_authority;
+DROP TABLE IF EXISTS __vw_allow_unresumable_mysql_downgrade;
+DROP TABLE IF EXISTS __vw_ack_permanent_collection_authority;
+DROP TABLE IF EXISTS __vw_rollback_manager_allowlist;
 DROP TABLE IF EXISTS __vw_custom_role_legacy_manager;
+DROP TABLE IF EXISTS __vw_custom_role_history_verified;
 
 -- Finally forget the eight migrations, so the older binary does not see a ledger from the future
 -- and a later upgrade applies them again from a clean state.
@@ -237,13 +304,14 @@ WHERE version IN (
   '20260724120000',
   '20260724130000',
   '20260724140000',
-  '20260809120000'
+  '20260809120000',
+  '20260810120000'
 );
 
 -- Every statement above except this DELETE is DDL and was therefore committed implicitly the moment
 -- it ran. The DELETE is plain DML: under `autocommit = 0` -- which `mysql --init-command`, a my.cnf
 -- default, or a connection pool can all set -- it would be rolled back on disconnect, leaving the
--- schema rolled back but all eight migrations still marked as applied. A later upgrade would then
+-- schema rolled back but all nine migrations still marked as applied. A later upgrade would then
 -- skip them and start new code against the old schema. Commit it explicitly; harmless when
 -- autocommit is already on.
 COMMIT;

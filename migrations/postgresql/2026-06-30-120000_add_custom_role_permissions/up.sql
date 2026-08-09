@@ -19,6 +19,17 @@ INSERT INTO __vw_custom_role_legacy_manager (users_organizations_uuid)
 SELECT uuid FROM users_organizations WHERE atype = 3
 ON CONFLICT DO NOTHING;
 
+-- Separately, mark that this database's Custom-role history is accounted for -- it was produced by
+-- the migrations that ship today. Nothing else creates this table, which is what lets the startup
+-- preflight treat its absence as proof that an earlier revision of this chain ran instead.
+--
+-- Deliberately not the record table above: that one holds data an operator has to be able to write
+-- during recovery, so its existence cannot also stand for "the history behind this data was
+-- reviewed" -- creating it empty to silence an error would otherwise pass as the audit it asks for.
+CREATE TABLE IF NOT EXISTS __vw_custom_role_history_verified (
+    verified INTEGER NOT NULL PRIMARY KEY
+);
+
 -- Previously the server stored members created with the Custom role as Manager (3) and
 -- masqueraded them as Custom (4) in all API responses. Now that Custom is a real, persisted
 -- type, convert those members so clients (which no longer know the Manager role) keep
