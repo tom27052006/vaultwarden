@@ -569,15 +569,14 @@ async fn post_organization_collections(
     let collection = Collection::new(org_id.clone(), data.name, data.external_id);
     collection.save(&conn).await?;
 
-    // Security (F-3): a `manage` grant carries collection *delete*/administer authority
-    // (`has_explicit_collection_manage_access` -> CollectionDeleteHeaders/ManagerHeaders), so only a
-    // caller who could delete this collection may confer it — the same rule the collection-update and
-    // bulk-access endpoints apply. Create is deliberately independent from Edit/Delete, so a Custom
-    // member holding only `create_new_collections` must not be able to hand a manage row to another
-    // member or to a group while creating the collection. For such callers the requested `manage`
-    // is forced to false; Admin/Owner and Custom-with-`delete_any_collection` keep it. The creator's
-    // own object-scoped ownership is added separately below. Evaluated after the collection exists
-    // so the per-collection lookup sees it.
+    // Security (F-3): a `manage` grant carries collection administration authority
+    // (`has_explicit_collection_manage_access` -> ManagerHeaders), so only a caller who may already
+    // administer this collection may confer it — the same rule the collection-update and bulk-access
+    // endpoints apply. Create is deliberately independent from Edit/Delete, so a Custom member
+    // holding only `create_new_collections` must not be able to hand a manage row to another member
+    // or to a group while creating the collection. For such callers the requested `manage` is forced
+    // to false. The creator's own object-scoped ownership is added separately below. Evaluated after
+    // the collection exists so the per-collection lookup sees it.
     let may_grant_manage = caller_may_grant_collection_manage(&headers.membership, &collection.uuid, &conn).await;
     let creator_needs_assignment = !headers.membership.has_full_access();
 
@@ -1958,6 +1957,16 @@ async fn edit_member(
     // confirm, revoke, restore, delete). Without it `edit_member` was the only path on which a
     // Custom member holding manage_users could aim at an Admin or at a fellow Custom membership, as
     // long as the request left the role unchanged.
+    //
+    // NOTE: this is a deliberate, documented narrowing of upstream. Bitwarden lets Custom+ManageUsers
+    // administer *peer Custom* members too, and delegate a subset of the permissions the actor holds
+    // itself (`OrganizationUserValidationService`). Implementing that would put permission delegation
+    // -- the one operation that can raise another member's authority -- into the hands of a
+    // non-Admin, and correctness would then rest on a subset comparison being right on every path.
+    // Vaultwarden keeps role and permission changes with Admins/Owners instead: strictly less
+    // authority than upstream grants, and the failure mode is a refused request rather than an
+    // escalation. Change this only together with tests for every actor/target/permission-subset
+    // combination.
     if !may_manage_stored_member_type(headers.membership_type, member_to_edit.atype) {
         err!("You don't have permission to edit this member")
     }
@@ -1985,6 +1994,15 @@ async fn edit_member(
     // with full access) may change a member's collection assignments. A custom user with only
     // manage_users must not be able to add/remove collection access, so we leave the existing
     // assignments untouched for them.
+    //
+    // NOTE: another deliberate narrowing of upstream, which resolves ModifyUserAccess per collection
+    // and accepts a per-collection Manage grant on every affected collection. Requiring blanket
+    // authority here is coarser -- a ManageUsers member holding Manage on exactly the collections in
+    // the request is refused -- but it keeps a *stored* grant from being reachable as a lever for
+    // handing out access, which is the same boundary `caller_may_grant_collection_manage` draws. The
+    // group paths below (`post_groups`, `put_group_members`, `delete_group`) are narrowed for the same
+    // reason. Widening this needs the per-collection check to cover the members' *current* assignments
+    // as well as the requested ones, or removal becomes the hole.
     let caller_can_manage_collections = headers.membership_type >= MembershipType::Admin
         || match Membership::find_by_user_and_org(&headers.user.uuid, &org_id, &conn).await {
             Some(m) => m.has_full_access(),
@@ -2020,40 +2038,38 @@ async fn edit_member(
     // We need to perform the check after changing the type since `admin` is exempt.
     OrgPolicy::check_user_allowed(&member_to_edit, "modify", &conn).await?;
 
-    if caller_can_manage_collections {
-        // Delete all the odd collections
-        for c in CollectionUser::find_by_organization_and_user_uuid(&org_id, &member_to_edit.user_uuid, &conn).await {
-            c.delete(&conn).await?;
-        }
+    // ---------------------------------------------------------------------------------------------
+    // Validation phase. Nothing below this point may be written until every id, tenant binding and
+    // caller right in the request has been checked.
+    //
+    // This endpoint replaces a member's collection assignments and their group memberships, and
+    // Vaultwarden has no database transactions, so an error raised *between* those two replaces used
+    // to leave the request half-applied: the member's collection access already changed, their groups
+    // still the old ones, no `OrganizationUserUpdated` event written, and a 4xx on the wire telling
+    // the client that nothing happened. A foreign group id -- exactly the case the tenant check below
+    // exists for -- was enough to trigger it. Resolving everything first cannot make the two replaces
+    // atomic against a database error, but it does mean a *rejected* request changes nothing.
+    // ---------------------------------------------------------------------------------------------
 
-        // Security (F-1): a per-collection `manage` grant carries delete authority, so the caller
-        // may only confer it on collections they could delete themselves. A caller acting via
-        // Edit-any-collection thus cannot hand another member a manage/delete grant it lacks.
-        let caller = Membership::find_by_user_and_org(&headers.user.uuid, &org_id, &conn).await;
+    // Security (F-1): a per-collection `manage` grant is durable administration authority, so the
+    // caller may only confer it where they already hold it themselves. A caller acting via
+    // Edit-any-collection thus cannot hand another member a manage grant it lacks.
+    let caller = Membership::find_by_user_and_org(&headers.user.uuid, &org_id, &conn).await;
 
-        // If the member does not already reach every collection, add the collections received
-        if !grants_full_access {
-            for col in data.collections.iter().flatten() {
-                match Collection::find_by_uuid_and_org(&col.id, &org_id, &conn).await {
-                    None => err!("Collection not found in Organization"),
-                    Some(collection) => {
-                        let manage = col.manage
-                            && match &caller {
-                                Some(c) => caller_may_grant_collection_manage(c, &collection.uuid, &conn).await,
-                                None => false,
-                            };
-                        CollectionUser::save(
-                            &member_to_edit.user_uuid,
-                            &collection.uuid,
-                            col.read_only,
-                            col.hide_passwords,
-                            manage,
-                            &conn,
-                        )
-                        .await?;
-                    }
-                }
-            }
+    // Resolve the requested assignments: every collection has to exist in *this* organization, and
+    // the effective `manage` bit is decided here rather than while writing.
+    let mut collection_assignments: Vec<(CollectionId, bool, bool, bool)> = Vec::new();
+    if caller_can_manage_collections && !grants_full_access {
+        for col in data.collections.iter().flatten() {
+            let Some(collection) = Collection::find_by_uuid_and_org(&col.id, &org_id, &conn).await else {
+                err!("Collection not found in Organization")
+            };
+            let manage = col.manage
+                && match &caller {
+                    Some(c) => caller_may_grant_collection_manage(c, &collection.uuid, &conn).await,
+                    None => false,
+                };
+            collection_assignments.push((collection.uuid, col.read_only, col.hide_passwords, manage));
         }
     }
 
@@ -2061,7 +2077,7 @@ async fn edit_member(
     // (via the groups' collections). Only callers who may manage groups (Admins/Owners or users
     // with manage_groups) are allowed to change it. For others we leave group membership untouched.
     let caller_can_manage_groups = headers.membership_type >= MembershipType::Admin
-        || match Membership::find_by_user_and_org(&headers.user.uuid, &org_id, &conn).await {
+        || match &caller {
             Some(m) => m.has_manage_groups(),
             None => false,
         };
@@ -2086,54 +2102,66 @@ async fn edit_member(
         }
     }
 
+    // Security (audit H-2): every requested group has to belong to this organization. Otherwise a
+    // caller could link the member to a group of a foreign tenant (e.g. an access-all group), which
+    // the direct cipher-access checks would then honor. Fail closed on the whole request.
     if caller_can_manage_groups {
-        // Security (audit H-2): validate that every requested group belongs to this organization
-        // *before* mutating any group membership. Otherwise a caller could link the member to a
-        // group of a foreign tenant (e.g. an access-all group), which the direct cipher-access
-        // checks would then honor. Fail closed on the whole request if any group is foreign.
         for group_id in data.groups.iter().flatten() {
             if Group::find_by_uuid_and_org(group_id, &org_id, &conn).await.is_none() {
                 err!("Group not found in this organization")
             }
         }
+    }
 
-        if caller_can_manage_collections {
-            // Caller may grant/revoke collection access via groups: full replace.
-            GroupUser::delete_all_by_member(&member_to_edit.uuid, &conn).await?;
-
-            for group_id in data.groups.iter().flatten() {
-                let mut group_entry = GroupUser::new(group_id.clone(), member_to_edit.uuid.clone());
-                group_entry.save(&conn).await?;
-            }
-        } else {
-            // Security: the caller may manage groups but NOT collections. They may only change the
-            // member's membership in groups that confer no collection access; collection-bearing
-            // memberships are preserved untouched (neither granted nor revoked), mirroring the
-            // restriction enforced in put_group_members and add_update_group.
-
-            // Remove the member only from non-collection-bearing groups; keep collection-bearing
-            // memberships so this caller cannot revoke collection access either.
-            for gu in GroupUser::find_by_member(&member_to_edit.uuid, &conn).await {
-                if may_change_group_membership(
-                    caller_can_manage_collections,
-                    group_confers_collection_access(&gu.groups_uuid, &org_id, &conn).await,
-                ) {
-                    GroupUser::delete_by_group_and_member(&gu.groups_uuid, &member_to_edit.uuid, &conn).await?;
-                }
-            }
-
-            // Add the requested groups, skipping any that would grant collection access.
-            for group_id in data.groups.iter().flatten() {
-                if !may_change_group_membership(
+    // Decide the group changes while still not writing. A caller who may manage groups but *not*
+    // collections may only touch memberships in groups that confer no collection access; the others
+    // are preserved untouched (neither granted nor revoked), mirroring put_group_members and
+    // add_update_group.
+    let mut groups_to_remove: Vec<GroupId> = Vec::new();
+    let mut groups_to_add: Vec<GroupId> = Vec::new();
+    if caller_can_manage_groups {
+        for group_id in &current_groups {
+            if caller_can_manage_collections
+                || may_change_group_membership(
                     caller_can_manage_collections,
                     group_confers_collection_access(group_id, &org_id, &conn).await,
-                ) {
-                    continue;
-                }
-                let mut group_entry = GroupUser::new(group_id.clone(), member_to_edit.uuid.clone());
-                group_entry.save(&conn).await?;
+                )
+            {
+                groups_to_remove.push(group_id.clone());
             }
         }
+        for group_id in data.groups.iter().flatten() {
+            if caller_can_manage_collections
+                || may_change_group_membership(
+                    caller_can_manage_collections,
+                    group_confers_collection_access(group_id, &org_id, &conn).await,
+                )
+            {
+                groups_to_add.push(group_id.clone());
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Write phase.
+    // ---------------------------------------------------------------------------------------------
+
+    if caller_can_manage_collections {
+        for c in CollectionUser::find_by_organization_and_user_uuid(&org_id, &member_to_edit.user_uuid, &conn).await {
+            c.delete(&conn).await?;
+        }
+        for (collection_uuid, read_only, hide_passwords, manage) in collection_assignments {
+            CollectionUser::save(&member_to_edit.user_uuid, &collection_uuid, read_only, hide_passwords, manage, &conn)
+                .await?;
+        }
+    }
+
+    for group_id in groups_to_remove {
+        GroupUser::delete_by_group_and_member(&group_id, &member_to_edit.uuid, &conn).await?;
+    }
+    for group_id in groups_to_add {
+        let mut group_entry = GroupUser::new(group_id, member_to_edit.uuid.clone());
+        group_entry.save(&conn).await?;
     }
 
     log_event(
@@ -3403,29 +3431,27 @@ async fn group_confers_collection_access(group_id: &GroupId, org_id: &Organizati
 /// Whether `caller` may set a per-collection `manage` grant (`users_collections.manage` /
 /// `collections_groups.manage`) on `col_id`.
 ///
-/// Security (F-1, edit-any -> delete-any escalation): a `manage` grant carries collection *delete*
-/// authority — `CollectionDeleteHeaders` accepts it via `has_explicit_collection_manage_access`.
-/// Without this gate a Custom member holding only `edit_any_collection` (which grants full access to
-/// every collection) could, through the collection-access / group endpoints, hand a `manage` row to
-/// a group they belong to (or to a manager-level member) and thereby gain deletion — a capability
-/// `edit_any_collection` must never imply.
+/// Security (F-1): a `manage` grant is per-collection administration authority — `ManagerHeaders`
+/// accepts it via `has_explicit_collection_manage_access`, and it survives every later change to the
+/// grantee's role. Without this gate a Custom member holding only `edit_any_collection` (which grants
+/// full access to every collection, but is meant to be revocable by clearing one flag) could, through
+/// the collection-access / group endpoints, hand a permanent `manage` row to a group they belong to
+/// and keep that authority after the flag is gone.
 ///
-/// We therefore allow granting `manage` on a collection only to a caller who could delete that same
-/// collection themselves, mirroring `collection_delete_access` exactly so it can never hand out a
-/// right the caller lacks: Admin/Owner and Custom-with-`delete_any_collection` always qualify; any
-/// other Custom member must hold a real explicit manage grant. This is strictly subtractive — it can
-/// only ever downgrade a requested `manage` to `false`, never grant it — so it opens no new access,
-/// and delete-capable members (including all Admins/Owners) are unaffected.
+/// We therefore allow granting `manage` on a collection only to a caller who already holds blanket
+/// collection authority or a real stored manage grant on that same collection: Admin/Owner and
+/// Custom-with-`delete_any_collection` always qualify; any other Custom member must hold an explicit
+/// manage grant. This is strictly subtractive — it can only ever downgrade a requested `manage` to
+/// `false`, never grant it — so it opens no new access, and Admins/Owners are unaffected.
 async fn caller_may_grant_collection_manage(caller: &Membership, col_id: &CollectionId, conn: &DbConn) -> bool {
     match caller_manage_grant_role_check(caller) {
         // Role alone decides it (Admin/Owner or delete_any -> yes; User/unknown/unconfirmed -> no).
         Some(decision) => decision,
         // Custom without delete_any: the answer is per-collection and must reflect a *real* stored
-        // manage grant. Edit any collection deliberately does not count here, and neither does the
-        // legacy `access_all`-group authority: that one is derived from a group membership that can
-        // be taken away again, while a `manage` row written here outlives it. Accepting it would let
-        // temporary authority be laundered into a permanent grant — and with it collection deletion
-        // — which is exactly the escalation this clamp exists to prevent.
+        // manage grant. Edit any collection deliberately does not count here — it is revocable by
+        // clearing a flag, while a `manage` row written here outlives it. Accepting it would let
+        // temporary authority be laundered into a permanent grant, which is exactly the escalation
+        // this clamp exists to prevent.
         None => match MembershipType::from_i32(caller.atype) {
             Some(MembershipType::Custom) => caller.has_explicit_collection_manage_access(col_id, conn).await,
             _ => false,

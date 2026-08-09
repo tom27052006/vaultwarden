@@ -149,6 +149,15 @@ impl MembershipType {
     }
 }
 
+/// The stored `users_organizations.atype` values that carry organization-wide authority by role.
+///
+/// Queries use this set instead of the numeric `atype <= Admin` comparison the removal of
+/// membership-level `access_all` would otherwise have left behind in them. `<=` also matches every
+/// value *below* `Owner`, so a corrupt or hand-written negative `atype` would satisfy an SQL check
+/// while every Rust guard rejects it -- `MembershipType::from_i32` returns `None` there and the
+/// request guards fail closed. Enumerating the two values keeps both layers on the same answer.
+pub(crate) const ORG_ADMIN_ATYPES: &[i32] = &[MembershipType::Owner as i32, MembershipType::Admin as i32];
+
 impl Ord for MembershipType {
     fn cmp(&self, other: &MembershipType) -> Ordering {
         // Roles are ordered by their authorization rank, not by their raw discriminant (Custom's
@@ -899,9 +908,18 @@ impl Membership {
         self.has_type(MembershipType::Custom) && self.access_reports
     }
 
-    /// Check for an explicit per-collection Manage grant without treating any `access_all` value
-    /// as such a grant. Custom-role collection guards use this instead of the legacy broad helper,
-    /// because membership/group `access_all` must not manufacture a per-collection Manage grant.
+    /// Check for an explicit per-collection Manage grant without treating any `access_all` value as
+    /// such a grant. This is the *only* per-collection authority a Custom member can hold: neither
+    /// membership nor group `access_all` may manufacture one.
+    ///
+    /// No live exception exists for legacy Managers whose authority came from an organization-local
+    /// `access_all` group. Deriving one from the membership's shape ("Custom, no collection
+    /// permissions, member of such a group") was not sound — that shape is also what every newly
+    /// created flagless Custom member has, so assigning one to an ordinary `access_all` group handed
+    /// out organization-wide collection edit and delete, and *removing* a collection permission
+    /// activated it. The repair migration `2026-07-23-120000` materializes that authority into the
+    /// visible `edit_any_collection` / `delete_any_collection` columns instead, where an owner can
+    /// see and revoke it.
     pub async fn has_explicit_collection_manage_access(&self, collection_uuid: &CollectionId, conn: &DbConn) -> bool {
         let membership_uuid = self.uuid.clone();
         let user_uuid = self.user_uuid.clone();
@@ -962,72 +980,6 @@ impl Membership {
                 != 0
         })
         .await
-    }
-
-    /// Legacy collection-management authority derived from an organization-local `access_all` group.
-    ///
-    /// Before this role model existed, a Manager who reached every collection through such a group
-    /// could edit and delete all of them — `Collection::is_coll_manageable_by_user` accepted
-    /// `groups.access_all` outright. Managers are Custom members now, so that authority has to keep
-    /// coming from the same place, or the upgrade would silently strip a capability from members who
-    /// hold no explicit per-collection grant. Deriving it live (instead of copying it into the
-    /// permission columns during the migration) is what keeps it revocable: remove the member from
-    /// the group, or clear the group's `access_all`, and the authority is gone with it.
-    ///
-    /// Deliberately not collection *creation*: that historically required membership-level
-    /// `access_all` and is now the independent `create_new_collections` permission.
-    ///
-    /// Security: the exception is limited to members holding *none* of the three collection
-    /// permissions, which is exactly the shape the migration leaves a group-derived legacy Manager
-    /// in. Without that limit it would also cover a Custom member holding `edit_any_collection` —
-    /// and since `edit_any_collection` is what lets a caller create an `access_all` group in the
-    /// first place, such a member could grant themselves this authority and use it to persist a
-    /// real `collections_groups.manage` row, keeping collection deletion after leaving the group.
-    pub async fn has_legacy_group_collection_manage_access(
-        &self,
-        collection_uuid: &CollectionId,
-        conn: &DbConn,
-    ) -> bool {
-        if self.create_new_collections || self.edit_any_collection || self.delete_any_collection {
-            return false;
-        }
-
-        let membership_uuid = self.uuid.clone();
-        let user_uuid = self.user_uuid.clone();
-        let org_uuid = self.org_uuid.clone();
-        let collection_uuid = collection_uuid.clone();
-
-        conn.run(move |conn| {
-            users_organizations::table
-                .inner_join(
-                    groups_users::table.on(groups_users::users_organizations_uuid.eq(users_organizations::uuid)),
-                )
-                .inner_join(
-                    groups::table.on(groups::uuid
-                        .eq(groups_users::groups_uuid)
-                        .and(groups::organizations_uuid.eq(users_organizations::org_uuid))),
-                )
-                .inner_join(collections::table.on(collections::org_uuid.eq(users_organizations::org_uuid)))
-                .filter(users_organizations::uuid.eq(membership_uuid))
-                .filter(users_organizations::user_uuid.eq(user_uuid))
-                .filter(users_organizations::org_uuid.eq(org_uuid))
-                .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
-                .filter(users_organizations::atype.eq(MembershipType::Custom as i32))
-                .filter(collections::uuid.eq(collection_uuid))
-                .filter(groups::access_all.eq(true))
-                .count()
-                .first::<i64>(conn)
-                .unwrap_or(0)
-                != 0
-        })
-        .await
-    }
-
-    /// Whether this member may manage `collection_uuid` without holding a blanket collection
-    /// permission: either a real stored per-collection grant, or the legacy full-access group.
-    pub async fn has_collection_manage_authority(&self, collection_uuid: &CollectionId, conn: &DbConn) -> bool {
-        self.has_explicit_collection_manage_access(collection_uuid, conn).await
-            || self.has_legacy_group_collection_manage_access(collection_uuid, conn).await
     }
 
     /// `manageAllCollections` is a client-side aggregate checkbox, not a separately persisted
@@ -1316,7 +1268,7 @@ impl Membership {
                 )
                 .filter(
                     custom_membership_with_edit_any_collection() // Custom "Edit any collection" (successor of access_all)
-                        .or(users_organizations::atype.le(MembershipType::Admin as i32)) // or org admin/owner
+                        .or(users_organizations::atype.eq_any(ORG_ADMIN_ATYPES)) // or org admin/owner
                         .or(ciphers_collections::cipher_uuid.eq(&cipher_uuid)), // ..or access to collection with cipher
                 )
                 .select(users_organizations::all_columns)
@@ -1372,7 +1324,7 @@ impl Membership {
                 .left_join(users_collections::table.on(users_collections::user_uuid.eq(users_organizations::user_uuid)))
                 .filter(
                     custom_membership_with_edit_any_collection() // Custom "Edit any collection" (successor of access_all)
-                        .or(users_organizations::atype.le(MembershipType::Admin as i32)) // or org admin/owner
+                        .or(users_organizations::atype.eq_any(ORG_ADMIN_ATYPES)) // or org admin/owner
                         .or(users_collections::collection_uuid.eq(&collection_uuid)), // ..or access to collection
                 )
                 .select(users_organizations::all_columns)
@@ -1504,6 +1456,23 @@ mod tests {
         membership.atype = member_type as i32;
         membership.status = MembershipStatus::Confirmed as i32;
         membership
+    }
+
+    /// The SQL-side admin set has to stay in step with the Rust-side role check, and it must not be a
+    /// range: `atype <= Admin` would also match a corrupt negative value that
+    /// `MembershipType::from_i32` rejects.
+    #[test]
+    fn the_sql_admin_atype_set_matches_the_two_admin_roles() {
+        assert_eq!(ORG_ADMIN_ATYPES, [MembershipType::Owner as i32, MembershipType::Admin as i32]);
+        for atype in [-1, 2, 3, 5, i32::MAX, i32::MIN] {
+            assert!(!ORG_ADMIN_ATYPES.contains(&atype), "atype {atype} must not count as an organization admin");
+        }
+        for atype in ORG_ADMIN_ATYPES {
+            assert!(
+                matches!(MembershipType::from_i32(*atype), Some(MembershipType::Owner | MembershipType::Admin)),
+                "every value in the set has to resolve to an admin role in Rust as well"
+            );
+        }
     }
 
     #[test]

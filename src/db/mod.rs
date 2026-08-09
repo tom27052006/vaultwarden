@@ -513,13 +513,25 @@ impl PermissionColumnGroup {
             Self::Access => "custom access-permission",
         }
     }
+
+    /// Whether this group's migration derives its values from the legacy `access_all` column.
+    ///
+    /// Only the collection group does (`create_new_collections = access_all` and friends). That makes
+    /// it the one group whose migration can no longer be executed once `access_all` has been dropped by
+    /// {`DROP_MEMBERSHIP_ACCESS_ALL_MIGRATION`}, so it must never be recommended for a replay
+    /// afterwards. The other two only add columns (and convert the retired Manager type), which stays
+    /// valid at any point in the chain.
+    const fn reads_legacy_access_all(self) -> bool {
+        matches!(self, Self::Collection)
+    }
 }
 
 const PARTIAL_PERMISSION_COLUMNS_RECOVERY: &str = concat!(
     "\n\nThis happens when a migration was interrupted between its ALTER TABLE statements (on ",
     "MySQL/MariaDB every DDL statement commits on its own, so columns can exist without the ledger ",
-    "entry). The leftover columns only ever hold their FALSE default at this point, so dropping them ",
-    "loses nothing and lets the migration run again from a clean state.\n\n",
+    "entry). Because the migration never completed, Vaultwarden never wrote to these columns: they ",
+    "only hold their FALSE default, so dropping them loses nothing and lets the migration run again ",
+    "from a clean state.\n\n",
     "List the columns that are already present:\n",
     "SELECT column_name\n",
     "FROM information_schema.columns\n",
@@ -534,44 +546,95 @@ const PARTIAL_PERMISSION_COLUMNS_RECOVERY: &str = concat!(
     "Afterwards restart Vaultwarden so the migration applies the whole group in one go."
 );
 
-const AMBIGUOUS_DIRECT_PERMISSIONS_RECOVERY_SQL: &str = concat!(
-    "\n\nList every affected membership with this SQLite/MySQL/PostgreSQL-compatible query:\n",
-    "SELECT uuid, user_uuid, org_uuid, atype, status\n",
-    "FROM users_organizations\n",
-    "WHERE atype IN (3, 4)\n",
-    "  AND access_all = FALSE\n",
-    "  AND create_new_collections = FALSE\n",
-    "  AND edit_any_collection = TRUE\n",
-    "  AND delete_any_collection = TRUE;\n\n",
-    "To see which of them still have an organization-local full-access group as a plausible source of the pattern, ",
-    "run the query below. On MySQL/MariaDB the reserved word `groups` has to be quoted with backticks:\n",
-    "SELECT uo.uuid, uo.org_uuid, g.uuid AS group_uuid, g.name AS group_name\n",
-    "FROM users_organizations uo\n",
-    "INNER JOIN groups_users gu ON gu.users_organizations_uuid = uo.uuid\n",
-    "INNER JOIN groups g ON g.uuid = gu.groups_uuid AND g.organizations_uuid = uo.org_uuid\n",
-    "WHERE g.access_all = TRUE\n",
-    "  AND uo.atype IN (3, 4)\n",
-    "  AND uo.access_all = FALSE\n",
-    "  AND uo.create_new_collections = FALSE\n",
-    "  AND uo.edit_any_collection = TRUE\n",
-    "  AND uo.delete_any_collection = TRUE;\n\n",
-    "An organization owner has to decide per membership which of the two meanings applies. Replace ",
-    "<MEMBERSHIP_UUID> and run exactly one guarded statement for that membership while every Vaultwarden instance is ",
-    "stopped. Do not bulk-apply either statement.\n\n",
-    "The pattern was a group-derived copy, or the authority is no longer wanted: drop it and let the group (if any) ",
-    "remain the only source of access.\n",
-    "UPDATE users_organizations\n",
-    "SET edit_any_collection = FALSE,\n",
-    "    delete_any_collection = FALSE\n",
-    "WHERE uuid = '<MEMBERSHIP_UUID>' AND access_all = FALSE AND create_new_collections = FALSE;\n\n",
-    "The pattern was an intentional direct grant that has to survive: make it unambiguous so the migration can pass.\n",
-    "UPDATE users_organizations\n",
-    "SET create_new_collections = TRUE\n",
-    "WHERE uuid = '<MEMBERSHIP_UUID>' AND access_all = FALSE AND edit_any_collection = TRUE;\n\n",
-    "Note that the second statement also grants Create-any-collection, because a 0/1/1 pattern is exactly the state ",
-    "the migration cannot attribute. If that member must not be able to create collections, start the server once so ",
-    "the migration completes, then set create_new_collections back to FALSE for that membership."
+/// Deliberately *not* the same advice as [`PARTIAL_PERMISSION_COLUMNS_RECOVERY`].
+///
+/// Here the ledger entry is present, so the migration did complete once and Vaultwarden has been
+/// running with those columns: the ones that are still there can hold real granted permissions. The
+/// missing columns cannot have been lost by an interrupted migration -- something dropped them
+/// afterwards -- so telling the operator to drop the remainder would destroy live authorization data.
+/// It would not even recover the instance: with the ledger entry in place, the next start finds zero
+/// columns for a recorded migration and refuses again.
+const PERMISSION_LEDGER_MISMATCH_RECOVERY: &str = concat!(
+    "\n\nUnlike an interrupted migration, this state means the migration already completed once, so ",
+    "the columns that are still present can hold real permissions that members were granted. Do not ",
+    "drop them: that destroys authorization data, and it does not fix the refusal either, because the ",
+    "ledger entry stays behind.\n\n",
+    "Restoring the database backup taken before the columns went missing is the only lossless fix. ",
+    "Run the upgrade again against that restored copy.\n\n",
+    "If the lost permissions are genuinely expendable, the migration can be replayed from scratch ",
+    "instead. With every Vaultwarden instance stopped and a backup taken, drop the remaining columns ",
+    "of the affected group that the message above names AND remove its ledger entry, so the migration ",
+    "is pending again rather than recorded-but-missing:\n",
+    "ALTER TABLE users_organizations DROP COLUMN <COLUMN_NAME>;\n",
+    "DELETE FROM __diesel_schema_migrations WHERE version = '<MIGRATION_VERSION>';\n\n",
+    "Every member of the affected organizations then has to be re-checked, because the permissions ",
+    "come back as FALSE."
 );
+
+/// Recovery for a damaged collection-permission group *after* `access_all` has been dropped.
+///
+/// Neither of the two texts above applies there. Both ultimately rely on the migration running again --
+/// by leaving it pending, or by deleting its ledger row -- but `2026-07-16-120000` computes its three
+/// columns *from* `access_all`, which `2026-07-24-120000` has already removed. A replay therefore fails
+/// with "no such column: access_all" on every start, and on MySQL/MariaDB it fails *after* its three
+/// `ADD COLUMN`s have committed, leaving the database stuck in the very state that was being repaired.
+/// The way out is to reach the completed shape without executing that SQL at all.
+const COLLECTION_PERMISSIONS_AFTER_DROP_RECOVERY: &str = concat!(
+    "\n\nThis group cannot be migrated again on this database: migration ",
+    "2026-07-16-120000 derives its three columns from the membership access_all column, and ",
+    "2026-07-24-120000 has already dropped that column. Leaving the migration pending, or deleting its ",
+    "ledger entry so it runs again, therefore fails on every start -- and on MySQL/MariaDB it fails only ",
+    "after its own ALTER TABLEs have committed.\n\n",
+    "Restoring the database backup taken before these columns went missing is the only lossless fix. ",
+    "Run the upgrade again against that restored copy.\n\n",
+    "If the lost permissions are expendable, bring the group to its completed shape by hand instead, ",
+    "with every Vaultwarden instance stopped and a backup taken. Add whichever of the three columns the ",
+    "message above reports as missing:\n",
+    "ALTER TABLE users_organizations ADD COLUMN create_new_collections BOOLEAN NOT NULL DEFAULT FALSE;\n",
+    "ALTER TABLE users_organizations ADD COLUMN edit_any_collection BOOLEAN NOT NULL DEFAULT FALSE;\n",
+    "ALTER TABLE users_organizations ADD COLUMN delete_any_collection BOOLEAN NOT NULL DEFAULT FALSE;\n\n",
+    "Then make sure the migration counts as done, so it is never executed:\n",
+    "INSERT INTO __diesel_schema_migrations (version) VALUES ('20260716120000');\n\n",
+    "(Skip that INSERT if the entry is already there -- the message above says whether it is.)\n\n",
+    "Every Custom member of every organization then has to be re-checked, because the three collection ",
+    "permissions come back as FALSE and nothing can reconstruct their previous values."
+);
+
+const LEGACY_USER_ACCESS_ALL_RECOVERY: &str = concat!(
+    "\n\nList the affected memberships:\n",
+    "SELECT uuid, user_uuid, org_uuid, status\n",
+    "FROM users_organizations\n",
+    "WHERE atype = 2\n",
+    "  AND access_all = TRUE;\n\n",
+    "The bit gave these members read/write reach over every collection of the organization, including ",
+    "collections created later, but no collection-management authority -- and it stopped applying as ",
+    "soon as the membership was revoked. The new role model has no equivalent, so an owner has to pick ",
+    "one of the two meanings per membership, with every Vaultwarden instance stopped and a backup ",
+    "taken.\n\n",
+    "The reach is no longer wanted -- this is also the right choice for an invited, accepted or revoked ",
+    "membership: clear the bit. The member keeps every collection they are explicitly assigned to.\n",
+    "UPDATE users_organizations\n",
+    "SET access_all = FALSE\n",
+    "WHERE uuid = '<MEMBERSHIP_UUID>';\n\n",
+    "The reach has to survive: write it out as explicit assignments first, then clear the bit. Do this ",
+    "only for a confirmed membership, and only if a snapshot is acceptable -- collections created after ",
+    "this point are not added, and unlike access_all these rows are not tied to the membership status.\n",
+    "INSERT INTO users_collections (user_uuid, collection_uuid, read_only, hide_passwords, manage)\n",
+    "SELECT uo.user_uuid, c.uuid, FALSE, FALSE, FALSE\n",
+    "FROM users_organizations uo\n",
+    "INNER JOIN collections c ON c.org_uuid = uo.org_uuid\n",
+    "WHERE uo.uuid = '<MEMBERSHIP_UUID>'\n",
+    "  AND NOT EXISTS (\n",
+    "    SELECT 1 FROM users_collections uc\n",
+    "    WHERE uc.user_uuid = uo.user_uuid AND uc.collection_uuid = c.uuid\n",
+    "  );\n\n",
+    "Existing assignments are left untouched by that statement, so re-check their read_only / ",
+    "hide_passwords values: access_all used to override both.\n\n",
+    "If the member genuinely needs organization-wide reach afterwards, give them the Custom role with ",
+    "the 'Edit any collection' permission from the web vault once the upgrade has completed. That is ",
+    "the supported, visible and revocable equivalent."
+);
+
 const INTERRUPTED_ACCESS_ALL_DROP_RECOVERY: &str = concat!(
     "\n\nThe drop itself carries no data, so the schema is already in its intended final state and ",
     "only the ledger entry is missing. Vaultwarden completes this automatically on MySQL/MariaDB, ",
@@ -612,7 +675,7 @@ struct CustomRoleMigrationFacts {
     access_permissions_migration_applied: bool,
     repair_migration_applied: bool,
     access_all_drop_migration_applied: bool,
-    ambiguous_direct_permission_count: i64,
+    legacy_user_access_all_count: i64,
     same_run_0716_marker: bool,
 }
 
@@ -641,7 +704,7 @@ enum CustomRolePreflightDecision {
     RefuseAlreadyDropped,
     RefuseMissingAccessAll,
     RefuseMissingMigrationLedger,
-    RefuseAmbiguousDirectPermissions,
+    RefuseLegacyUserAccessAll,
     RefuseInterruptedAccessAllDrop,
     RefuseAccessAllDropLedgerMismatch,
     RefusePartialPermissionSchema(PermissionColumnGroup),
@@ -682,8 +745,8 @@ fn custom_role_preflight_decision(
             };
         }
     } else {
-        // Once access_all has been dropped, its former value and the provenance of 0/1/1
-        // collection permissions can no longer be reconstructed. Never guess at either.
+        // Once access_all has been dropped, its former value can no longer be reconstructed. Never
+        // guess at it.
         if facts.access_all_drop_migration_applied {
             return CustomRolePreflightDecision::RefuseAlreadyDropped;
         }
@@ -691,8 +754,15 @@ fn custom_role_preflight_decision(
             return CustomRolePreflightDecision::RefuseMissingAccessAll;
         }
 
-        if facts.ambiguous_direct_permission_count != 0 && !facts.same_run_0716_marker {
-            return CustomRolePreflightDecision::RefuseAmbiguousDirectPermissions;
+        // A plain User carrying membership `access_all` has no representation in the new model: the
+        // bit gave unlimited *reach* over every collection, present and future, without any
+        // management authority, and the role that replaces it cannot express that. Converting the
+        // reach into direct per-collection assignments would silently turn a dynamic guarantee into a
+        // point-in-time snapshot, and -- because a `users_collections` row is not bound to the
+        // membership status the way `access_all` was -- would hand a revoked or never-confirmed member
+        // durable assignments that outlive this schema. Refuse and let an owner decide.
+        if facts.legacy_user_access_all_count != 0 {
+            return CustomRolePreflightDecision::RefuseLegacyUserAccessAll;
         }
     }
 
@@ -732,11 +802,11 @@ fn custom_role_preflight_error(decision: CustomRolePreflightDecision, facts: Cus
              Refusing to guess which schema and data migrations were previously applied."
                 .to_owned()
         }
-        CustomRolePreflightDecision::RefuseAmbiguousDirectPermissions => format!(
-            "Found {} membership(s) with an ambiguous 0/1/1 collection-permission pattern. It is \
-             not possible to distinguish an older group-derived backfill from an intentional \
-             direct Edit+Delete assignment.",
-            facts.ambiguous_direct_permission_count
+        CustomRolePreflightDecision::RefuseLegacyUserAccessAll => format!(
+            "Found {} membership(s) of the plain User type carrying the legacy access_all bit. That \
+             combination has no representation in the Custom role model: it grants dynamic reach over \
+             every collection without any management authority.",
+            facts.legacy_user_access_all_count
         ),
         CustomRolePreflightDecision::RefusePartialPermissionSchema(group) => format!(
             "Found {} of the three {} columns ({}) without a completed {} migration. The migration \
@@ -769,9 +839,17 @@ fn custom_role_preflight_error(decision: CustomRolePreflightDecision, facts: Cus
         }
     };
     let recovery = match decision {
-        CustomRolePreflightDecision::RefuseAmbiguousDirectPermissions => AMBIGUOUS_DIRECT_PERMISSIONS_RECOVERY_SQL,
-        CustomRolePreflightDecision::RefusePartialPermissionSchema(_)
-        | CustomRolePreflightDecision::RefusePermissionLedgerMismatch(_) => PARTIAL_PERMISSION_COLUMNS_RECOVERY,
+        CustomRolePreflightDecision::RefuseLegacyUserAccessAll => LEGACY_USER_ACCESS_ALL_RECOVERY,
+        // Once access_all is gone, the collection group's migration can no longer run at all, so
+        // neither of the two generic texts may be handed out -- both end in a replay.
+        CustomRolePreflightDecision::RefusePartialPermissionSchema(group)
+        | CustomRolePreflightDecision::RefusePermissionLedgerMismatch(group)
+            if group.reads_legacy_access_all() && !facts.access_all_column_exists =>
+        {
+            COLLECTION_PERMISSIONS_AFTER_DROP_RECOVERY
+        }
+        CustomRolePreflightDecision::RefusePartialPermissionSchema(_) => PARTIAL_PERMISSION_COLUMNS_RECOVERY,
+        CustomRolePreflightDecision::RefusePermissionLedgerMismatch(_) => PERMISSION_LEDGER_MISMATCH_RECOVERY,
         CustomRolePreflightDecision::RefuseAlreadyDropped => ALREADY_DROPPED_RECOVERY,
         CustomRolePreflightDecision::RefuseInterruptedAccessAllDrop => INTERRUPTED_ACCESS_ALL_DROP_RECOVERY,
         CustomRolePreflightDecision::RefuseAccessAllDropLedgerMismatch => ACCESS_ALL_DROP_MISMATCH_RECOVERY,
@@ -917,15 +995,15 @@ mod sqlite_migrations {
                 format!("SELECT COUNT(*) AS count FROM {} WHERE marker = 1", super::CUSTOM_ROLE_SAME_RUN_MARKER_TABLE),
             )? != 0;
 
-        let ambiguous_direct_permission_count = if access_all_column_exists && collection_permission_columns == 3 {
+        // Status is deliberately not part of this count: an invited, accepted or revoked membership
+        // carrying the bit is exactly the state that must never become durable direct assignments, so
+        // it has to stop the upgrade as well.
+        let legacy_user_access_all_count = if access_all_column_exists {
             count(
                 connection,
                 "SELECT COUNT(*) AS count FROM users_organizations \
-                     WHERE atype IN (3, 4) \
-                       AND access_all = FALSE \
-                       AND create_new_collections = FALSE \
-                       AND edit_any_collection = TRUE \
-                       AND delete_any_collection = TRUE",
+                     WHERE atype = 2 \
+                       AND access_all = TRUE",
             )?
         } else {
             0
@@ -943,7 +1021,7 @@ mod sqlite_migrations {
             access_permissions_migration_applied,
             repair_migration_applied,
             access_all_drop_migration_applied,
-            ambiguous_direct_permission_count,
+            legacy_user_access_all_count,
             same_run_0716_marker,
         };
 
@@ -1147,15 +1225,15 @@ mod mysql_migrations {
                 format!("SELECT COUNT(*) AS count FROM {} WHERE marker = 1", super::CUSTOM_ROLE_SAME_RUN_MARKER_TABLE),
             )? != 0;
 
-        let ambiguous_direct_permission_count = if access_all_column_exists && collection_permission_columns == 3 {
+        // Status is deliberately not part of this count: an invited, accepted or revoked membership
+        // carrying the bit is exactly the state that must never become durable direct assignments, so
+        // it has to stop the upgrade as well.
+        let legacy_user_access_all_count = if access_all_column_exists {
             count(
                 connection,
                 "SELECT COUNT(*) AS count FROM users_organizations \
-                     WHERE atype IN (3, 4) \
-                       AND access_all = FALSE \
-                       AND create_new_collections = FALSE \
-                       AND edit_any_collection = TRUE \
-                       AND delete_any_collection = TRUE",
+                     WHERE atype = 2 \
+                       AND access_all = TRUE",
             )?
         } else {
             0
@@ -1173,7 +1251,7 @@ mod mysql_migrations {
             access_permissions_migration_applied,
             repair_migration_applied,
             access_all_drop_migration_applied,
-            ambiguous_direct_permission_count,
+            legacy_user_access_all_count,
             same_run_0716_marker,
         };
 
@@ -1296,15 +1374,15 @@ mod postgresql_migrations {
                 format!("SELECT COUNT(*) AS count FROM {} WHERE marker = 1", super::CUSTOM_ROLE_SAME_RUN_MARKER_TABLE),
             )? != 0;
 
-        let ambiguous_direct_permission_count = if access_all_column_exists && collection_permission_columns == 3 {
+        // Status is deliberately not part of this count: an invited, accepted or revoked membership
+        // carrying the bit is exactly the state that must never become durable direct assignments, so
+        // it has to stop the upgrade as well.
+        let legacy_user_access_all_count = if access_all_column_exists {
             count(
                 connection,
                 "SELECT COUNT(*) AS count FROM users_organizations \
-                     WHERE atype IN (3, 4) \
-                       AND access_all = FALSE \
-                       AND create_new_collections = FALSE \
-                       AND edit_any_collection = TRUE \
-                       AND delete_any_collection = TRUE",
+                     WHERE atype = 2 \
+                       AND access_all = TRUE",
             )?
         } else {
             0
@@ -1322,7 +1400,7 @@ mod postgresql_migrations {
             access_permissions_migration_applied,
             repair_migration_applied,
             access_all_drop_migration_applied,
-            ambiguous_direct_permission_count,
+            legacy_user_access_all_count,
             same_run_0716_marker,
         };
 
@@ -1397,7 +1475,7 @@ mod custom_role_migration_preflight_tests {
             access_permissions_migration_applied: true,
             repair_migration_applied: true,
             access_all_drop_migration_applied: true,
-            ambiguous_direct_permission_count: 0,
+            legacy_user_access_all_count: 0,
             same_run_0716_marker: false,
         }
     }
@@ -1522,24 +1600,24 @@ mod custom_role_migration_preflight_tests {
     }
 
     #[test]
-    fn ambiguous_direct_permissions_error_carries_a_recovery_path() {
+    fn legacy_user_access_all_error_carries_a_recovery_path() {
         let facts = Facts {
-            ambiguous_direct_permission_count: 2,
+            legacy_user_access_all_count: 2,
             ..pending_repair()
         };
         let decision = custom_role_preflight_decision(facts, false);
-        assert_eq!(decision, Decision::RefuseAmbiguousDirectPermissions);
+        assert_eq!(decision, Decision::RefuseLegacyUserAccessAll);
 
         let error = custom_role_preflight_error(decision, facts);
         let message = error.source().expect("preflight error should retain its I/O error source").to_string();
         assert!(message.contains("2 membership(s)"));
-        // The operator needs the affected memberships and their possible group source ...
-        assert!(message.contains("SELECT uuid, user_uuid, org_uuid, atype, status"));
-        assert!(message.contains("WHERE g.access_all = TRUE"));
-        // ... plus both decisions, and the note that keeping the grant also grants Create.
-        assert!(message.contains("SET edit_any_collection = FALSE,\n    delete_any_collection = FALSE"));
-        assert!(message.contains("SET create_new_collections = TRUE"));
-        assert!(message.contains("also grants Create-any-collection"));
+        // The operator needs the affected memberships ...
+        assert!(message.contains("WHERE atype = 2\n  AND access_all = TRUE;"));
+        // ... and both decisions: drop the reach, or write it out explicitly first.
+        assert!(message.contains("SET access_all = FALSE"));
+        assert!(message.contains("INSERT INTO users_collections"));
+        // Nothing here may present the snapshot as equivalent to the old dynamic reach.
+        assert!(message.contains("collections created after"));
     }
 
     #[test]
@@ -1556,12 +1634,26 @@ mod custom_role_migration_preflight_tests {
         assert!(message.contains("Restore the database backup"));
     }
 
-    // REGRESSION: a legacy `User` membership with the historical access_all bit must NOT stop the
-    // upgrade. The 2026-07-23 migration materializes that reach as explicit per-collection
-    // assignments, so the preflight has nothing left to decide and every other fact stays untouched.
+    /// A legacy `User` membership carrying the historical access_all bit stops the upgrade before any
+    /// migration runs, whatever its status is. Converting the bit into direct per-collection
+    /// assignments would turn a dynamic, status-bound reach into a durable snapshot -- and those rows
+    /// would still be there for an older binary after a rollback, which never checked the membership
+    /// status on that path.
     #[test]
-    fn legacy_user_access_all_no_longer_blocks_the_upgrade() {
+    fn legacy_user_access_all_blocks_the_upgrade_before_any_migration() {
         assert_eq!(custom_role_preflight_decision(pending_repair(), false), Decision::Proceed);
+
+        let untouched_schema = Facts {
+            legacy_user_access_all_count: 1,
+            ..pending_repair()
+        };
+        assert_eq!(
+            custom_role_preflight_decision(untouched_schema, false),
+            Decision::RefuseLegacyUserAccessAll,
+            "nothing may have been migrated yet when this is refused"
+        );
+        // MySQL/MariaDB gets no exception: no partial state may be completed past this either.
+        assert_eq!(custom_role_preflight_decision(untouched_schema, true), Decision::RefuseLegacyUserAccessAll);
         assert_eq!(
             custom_role_preflight_decision(
                 Facts {
@@ -1569,11 +1661,12 @@ mod custom_role_migration_preflight_tests {
                     collection_permissions_migration_applied: true,
                     manage_permission_columns: 3,
                     manage_permissions_migration_applied: true,
+                    legacy_user_access_all_count: 1,
                     ..pending_repair()
                 },
                 false,
             ),
-            Decision::Proceed
+            Decision::RefuseLegacyUserAccessAll
         );
     }
 
@@ -1622,45 +1715,116 @@ mod custom_role_migration_preflight_tests {
         }
     }
 
+    /// A group-derived legacy Manager is no longer a special case for the preflight: the repair
+    /// migration writes the authority into the permission columns, and nothing reads the 0/1/1 shape
+    /// afterwards, so no state of those columns has to be attributed or refused.
     #[test]
-    fn group_derived_zero_permissions_are_safe_but_ambiguous_direct_permissions_are_refused() {
+    fn a_group_derived_legacy_manager_needs_no_preflight_decision() {
         assert_eq!(custom_role_preflight_decision(pending_repair(), false), Decision::Proceed);
-        assert_eq!(
-            custom_role_preflight_decision(
-                Facts {
-                    collection_permission_columns: 3,
-                    collection_permissions_migration_applied: true,
-                    ..pending_repair()
-                },
-                false,
-            ),
-            Decision::Proceed
-        );
-        assert_eq!(
-            custom_role_preflight_decision(
-                Facts {
-                    collection_permission_columns: 3,
-                    collection_permissions_migration_applied: true,
-                    ambiguous_direct_permission_count: 1,
-                    ..pending_repair()
-                },
-                false,
-            ),
-            Decision::RefuseAmbiguousDirectPermissions
-        );
-        assert_eq!(
-            custom_role_preflight_decision(
-                Facts {
-                    collection_permission_columns: 3,
-                    collection_permissions_migration_applied: true,
-                    ambiguous_direct_permission_count: 1,
-                    same_run_0716_marker: true,
-                    ..pending_repair()
-                },
-                false,
-            ),
-            Decision::Proceed
-        );
+        for same_run_0716_marker in [false, true] {
+            assert_eq!(
+                custom_role_preflight_decision(
+                    Facts {
+                        collection_permission_columns: 3,
+                        collection_permissions_migration_applied: true,
+                        same_run_0716_marker,
+                        ..pending_repair()
+                    },
+                    false,
+                ),
+                Decision::Proceed
+            );
+        }
+    }
+
+    /// The two partial-column states need opposite advice. Without the ledger entry the migration
+    /// never completed, so the leftovers are untouched defaults and dropping them is free. With the
+    /// ledger entry the migration *did* run, so the remaining columns can hold granted permissions --
+    /// and dropping them alone would not even clear the refusal, because the ledger row stays.
+    #[test]
+    fn the_two_partial_column_states_get_opposite_recovery_advice() {
+        let interrupted = Facts {
+            access_permission_columns: 1,
+            access_permissions_migration_applied: false,
+            ..fully_migrated()
+        };
+        let vanished = Facts {
+            access_permission_columns: 1,
+            access_permissions_migration_applied: true,
+            ..fully_migrated()
+        };
+
+        let interrupted_decision = custom_role_preflight_decision(interrupted, false);
+        let vanished_decision = custom_role_preflight_decision(vanished, false);
+        assert_eq!(interrupted_decision, Decision::RefusePartialPermissionSchema(super::PermissionColumnGroup::Access));
+        assert_eq!(vanished_decision, Decision::RefusePermissionLedgerMismatch(super::PermissionColumnGroup::Access));
+
+        let message_of = |decision| {
+            custom_role_preflight_error(decision, interrupted)
+                .source()
+                .expect("preflight error should retain its I/O error source")
+                .to_string()
+        };
+        let interrupted_message = message_of(interrupted_decision);
+        let vanished_message = message_of(vanished_decision);
+
+        assert!(interrupted_message.contains("dropping them"), "{interrupted_message}");
+        assert!(!interrupted_message.contains("DELETE FROM __diesel_schema_migrations"));
+
+        // The dangerous claim must not be repeated where it is false, and the operator has to be told
+        // to remove the ledger row as well if they accept the loss.
+        assert!(!vanished_message.contains("loses nothing"), "{vanished_message}");
+        assert!(vanished_message.contains("Do not drop them"), "{vanished_message}");
+        assert!(vanished_message.contains("Restoring the database backup"), "{vanished_message}");
+        assert!(vanished_message.contains("DELETE FROM __diesel_schema_migrations"), "{vanished_message}");
+    }
+
+    /// Both generic texts end in the migration running again. For the collection group after the
+    /// access_all drop that is impossible -- 2026-07-16-120000 reads the dropped column -- so the advice
+    /// has to change to "reach the finished shape without executing it".
+    #[test]
+    fn the_collection_group_gets_replay_free_advice_once_access_all_is_gone() {
+        for (columns, applied, expected) in [
+            (1, false, Decision::RefusePartialPermissionSchema(super::PermissionColumnGroup::Collection)),
+            (1, true, Decision::RefusePermissionLedgerMismatch(super::PermissionColumnGroup::Collection)),
+        ] {
+            let facts = Facts {
+                collection_permission_columns: columns,
+                collection_permissions_migration_applied: applied,
+                ..fully_migrated()
+            };
+            let decision = custom_role_preflight_decision(facts, false);
+            assert_eq!(decision, expected);
+
+            let message = custom_role_preflight_error(decision, facts)
+                .source()
+                .expect("preflight error should retain its I/O error source")
+                .to_string();
+            assert!(message.contains("cannot be migrated again on this database"), "{message}");
+            assert!(message.contains("ADD COLUMN create_new_collections"), "{message}");
+            assert!(message.contains("VALUES ('20260716120000')"), "{message}");
+            // The replay-based advice must not leak through for this state.
+            assert!(!message.contains("DELETE FROM __diesel_schema_migrations"), "{message}");
+            assert!(!message.contains("lets the migration run again"), "{message}");
+        }
+
+        // While access_all still exists a replay is fine, so the generic texts stay in place.
+        let before_drop = Facts {
+            access_all_column_exists: true,
+            access_all_drop_migration_applied: false,
+            access_permission_columns: 0,
+            access_permissions_migration_applied: false,
+            collection_permission_columns: 1,
+            collection_permissions_migration_applied: false,
+            ..fully_migrated()
+        };
+        let decision = custom_role_preflight_decision(before_drop, false);
+        assert_eq!(decision, Decision::RefusePartialPermissionSchema(super::PermissionColumnGroup::Collection));
+        let message = custom_role_preflight_error(decision, before_drop)
+            .source()
+            .expect("preflight error should retain its I/O error source")
+            .to_string();
+        assert!(message.contains("lets the migration run again"), "{message}");
     }
 
     #[test]

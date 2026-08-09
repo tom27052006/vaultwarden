@@ -16,19 +16,56 @@ PRAGMA foreign_keys = OFF;
 
 BEGIN;
 
--- Refuse to start at all unless the database is in the state this script converts *from*. A repeat
--- run would otherwise only fail somewhere in the middle. The failing CHECK names the reason.
+-- Refuse to start at all unless the database is in the exact state this script converts *from*. A
+-- repeat run, or a half-finished upgrade, would otherwise only fail somewhere in the middle. Each
+-- check is read-only, and the name of the failing CHECK constraint *is* the error message.
 CREATE TEMPORARY TABLE __vw_rollback_precondition (
     ok INTEGER NOT NULL CONSTRAINT
-        this_database_has_no_custom_role_permission_columns_to_roll_back CHECK (ok = 1)
+        refused_membership_access_all_still_exists_so_this_database_was_not_upgraded_or_was_already_rolled_back
+        CHECK (ok = 1)
 );
 INSERT INTO __vw_rollback_precondition (ok)
 SELECT CASE
-    WHEN EXISTS (SELECT 1 FROM pragma_table_info('users_organizations') WHERE name = 'create_new_collections')
+    WHEN NOT EXISTS (SELECT 1 FROM pragma_table_info('users_organizations') WHERE name = 'access_all')
     THEN 1
     ELSE 0
 END;
 DROP TABLE __vw_rollback_precondition;
+
+CREATE TEMPORARY TABLE __vw_rollback_precondition_columns (
+    ok INTEGER NOT NULL CONSTRAINT
+        refused_all_nine_custom_role_permission_columns_must_exist_restore_the_pre_upgrade_backup
+        CHECK (ok = 9)
+);
+INSERT INTO __vw_rollback_precondition_columns (ok)
+SELECT COUNT(*)
+FROM pragma_table_info('users_organizations')
+WHERE name IN (
+    'manage_users', 'manage_groups', 'manage_policies',
+    'create_new_collections', 'edit_any_collection', 'delete_any_collection',
+    'access_event_logs', 'access_import_export', 'access_reports'
+);
+DROP TABLE __vw_rollback_precondition_columns;
+
+CREATE TEMPORARY TABLE __vw_rollback_precondition_ledger (
+    ok INTEGER NOT NULL CONSTRAINT
+        refused_all_eight_custom_role_migrations_must_be_recorded_schema_and_ledger_disagree
+        CHECK (ok = 8)
+);
+INSERT INTO __vw_rollback_precondition_ledger (ok)
+SELECT COUNT(*)
+FROM __diesel_schema_migrations
+WHERE version IN (
+  '20260630120000',
+  '20260715120000',
+  '20260716120000',
+  '20260723120000',
+  '20260724120000',
+  '20260724130000',
+  '20260724140000',
+  '20260809120000'
+);
+DROP TABLE __vw_rollback_precondition_ledger;
 
 CREATE TABLE users_organizations_rollback (
   uuid       TEXT    NOT NULL PRIMARY KEY,
@@ -77,7 +114,7 @@ ALTER TABLE users_organizations_rollback RENAME TO users_organizations;
 DROP TABLE IF EXISTS __vw_custom_role_same_run_0716;
 DROP TABLE IF EXISTS __vw_allow_custom_role_downgrade;
 
--- Finally forget the seven migrations, so the older binary does not see a ledger from the future
+-- Finally forget the eight migrations, so the older binary does not see a ledger from the future
 -- and a later upgrade applies them again from a clean state.
 DELETE FROM __diesel_schema_migrations
 WHERE version IN (
@@ -87,7 +124,8 @@ WHERE version IN (
   '20260723120000',
   '20260724120000',
   '20260724130000',
-  '20260724140000'
+  '20260724140000',
+  '20260809120000'
 );
 
 COMMIT;
