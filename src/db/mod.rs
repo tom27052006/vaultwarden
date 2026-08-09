@@ -474,6 +474,15 @@ const DROP_MEMBERSHIP_ACCESS_ALL_MIGRATION: &str = "20260724120000";
 const CUSTOM_ROLE_MANAGE_PERMISSIONS_MIGRATION: &str = "20260630120000";
 const CUSTOM_ACCESS_PERMISSIONS_MIGRATION: &str = "20260724130000";
 const CUSTOM_ROLE_SAME_RUN_MARKER_TABLE: &str = "__vw_custom_role_same_run_0716";
+/// Records which memberships were legacy Managers, written by
+/// {`CUSTOM_ROLE_MANAGE_PERMISSIONS_MIGRATION`} before it reuses `atype = 3` for the Custom role.
+///
+/// Its *presence* doubles as the marker that {`CUSTOM_ROLE_REPAIR_MIGRATION`} ran in its current
+/// form. Both files were rewritten after an earlier revision of this feature branch shipped, and
+/// Diesel never re-runs a migration whose version is already in the ledger -- so a database upgraded
+/// by that earlier revision carries the repair migration's version without any of the effects the
+/// current one has.
+const CUSTOM_ROLE_LEGACY_MANAGER_TABLE: &str = "__vw_custom_role_legacy_manager";
 
 /// One of the three groups of granular permission columns, each added by its own migration.
 ///
@@ -653,6 +662,33 @@ const ACCESS_ALL_DROP_MISMATCH_RECOVERY: &str = concat!(
     "Otherwise restore the database backup taken before the upgrade and run the upgrade again."
 );
 
+const MISSING_LEGACY_MANAGER_RECORD_RECOVERY: &str = concat!(
+    "\n\nTwo pieces of information the current migrations rely on were never written, and neither can ",
+    "be recomputed from the schema. Resolve both with every Vaultwarden instance stopped and a backup ",
+    "taken.\n\n",
+    "1) A plain User carrying membership access_all. The earlier revision converted that state into ",
+    "direct assignments to the collections that existed at the time, and then dropped the column; the ",
+    "current one refuses it instead, because the reach also covered collections created later. Those ",
+    "assignments look exactly like ordinary ones, so review whether they are still what you want:\n",
+    "SELECT uc.user_uuid, uc.collection_uuid, uc.read_only, uc.hide_passwords, uc.manage\n",
+    "FROM users_collections uc\n",
+    "INNER JOIN users_organizations uo ON uo.user_uuid = uc.user_uuid\n",
+    "INNER JOIN collections c ON c.uuid = uc.collection_uuid AND c.org_uuid = uo.org_uuid\n",
+    "WHERE uo.atype = 2;\n\n",
+    "2) Which memberships were legacy Managers. Without it, 20260809120000 cannot tell a converted ",
+    "legacy Manager from an ordinary Custom member, and neither can the rollback scripts in ",
+    "tools/custom_role_rollback/. Create the table, then record every membership that held the Manager ",
+    "role before this database was first upgraded:\n",
+    "CREATE TABLE __vw_custom_role_legacy_manager (users_organizations_uuid TEXT NOT NULL PRIMARY KEY);\n",
+    "INSERT INTO __vw_custom_role_legacy_manager (users_organizations_uuid) VALUES ('<MEMBERSHIP_UUID>');\n\n",
+    "Use CHAR(36) instead of TEXT on MySQL/MariaDB and PostgreSQL. Leaving the table empty is valid and ",
+    "means \"no membership was a legacy Manager\": nothing is granted, and a later rollback maps every ",
+    "Custom member to plain User. Creating it is what lets the upgrade continue -- it is the marker ",
+    "that this decision was made.\n\n",
+    "If the database has no Custom members yet, or you still have the backup from before the first ",
+    "upgrade, restoring that backup and upgrading again is simpler and needs no decision at all."
+);
+
 const ALREADY_DROPPED_RECOVERY: &str = concat!(
     "\n\nThe permission values cannot be recomputed from the current schema. Restore the database backup taken ",
     "before the upgrade and run the upgrade again against that restored copy."
@@ -677,6 +713,7 @@ struct CustomRoleMigrationFacts {
     access_all_drop_migration_applied: bool,
     legacy_user_access_all_count: i64,
     same_run_0716_marker: bool,
+    legacy_manager_record_exists: bool,
 }
 
 impl CustomRoleMigrationFacts {
@@ -705,6 +742,7 @@ enum CustomRolePreflightDecision {
     RefuseMissingAccessAll,
     RefuseMissingMigrationLedger,
     RefuseLegacyUserAccessAll,
+    RefuseMissingLegacyManagerRecord,
     RefuseInterruptedAccessAllDrop,
     RefuseAccessAllDropLedgerMismatch,
     RefusePartialPermissionSchema(PermissionColumnGroup),
@@ -730,6 +768,19 @@ fn custom_role_preflight_decision(
     // those states, and the generic Diesel retry then fails on every following start with
     // `Unknown column` (1091) or `Duplicate column name` (1060).
     if facts.repair_migration_applied {
+        // The repair migration is recorded, but not by the version of it that ships today: an earlier
+        // revision of this feature branch wrote that ledger entry, and Diesel never runs a recorded
+        // version again. Two things then differ silently from a fresh upgrade. The old file converted
+        // a plain User carrying membership `access_all` into a point-in-time snapshot of the
+        // collections that existed at the time -- future collections are simply missing -- where the
+        // current one refuses that state and asks an owner to resolve it. And it recorded no legacy
+        // provenance, so 2026-08-09-120000 and tools/custom_role_rollback/ cannot tell a converted
+        // legacy Manager from an ordinary Custom member. Neither is reconstructible from the schema
+        // after `access_all` was dropped, so stop before the remaining migrations run.
+        if !facts.legacy_manager_record_exists {
+            return CustomRolePreflightDecision::RefuseMissingLegacyManagerRecord;
+        }
+
         // The drop is a single statement with no data component, so it is all-or-nothing: either the
         // column is still there and the migration is pending, or the column is gone and the
         // migration is recorded.
@@ -808,6 +859,12 @@ fn custom_role_preflight_error(decision: CustomRolePreflightDecision, facts: Cus
              every collection without any management authority.",
             facts.legacy_user_access_all_count
         ),
+        CustomRolePreflightDecision::RefuseMissingLegacyManagerRecord => format!(
+            "Repair migration {CUSTOM_ROLE_REPAIR_MIGRATION} is recorded, but the \
+             {CUSTOM_ROLE_LEGACY_MANAGER_TABLE} table it writes today does not exist. This database \
+             was upgraded by an earlier revision of the Custom-role change, whose migrations had \
+             different effects and which Diesel will not re-run."
+        ),
         CustomRolePreflightDecision::RefusePartialPermissionSchema(group) => format!(
             "Found {} of the three {} columns ({}) without a completed {} migration. The migration \
              was interrupted between its ALTER TABLE statements.",
@@ -840,6 +897,7 @@ fn custom_role_preflight_error(decision: CustomRolePreflightDecision, facts: Cus
     };
     let recovery = match decision {
         CustomRolePreflightDecision::RefuseLegacyUserAccessAll => LEGACY_USER_ACCESS_ALL_RECOVERY,
+        CustomRolePreflightDecision::RefuseMissingLegacyManagerRecord => MISSING_LEGACY_MANAGER_RECORD_RECOVERY,
         // Once access_all is gone, the collection group's migration can no longer run at all, so
         // neither of the two generic texts may be handed out -- both end in a replay.
         CustomRolePreflightDecision::RefusePartialPermissionSchema(group)
@@ -989,6 +1047,7 @@ mod sqlite_migrations {
         let access_all_drop_migration_applied =
             migration_table_exists && migration_applied(connection, super::DROP_MEMBERSHIP_ACCESS_ALL_MIGRATION)?;
         let same_run_marker_table_exists = table_exists(connection, super::CUSTOM_ROLE_SAME_RUN_MARKER_TABLE)?;
+        let legacy_manager_record_exists = table_exists(connection, super::CUSTOM_ROLE_LEGACY_MANAGER_TABLE)?;
         let same_run_0716_marker = same_run_marker_table_exists
             && count(
                 connection,
@@ -1023,6 +1082,7 @@ mod sqlite_migrations {
             access_all_drop_migration_applied,
             legacy_user_access_all_count,
             same_run_0716_marker,
+            legacy_manager_record_exists,
         };
 
         let decision = super::custom_role_preflight_decision(facts, false);
@@ -1219,6 +1279,7 @@ mod mysql_migrations {
         let access_all_drop_migration_applied =
             migration_table_exists && migration_applied(connection, super::DROP_MEMBERSHIP_ACCESS_ALL_MIGRATION)?;
         let same_run_marker_table_exists = table_exists(connection, super::CUSTOM_ROLE_SAME_RUN_MARKER_TABLE)?;
+        let legacy_manager_record_exists = table_exists(connection, super::CUSTOM_ROLE_LEGACY_MANAGER_TABLE)?;
         let same_run_0716_marker = same_run_marker_table_exists
             && count(
                 connection,
@@ -1253,6 +1314,7 @@ mod mysql_migrations {
             access_all_drop_migration_applied,
             legacy_user_access_all_count,
             same_run_0716_marker,
+            legacy_manager_record_exists,
         };
 
         match super::custom_role_preflight_decision(facts, true) {
@@ -1368,6 +1430,7 @@ mod postgresql_migrations {
         let access_all_drop_migration_applied =
             migration_table_exists && migration_applied(connection, super::DROP_MEMBERSHIP_ACCESS_ALL_MIGRATION)?;
         let same_run_marker_table_exists = table_exists(connection, super::CUSTOM_ROLE_SAME_RUN_MARKER_TABLE)?;
+        let legacy_manager_record_exists = table_exists(connection, super::CUSTOM_ROLE_LEGACY_MANAGER_TABLE)?;
         let same_run_0716_marker = same_run_marker_table_exists
             && count(
                 connection,
@@ -1402,6 +1465,7 @@ mod postgresql_migrations {
             access_all_drop_migration_applied,
             legacy_user_access_all_count,
             same_run_0716_marker,
+            legacy_manager_record_exists,
         };
 
         let decision = super::custom_role_preflight_decision(facts, false);
@@ -1477,12 +1541,61 @@ mod custom_role_migration_preflight_tests {
             access_all_drop_migration_applied: true,
             legacy_user_access_all_count: 0,
             same_run_0716_marker: false,
+            legacy_manager_record_exists: true,
         }
     }
 
     #[test]
     fn repair_marker_makes_completed_state_idempotent() {
         assert_eq!(custom_role_preflight_decision(fully_migrated(), false), Decision::Proceed);
+    }
+
+    /// A database upgraded by an earlier revision of this feature branch carries the repair
+    /// migration's version without the effects the current file has, and Diesel will not run it
+    /// again. The missing legacy-Manager record is the only durable evidence of that, so it has to
+    /// stop the upgrade -- before every check that assumes the repair did what it does today.
+    #[test]
+    fn a_repair_recorded_by_an_earlier_revision_is_refused() {
+        assert_eq!(
+            custom_role_preflight_decision(
+                Facts {
+                    legacy_manager_record_exists: false,
+                    ..fully_migrated()
+                },
+                false,
+            ),
+            Decision::RefuseMissingLegacyManagerRecord
+        );
+
+        // It outranks the schema/ledger checks in the same branch: those describe an interrupted
+        // migration whose replay is safe, which is not what this database needs.
+        assert_eq!(
+            custom_role_preflight_decision(
+                Facts {
+                    legacy_manager_record_exists: false,
+                    access_all_column_exists: true,
+                    ..fully_migrated()
+                },
+                false,
+            ),
+            Decision::RefuseMissingLegacyManagerRecord
+        );
+
+        // Before the repair migration has run there is nothing to be inconsistent with, so the
+        // absent record must not stop a perfectly ordinary upgrade.
+        assert_eq!(
+            custom_role_preflight_decision(
+                Facts {
+                    repair_migration_applied: false,
+                    access_all_drop_migration_applied: false,
+                    access_all_column_exists: true,
+                    legacy_manager_record_exists: false,
+                    ..fully_migrated()
+                },
+                false,
+            ),
+            Decision::Proceed
+        );
     }
 
     /// The repair migration runs *before* the access_all drop and the third permission column group,

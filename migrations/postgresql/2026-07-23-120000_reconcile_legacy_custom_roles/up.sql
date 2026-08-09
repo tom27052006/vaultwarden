@@ -23,16 +23,30 @@ WHERE atype = 2
 LIMIT 1;
 DROP TABLE __vw_legacy_user_access_all_guard;
 
--- Step 1: a legacy Manager -- or a Custom member converted by an earlier revision of this feature --
--- who managed every collection through an organization-local group with `access_all` keeps that
--- authority, materialized into the permission columns it now lives in.
+-- A database that reaches this file with memberships still at `atype = 3` never ran the rewritten
+-- 2026-06-30-120000 -- for instance because a runner applied the files out of order, or because its
+-- ledger recorded an earlier revision of that file. Those rows are unambiguously legacy Managers
+-- *right now*, so record them before the conversion at the end of this file makes them
+-- indistinguishable from modern Custom members. Idempotent, and a no-op on the normal path.
+CREATE TABLE IF NOT EXISTS __vw_custom_role_legacy_manager (
+    users_organizations_uuid CHAR(36) NOT NULL PRIMARY KEY
+);
+INSERT INTO __vw_custom_role_legacy_manager (users_organizations_uuid)
+SELECT uuid FROM users_organizations WHERE atype = 3
+ON CONFLICT DO NOTHING;
+
+-- Step 1: a legacy Manager who managed every collection through an organization-local group with
+-- `access_all` keeps that authority, materialized into the permission columns it now lives in.
 --
--- Earlier revisions derived this authority live from the group instead. That was unsound: "Custom,
--- none of the three collection permissions, member of an `access_all` group" is also the shape of
--- every newly created flagless Custom member, so assigning one to an ordinary `access_all` group
--- handed out organization-wide collection edit and delete, and *removing* a collection permission
--- from a member of such a group activated it. Materializing the authority makes it visible to an
--- owner in the member's permission list and revocable by clearing a checkbox.
+-- Restricted to memberships recorded as legacy Managers. Matching on role and group membership
+-- alone -- which an earlier revision did -- also matches every *modern* flagless Custom member who
+-- happens to sit in an ordinary `access_all` group, because the two states are the same shape, and
+-- would hand them organization-wide collection edit and delete.
+--
+-- Earlier revisions derived this authority live from the group at request time instead, which was
+-- unsound for exactly that reason. Materializing it makes it visible to an owner in the member's
+-- permission list and revocable by clearing a checkbox. It is deliberately a one-time snapshot: the
+-- permission no longer lapses when the source group does. See tools/custom_role_rollback/README.md.
 --
 -- Deliberately not `create_new_collections`: creating collections historically required
 -- membership-level `access_all`, and it is an independent permission now.
@@ -40,6 +54,7 @@ UPDATE users_organizations
 SET edit_any_collection = TRUE,
     delete_any_collection = TRUE
 WHERE atype IN (3, 4)
+  AND uuid IN (SELECT users_organizations_uuid FROM __vw_custom_role_legacy_manager)
   AND EXISTS (
     SELECT 1
     FROM groups_users AS gu
@@ -49,14 +64,16 @@ WHERE atype IN (3, 4)
       AND g.access_all = TRUE
   );
 
--- Step 2: membership `access_all` on a legacy Manager/Custom represented all three collection
--- capabilities. Set only TRUE values so this repair never removes independently configured
--- permissions.
+-- Step 2: membership `access_all` on a legacy Manager represented all three collection capabilities.
+-- Set only TRUE values so this repair never removes independently configured permissions, and again
+-- only for recorded legacy Managers -- an intermediate revision of this feature branch could leave a
+-- modern Custom member carrying the old column as well.
 UPDATE users_organizations
 SET create_new_collections = TRUE,
     edit_any_collection = TRUE,
     delete_any_collection = TRUE
 WHERE atype IN (3, 4)
+  AND uuid IN (SELECT users_organizations_uuid FROM __vw_custom_role_legacy_manager)
   AND access_all = TRUE;
 
 -- Convert only after the legacy bit has been copied.

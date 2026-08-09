@@ -20,7 +20,9 @@ SELECT 1 FROM DUAL
 WHERE NOT EXISTS (
     SELECT 1 FROM information_schema.tables
     WHERE table_schema = DATABASE() AND table_name = '__vw_allow_custom_role_downgrade');
-DROP TABLE __vw_custom_role_downgrade_guard;
+-- `DROP TEMPORARY TABLE`, not `DROP TABLE`: the latter is one more statement that commits
+-- implicitly on MySQL/MariaDB, and it would happily drop a permanent table of the same name.
+DROP TEMPORARY TABLE __vw_custom_role_downgrade_guard;
 
 -- Nothing else to undo: the acknowledgement deliberately survives this step. It has to still be here
 -- when the next revert removes the first permission column, which is what this guard exists to
