@@ -1141,7 +1141,7 @@ impl Membership {
                 .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
                 .filter(
                     users_organizations::atype
-                        .eq_any(vec![MembershipType::Owner as i32, MembershipType::Admin as i32])
+                        .eq_any(ORG_ADMIN_ATYPES)
                         .or(custom_membership_with_edit_any_collection()),
                 )
                 .load::<Self>(conn)

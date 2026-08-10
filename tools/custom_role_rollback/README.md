@@ -123,10 +123,20 @@ there, so on that path the question arrives as nothing but a duplicate-key viola
 One membership matching the shape is deliberately *not* asked about: a legacy Manager whose
 `createNewCollections` is set got all three permissions from its own membership `access_all` bit
 (`2026-07-16-120000`, first statement), which was never bound to a group, so nothing changes meaning
-for it. Only that statement ever sets `createNewCollections` — the group-derived grant does not —
-which is what still distinguishes the two after `2026-07-24-120000` has dropped the column they came
-from. An invited or revoked membership *is* asked about: it holds no authority today, but the
-permission is what it would come back with if it is ever restored.
+for it. `createNewCollections` is only ever written from that stored bit — by that statement, and by
+`2026-07-23-120000`'s second one, which repeats it under the same `access_all = TRUE` condition —
+while the group-derived grant never sets it. That is what still distinguishes the two after
+`2026-07-24-120000` has dropped the column they came from. An invited or revoked membership *is*
+asked about: it holds no authority today, but the permission is what it would come back with if it
+is ever restored.
+
+Answering the question is a different statement depending on when you are asked, because the
+preflight looks ahead from both schemas. Before the upgrade has run there is nothing to clear — the
+permission columns do not exist yet — so declining means ending the group relationship the authority
+comes from, either for one membership (`DELETE FROM groups_users …`) or for the whole group
+(`UPDATE groups SET access_all = FALSE …`). Once the columns exist, clear them directly. Doing that
+after the upgrade is equally safe: Vaultwarden does not start until the acknowledgement is recorded,
+so nothing is ever live in between. The refusal prints both statements.
 
 ## How to run it
 

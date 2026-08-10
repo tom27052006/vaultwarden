@@ -51,10 +51,12 @@
 --     permanent. This is the row the question is actually about.
 --   * `was_legacy_manager = 1` and `create_new_collections = 1` -- the authority came from the
 --     membership's *own* `access_all` bit, which was never bound to a group. 2026-07-16-120000 turns
---     that stored value into all three permissions, and only that statement ever sets
---     `create_new_collections`; the group-derived grant deliberately does not. So the flag is what
---     still tells the two apart after 2026-07-24-120000 has dropped the column they came from, and
---     this row is excluded from the guard below -- nothing changes for it.
+--     that stored value into all three permissions. `create_new_collections` is only ever written
+--     from that stored bit -- by that statement, and by 2026-07-23-120000's second one, which
+--     repeats it under the same `access_all = TRUE` condition; the group-derived grant deliberately
+--     never sets it. So the flag is what still tells the two apart after 2026-07-24-120000 has
+--     dropped the column they came from, and this row is excluded from the guard below -- nothing
+--     changes for it.
 --   * `was_legacy_manager = 0` -- never a Manager. On a database first upgraded by revision bf54088c
 --     they may carry permissions that revision's 2026-08-09-120000 granted in bulk, which nothing can
 --     distinguish from a deliberate grant any more -- check them against what you intended.
