@@ -79,7 +79,7 @@ FROM (
 ) AS c
 WHERE c.n <> 9;
 
--- 3) All eight Custom-role migrations have to be recorded.
+-- 3) All nine Custom-role migrations have to be recorded.
 SELECT CONCAT(
     'REFUSED, nothing was changed: expected all nine Custom-role migrations in ',
     '__diesel_schema_migrations, found ', c.n, '. Schema and ledger disagree, so restore the backup ',
@@ -293,7 +293,7 @@ DROP TABLE IF EXISTS __vw_rollback_manager_allowlist;
 DROP TABLE IF EXISTS __vw_custom_role_legacy_manager;
 DROP TABLE IF EXISTS __vw_custom_role_history_verified;
 
--- Finally forget the eight migrations, so the older binary does not see a ledger from the future
+-- Finally forget the nine migrations, so the older binary does not see a ledger from the future
 -- and a later upgrade applies them again from a clean state.
 DELETE FROM __diesel_schema_migrations
 WHERE version IN (

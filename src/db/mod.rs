@@ -964,25 +964,38 @@ fn custom_role_preflight_error(decision: CustomRolePreflightDecision, facts: Cus
     .into()
 }
 
+/// The shapes a half-applied {`CUSTOM_COLLECTION_PERMISSIONS_MIGRATION`} may legitimately have left
+/// behind, expressed as a count of the rows that have any *other* shape.
+///
+/// `allow_same_run_group_derived` additionally permits the result of that migration's second data
+/// statement. That statement is driven by {`CUSTOM_ROLE_LEGACY_MANAGER_TABLE`}, so the allowance
+/// carries the same condition: a 0/1/1 row belonging to a membership that is *not* on record as a
+/// legacy Manager cannot have come from the migration that ships today, and counting it as expected
+/// would let the automatic recovery adopt a grant nothing can account for. The caller therefore only
+/// passes `true` when that record actually exists — without it the shape is undecidable, and the
+/// recovery refuses rather than guessing.
 #[cfg(any(mysql, test))]
 fn mysql_partial_unexpected_values_query(allow_same_run_group_derived: bool) -> String {
     let same_run_group_derived = if allow_same_run_group_derived {
-        " OR \
-         (atype = 4 \
-          AND access_all = FALSE \
-          AND create_new_collections = FALSE \
-          AND edit_any_collection = TRUE \
-          AND delete_any_collection = TRUE \
-          AND EXISTS ( \
-              SELECT 1 \
-              FROM groups_users AS gu \
-              INNER JOIN `groups` AS g ON g.uuid = gu.groups_uuid \
-              WHERE gu.users_organizations_uuid = users_organizations.uuid \
-                AND g.organizations_uuid = users_organizations.org_uuid \
-                AND g.access_all = TRUE \
-          ))"
+        format!(
+            " OR \
+             (atype = 4 \
+              AND access_all = FALSE \
+              AND create_new_collections = FALSE \
+              AND edit_any_collection = TRUE \
+              AND delete_any_collection = TRUE \
+              AND uuid IN (SELECT users_organizations_uuid FROM {CUSTOM_ROLE_LEGACY_MANAGER_TABLE}) \
+              AND EXISTS ( \
+                  SELECT 1 \
+                  FROM groups_users AS gu \
+                  INNER JOIN `groups` AS g ON g.uuid = gu.groups_uuid \
+                  WHERE gu.users_organizations_uuid = users_organizations.uuid \
+                    AND g.organizations_uuid = users_organizations.org_uuid \
+                    AND g.access_all = TRUE \
+              ))"
+        )
     } else {
-        ""
+        String::new()
     };
 
     format!(
@@ -1244,8 +1257,17 @@ mod mysql_migrations {
 
         connection.transaction::<(), diesel::result::Error, _>(|connection| {
             // This is the first data statement from the canonical migration. It also resets an
-            // exact, same-run group-derived 0/1/1 row to 0/0/0; that authority remains dynamically
-            // derived from the group, and the separate 07-23 repair then reconciles the role.
+            // exact, same-run group-derived 0/1/1 row to 0/0/0. That is deliberate: this completion
+            // path is not where legacy group authority is decided. Nothing derives it at request
+            // time any more -- the live fallback is gone -- so the reset is not "the group still
+            // covers it"; it is "leave the columns at the value this statement defines, and let the
+            // repair migration re-establish the authority from the legacy-Manager record". The
+            // canonical file's second statement is deliberately *not* replayed here, because the
+            // record it has to be driven by is the same one 2026-07-23-120000 reads a moment later.
+            //
+            // The two runs therefore converge: a recorded legacy Manager in an access_all group gets
+            // its 0/1/1 back from 2026-07-23-120000, and a membership that is not on the record
+            // keeps 0/0/0 -- which is the whole point of driving the grant by provenance.
             diesel::sql_query(
                 "UPDATE users_organizations \
                  SET create_new_collections = access_all, \
@@ -1367,7 +1389,12 @@ mod mysql_migrations {
         match super::custom_role_preflight_decision(facts, true) {
             super::CustomRolePreflightDecision::Proceed => Ok(()),
             super::CustomRolePreflightDecision::CompleteMysqlCollectionMigration => {
-                complete_partial_collection_migration(connection, same_run_0716_marker)
+                // The same-run allowance reads the legacy-Manager record, so it may only be offered
+                // when that record exists. Everywhere this decision is normally reachable it does --
+                // the history refusal above already requires it -- but the recovery must not depend
+                // on that: without the record the group-derived shape cannot be attributed to
+                // anything, and refusing is the correct answer.
+                complete_partial_collection_migration(connection, same_run_0716_marker && legacy_manager_record_exists)
             }
             super::CustomRolePreflightDecision::CompleteInterruptedAccessAllDrop => {
                 complete_interrupted_access_all_drop(connection)
@@ -1412,15 +1439,39 @@ mod postgresql_migrations {
         diesel::sql_query(query).get_result::<Count>(connection).map(|row| row.count)
     }
 
+    /// Resolved through `to_regclass`, i.e. exactly the way an unqualified name in a migration is
+    /// resolved -- and deliberately *not* through `table_schema = current_schema()`.
+    ///
+    /// `current_schema()` is the first *existing* schema on the `search_path`, which is where new
+    /// objects are created. It is not necessarily the schema an existing table is found in: with
+    /// `search_path = decoy, real` and the tables in `real`, `current_schema()` answers `decoy`, the
+    /// lookup finds nothing, and `preflight` returns early on `!memberships_table_exists` -- silently
+    /// skipping every check while Diesel then runs the migrations against `real`. `to_regclass`
+    /// walks the same path the migrations do, so the preflight and the statements it is guarding can
+    /// no longer disagree about which table they mean. (`tools/custom_role_rollback/postgresql.sql`
+    /// defends against the same split by binding the namespace once.)
     fn table_exists(connection: &mut diesel::pg::PgConnection, table: &str) -> Result<bool, diesel::result::Error> {
+        count(connection, format!("SELECT COUNT(*) AS count FROM pg_class WHERE oid = to_regclass('{table}')"))
+            .map(|value| value != 0)
+    }
+
+    /// Columns of `users_organizations`, resolved through the same `to_regclass` lookup as
+    /// [`table_exists`] so a `search_path` split cannot make the schema and the column checks
+    /// describe two different tables.
+    fn column_count(
+        connection: &mut diesel::pg::PgConnection,
+        column_list: &str,
+    ) -> Result<i64, diesel::result::Error> {
         count(
             connection,
             format!(
-                "SELECT COUNT(*) AS count FROM information_schema.tables \
-                 WHERE table_schema = current_schema() AND table_name = '{table}'"
+                "SELECT COUNT(*) AS count FROM pg_attribute \
+                 WHERE attrelid = to_regclass('users_organizations') \
+                   AND attnum > 0 \
+                   AND NOT attisdropped \
+                   AND attname IN ({column_list})"
             ),
         )
-        .map(|value| value != 0)
     }
 
     fn migration_applied(
@@ -1444,27 +1495,11 @@ mod postgresql_migrations {
         }
 
         let migration_table_exists = table_exists(connection, "__diesel_schema_migrations")?;
-        let access_all_column_exists = count(
-            connection,
-            "SELECT COUNT(*) AS count FROM information_schema.columns \
-             WHERE table_schema = current_schema() \
-               AND table_name = 'users_organizations' \
-               AND column_name = 'access_all'",
-        )? != 0;
-        let permission_columns = |connection: &mut diesel::pg::PgConnection,
-                                  group: super::PermissionColumnGroup|
-         -> Result<i64, diesel::result::Error> {
-            count(
-                connection,
-                format!(
-                    "SELECT COUNT(*) AS count FROM information_schema.columns                      WHERE table_schema = current_schema()                        AND table_name = 'users_organizations'                        AND column_name IN ({})",
-                    group.column_list()
-                ),
-            )
-        };
-        let manage_permission_columns = permission_columns(connection, super::PermissionColumnGroup::Manage)?;
-        let collection_permission_columns = permission_columns(connection, super::PermissionColumnGroup::Collection)?;
-        let access_permission_columns = permission_columns(connection, super::PermissionColumnGroup::Access)?;
+        let access_all_column_exists = column_count(connection, "'access_all'")? != 0;
+        let manage_permission_columns = column_count(connection, super::PermissionColumnGroup::Manage.column_list())?;
+        let collection_permission_columns =
+            column_count(connection, super::PermissionColumnGroup::Collection.column_list())?;
+        let access_permission_columns = column_count(connection, super::PermissionColumnGroup::Access.column_list())?;
 
         let manage_permissions_migration_applied =
             migration_table_exists && migration_applied(connection, super::CUSTOM_ROLE_MANAGE_PERMISSIONS_MIGRATION)?;
@@ -1533,6 +1568,167 @@ mod postgresql_migrations {
 
         connection.run_pending_migrations(MIGRATIONS).expect("Error running migrations");
         Ok(())
+    }
+}
+
+/// Executes the real migration files against a throwaway SQLite database.
+///
+/// Everything else in this file tests the *decision* the preflight makes; nothing tested the SQL the
+/// decision is protecting. The one rule those files encode -- legacy authority is granted from the
+/// recorded provenance, never from the shape of a membership -- is invisible to a Rust test unless
+/// the statements actually run, and it is a rule that was already lost once: `2026-07-16-120000`
+/// kept granting `edit_any_collection` / `delete_any_collection` to every Custom member of an
+/// `access_all` group after `2026-07-23-120000` and `2026-08-09-120000` had been narrowed to the
+/// record. `edit_any_collection` satisfies `has_full_access()`, so that reached every cipher in the
+/// organization.
+#[cfg(all(test, sqlite))]
+mod custom_role_migration_sql_tests {
+    use diesel::connection::SimpleConnection;
+    use diesel::{Connection, RunQueryDsl, sql_types::BigInt, sqlite::SqliteConnection};
+
+    const ADD_COLLECTION_PERMISSIONS: &str =
+        include_str!("../../migrations/sqlite/2026-07-16-120000_add_custom_collection_permissions/up.sql");
+
+    /// The shape `users_organizations` has when `2026-07-16-120000` runs: `2026-06-30-120000` has
+    /// added the three management columns and converted `atype = 3` to `4`, and membership
+    /// `access_all` still exists (`2026-07-24-120000` drops it later).
+    const SCHEMA_BEFORE_0716: &str = "
+        CREATE TABLE users_organizations (
+            uuid TEXT NOT NULL PRIMARY KEY,
+            user_uuid TEXT NOT NULL,
+            org_uuid TEXT NOT NULL,
+            access_all BOOLEAN NOT NULL DEFAULT FALSE,
+            akey TEXT NOT NULL DEFAULT '',
+            status INTEGER NOT NULL DEFAULT 2,
+            atype INTEGER NOT NULL,
+            manage_users BOOLEAN NOT NULL DEFAULT FALSE,
+            manage_groups BOOLEAN NOT NULL DEFAULT FALSE,
+            manage_policies BOOLEAN NOT NULL DEFAULT FALSE
+        );
+        CREATE TABLE groups (
+            uuid TEXT NOT NULL PRIMARY KEY,
+            organizations_uuid TEXT NOT NULL,
+            access_all BOOLEAN NOT NULL DEFAULT FALSE
+        );
+        CREATE TABLE groups_users (
+            groups_uuid TEXT NOT NULL,
+            users_organizations_uuid TEXT NOT NULL,
+            PRIMARY KEY (groups_uuid, users_organizations_uuid)
+        );
+    ";
+
+    const LEGACY_MANAGER_RECORD: &str = "
+        CREATE TABLE __vw_custom_role_legacy_manager (
+            users_organizations_uuid TEXT NOT NULL PRIMARY KEY
+        );
+    ";
+
+    /// Two memberships that are byte-identical in role and group membership and differ only in their
+    /// recorded provenance, plus a recorded Manager that is in no group at all.
+    const MEMBERSHIPS: &str = "
+        INSERT INTO groups (uuid, organizations_uuid, access_all) VALUES ('g_all', 'org', TRUE);
+        INSERT INTO users_organizations (uuid, user_uuid, org_uuid, access_all, atype) VALUES
+            ('m_recorded',   'u1', 'org', FALSE, 4),
+            ('m_unrecorded', 'u2', 'org', FALSE, 4),
+            ('m_no_group',   'u3', 'org', FALSE, 4);
+        INSERT INTO groups_users (groups_uuid, users_organizations_uuid) VALUES
+            ('g_all', 'm_recorded'),
+            ('g_all', 'm_unrecorded');
+    ";
+
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = BigInt)]
+        count: i64,
+    }
+
+    fn count(connection: &mut SqliteConnection, query: &str) -> i64 {
+        diesel::sql_query(query).get_result::<Count>(connection).map(|row| row.count).unwrap()
+    }
+
+    fn collection_permissions(connection: &mut SqliteConnection, membership: &str) -> (bool, bool, bool) {
+        let flag = |connection: &mut SqliteConnection, column: &str| {
+            count(
+                connection,
+                &format!(
+                    "SELECT COUNT(*) AS count FROM users_organizations \
+                     WHERE uuid = '{membership}' AND {column} = TRUE"
+                ),
+            ) != 0
+        };
+        (
+            flag(connection, "create_new_collections"),
+            flag(connection, "edit_any_collection"),
+            flag(connection, "delete_any_collection"),
+        )
+    }
+
+    fn connect(setup: &[&str]) -> SqliteConnection {
+        let mut connection = SqliteConnection::establish(":memory:").unwrap();
+        for statements in setup {
+            connection.batch_execute(statements).unwrap();
+        }
+        connection
+    }
+
+    /// Membership `access_all` is a stored value, not a shape, so it carries its own evidence and is
+    /// converted for every Custom member that holds it.
+    #[test]
+    fn membership_access_all_becomes_all_three_collection_permissions() {
+        let mut connection = connect(&[SCHEMA_BEFORE_0716, LEGACY_MANAGER_RECORD, MEMBERSHIPS]);
+        connection
+            .batch_execute("UPDATE users_organizations SET access_all = TRUE WHERE uuid = 'm_unrecorded'")
+            .unwrap();
+
+        connection.batch_execute(ADD_COLLECTION_PERMISSIONS).unwrap();
+
+        assert_eq!(collection_permissions(&mut connection, "m_unrecorded"), (true, true, true));
+    }
+
+    /// The regression this test exists for. `m_recorded` and `m_unrecorded` differ in nothing a
+    /// query at request time could see -- same role, same organization, same `access_all` group --
+    /// so only the provenance record may decide, and it must not leak organization-wide collection
+    /// authority to the membership that has none.
+    #[test]
+    fn group_derived_authority_is_granted_only_to_recorded_legacy_managers() {
+        let mut connection = connect(&[SCHEMA_BEFORE_0716, LEGACY_MANAGER_RECORD, MEMBERSHIPS]);
+        connection
+            .batch_execute(
+                "INSERT INTO __vw_custom_role_legacy_manager (users_organizations_uuid) \
+                 VALUES ('m_recorded'), ('m_no_group')",
+            )
+            .unwrap();
+
+        connection.batch_execute(ADD_COLLECTION_PERMISSIONS).unwrap();
+
+        // Edit and delete, never create: creating collections historically required membership
+        // `access_all`, which this member does not have.
+        assert_eq!(collection_permissions(&mut connection, "m_recorded"), (false, true, true));
+        // Not on record: identical in shape, and it gets nothing.
+        assert_eq!(collection_permissions(&mut connection, "m_unrecorded"), (false, false, false));
+        // On record, but its authority never came from a group.
+        assert_eq!(collection_permissions(&mut connection, "m_no_group"), (false, false, false));
+    }
+
+    /// Without the record the grant is undecidable, so the migration refuses -- and it has to refuse
+    /// *before* the `ALTER TABLE`s. On MySQL/MariaDB every one of them commits on its own, so a
+    /// guard placed after them would leave a half-added column group behind, which is exactly the
+    /// state `RefusePartialPermissionSchema` then has to talk an operator out of.
+    #[test]
+    fn the_migration_refuses_without_the_record_and_adds_no_column() {
+        let mut connection = connect(&[SCHEMA_BEFORE_0716, MEMBERSHIPS]);
+
+        assert!(connection.batch_execute(ADD_COLLECTION_PERMISSIONS).is_err());
+
+        assert_eq!(
+            count(
+                &mut connection,
+                "SELECT COUNT(*) AS count FROM pragma_table_info('users_organizations') \
+                 WHERE name IN ('create_new_collections', 'edit_any_collection', 'delete_any_collection')"
+            ),
+            0,
+            "the guard has to run before the ALTER TABLEs, or MySQL keeps the partial column group"
+        );
     }
 }
 
@@ -2050,6 +2246,9 @@ mod custom_role_migration_preflight_tests {
         let query = mysql_partial_unexpected_values_query(false);
         assert!(!query.contains(super::CUSTOM_ROLE_SAME_RUN_MARKER_TABLE));
         assert!(!query.contains("groups_users"));
+        // Without the allowance the query reads users_organizations only, so it stays answerable on
+        // a database that has no provenance record at all.
+        assert!(!query.contains(super::CUSTOM_ROLE_LEGACY_MANAGER_TABLE));
     }
 
     #[test]
@@ -2061,6 +2260,22 @@ mod custom_role_migration_preflight_tests {
         assert!(query.contains("INNER JOIN `groups` AS g"));
         assert!(query.contains("g.organizations_uuid = users_organizations.org_uuid"));
         assert!(query.contains("g.access_all = TRUE"));
+    }
+
+    /// The allowance describes what 2026-07-16-120000 can produce, and that statement is driven by
+    /// the legacy-Manager record. A 0/1/1 row for a membership that is not on the record therefore
+    /// has no legitimate source, and must not be counted as an expected shape -- otherwise the
+    /// automatic MySQL recovery would adopt a grant nothing can account for.
+    #[test]
+    fn the_same_run_allowance_is_bound_to_the_legacy_manager_record() {
+        let query = mysql_partial_unexpected_values_query(true);
+        assert!(
+            query.contains(&format!(
+                "uuid IN (SELECT users_organizations_uuid FROM {})",
+                super::CUSTOM_ROLE_LEGACY_MANAGER_TABLE
+            )),
+            "{query}"
+        );
     }
 
     #[test]
