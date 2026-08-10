@@ -109,9 +109,24 @@ membership, and the result is deliberately not identical to what it replaces:
 
 Doing that silently would be a migration granting durable organization-wide collection edit and
 delete on its own authority; dropping it silently would take a capability away. Neither is the
-migration's call, so it hands the decision to an owner. The migration file lists the review query and
-the acknowledgement; on a database that never combined the Manager role with an `accessAll` group —
-the common case — there is nothing to decide and it is a no-op.
+migration's call, so it hands the decision to an owner. On a database that never combined the Manager
+role with an `accessAll` group — the common case — there is nothing to decide and it is a no-op.
+
+**Start Vaultwarden once to get the question.** The startup preflight looks ahead for the same
+condition, from the legacy schema as well as the migrated one, and refuses with the review query, the
+three differences above and the acknowledgement statement
+(`RefuseUnconfirmedPermanentCollectionAuthority` in `src/db/mod.rs`). The migration keeps its own
+guard as the backstop for a bare `diesel migration run`, but Diesel reports only the driver error
+there, so on that path the question arrives as nothing but a duplicate-key violation on
+`__vw_permanent_authority_guard`.
+
+One membership matching the shape is deliberately *not* asked about: a legacy Manager whose
+`createNewCollections` is set got all three permissions from its own membership `access_all` bit
+(`2026-07-16-120000`, first statement), which was never bound to a group, so nothing changes meaning
+for it. Only that statement ever sets `createNewCollections` — the group-derived grant does not —
+which is what still distinguishes the two after `2026-07-24-120000` has dropped the column they came
+from. An invited or revoked membership *is* asked about: it holds no authority today, but the
+permission is what it would come back with if it is ever restored.
 
 ## How to run it
 

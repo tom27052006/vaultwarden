@@ -1498,6 +1498,54 @@ mod tests {
         }
     }
 
+    /// A stored `atype` that no role maps to is *incomparable*, and the two directions of the
+    /// comparison resolve that deliberately differently. Both overrides exist to keep the answer
+    /// fail-closed; neither was pinned by a test, and the asymmetry is easy to "tidy up" into a
+    /// silent authorization change.
+    ///
+    /// `MembershipType op i32` — "does the caller outrank this role?" — answers no: `gt`/`ge` are
+    /// false for an unknown value, so nothing is ever granted on the strength of one.
+    ///
+    /// `i32 op MembershipType` — "is this membership at most that role?" — answers yes: `lt`/`le`
+    /// are true. Every use of it is a *ceiling* (`atype < Admin`, `atype <= Admin`), so treating an
+    /// unrecognized value as low-ranked is the restrictive reading. It also cannot smuggle anything
+    /// past the one place that phrases a permission this way
+    /// (`check_reset_password_applicable_and_permissions`): the role an Admin must not reach is
+    /// `Owner`, whose discriminant is 0 and therefore never unknown.
+    #[test]
+    #[expect(
+        clippy::nonminimal_bool,
+        reason = "`!(role > atype)` must not become `role <= atype`: only `gt`/`ge` are overridden to \
+                  answer false for an incomparable value, while `le`/`lt` fall through to the derived \
+                  form. Clippy's rewrite would assert the opposite of what this test is for."
+    )]
+    fn an_unknown_stored_role_is_incomparable_and_resolves_fail_closed() {
+        for atype in [-1, 3, 5, i32::MAX, i32::MIN] {
+            assert_eq!(MembershipType::Admin.partial_cmp(&atype), None, "atype {atype}");
+            assert_eq!(atype.partial_cmp(&MembershipType::Admin), None, "atype {atype}");
+
+            // Never outranked by an unknown value: no permission is granted on its strength.
+            for role in [MembershipType::Owner, MembershipType::Admin, MembershipType::Custom, MembershipType::User] {
+                let known = role as i32;
+                assert!(!(role > atype), "atype {atype} must not be outranked by role {known}");
+                assert!(!(role >= atype), "atype {atype} must not be outranked by role {known}");
+            }
+
+            // Always under the ceiling: an unknown value is treated as the lowest rank there is.
+            assert!(atype < MembershipType::Admin, "atype {atype}");
+            assert!(atype <= MembershipType::Admin, "atype {atype}");
+
+            // And it is equal to nothing, in either direction.
+            assert!(atype != MembershipType::Custom, "atype {atype}");
+            assert!(MembershipType::Custom != atype, "atype {atype}");
+        }
+
+        // The known values keep behaving by rank, not by discriminant: Custom's is 4, above Admin's.
+        assert!(MembershipType::Admin > MembershipType::Custom as i32);
+        assert!((MembershipType::Custom as i32) < MembershipType::Admin);
+        assert!(MembershipType::Custom >= MembershipType::Custom as i32);
+    }
+
     #[test]
     fn custom_collection_permissions_are_independent_and_type_gated() {
         let mut member = membership(MembershipType::Custom);

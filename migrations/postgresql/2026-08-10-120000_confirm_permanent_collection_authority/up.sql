@@ -22,6 +22,12 @@
 -- On a database that never combined the legacy Manager role with an `access_all` group -- the common
 -- case -- there is nothing to decide and this is a no-op.
 --
+-- Vaultwarden's startup preflight looks ahead for exactly the condition below and refuses with the
+-- full text (`RefuseUnconfirmedPermanentCollectionAuthority` in `src/db/mod.rs`), from the legacy
+-- schema as well, so an operator normally never reaches the abort here. Diesel reports only the
+-- driver error, so on this path the question would arrive as a bare duplicate-key violation on
+-- `__vw_permanent_authority_guard` and nothing else. Keep the two predicates identical.
+--
 -- Review the affected memberships:
 --
 --     SELECT uo.uuid, uo.user_uuid, uo.org_uuid, uo.status,
@@ -38,10 +44,25 @@
 --           AND g.organizations_uuid = uo.org_uuid
 --           AND g.access_all);
 --
--- Rows with `was_legacy_manager = 1` are the conversion described above. Rows with `0` were never
--- Managers: on a database first upgraded by revision bf54088c they may carry permissions that
--- revision's 2026-08-09-120000 granted in bulk, which nothing can distinguish from a deliberate grant
--- any more -- check them against what you intended.
+-- Reading the result:
+--
+--   * `was_legacy_manager = t` and `create_new_collections = f` -- the conversion described above.
+--     This membership's collection authority came from the group, and it is about to become
+--     permanent. This is the row the question is actually about.
+--   * `was_legacy_manager = t` and `create_new_collections = t` -- the authority came from the
+--     membership's *own* `access_all` bit, which was never bound to a group. 2026-07-16-120000 turns
+--     that stored value into all three permissions, and only that statement ever sets
+--     `create_new_collections`; the group-derived grant deliberately does not. So the flag is what
+--     still tells the two apart after 2026-07-24-120000 has dropped the column they came from, and
+--     this row is excluded from the guard below -- nothing changes for it.
+--   * `was_legacy_manager = f` -- never a Manager. On a database first upgraded by revision bf54088c
+--     they may carry permissions that revision's 2026-08-09-120000 granted in bulk, which nothing can
+--     distinguish from a deliberate grant any more -- check them against what you intended.
+--
+-- An invited or revoked membership is listed too, and deliberately so. It holds no authority today --
+-- every guard requires a confirmed membership, and `MembershipStatus::from_i32` rejects the revoked
+-- value outright -- but the permission is what it would come back with if it is ever restored, and
+-- by then the group it came from may be gone. Status is therefore not part of the predicate.
 --
 -- Clear whatever you do not want to keep, for example:
 --
@@ -55,6 +76,21 @@
 --
 -- The acknowledgement is consumed at the end of this file, so one decision covers one upgrade.
 --
+-- The legacy-Manager record has to exist already: the predicate below reads it to tell a
+-- group-derived conversion from a membership that always held its authority outright. Refuse rather
+-- than let the reference fail as `relation does not exist` half a statement later; see
+-- 2026-07-23-120000 for why this never creates it.
+--
+-- The duplicate key aborts the migration. It is only inserted while the record table is absent.
+CREATE TEMPORARY TABLE __vw_legacy_manager_record_guard (
+    blocked INTEGER NOT NULL PRIMARY KEY
+);
+INSERT INTO __vw_legacy_manager_record_guard (blocked) VALUES (1);
+INSERT INTO __vw_legacy_manager_record_guard (blocked)
+SELECT 1
+WHERE to_regclass('__vw_custom_role_legacy_manager') IS NULL;
+DROP TABLE __vw_legacy_manager_record_guard;
+
 -- The duplicate key aborts the migration. It is only inserted while an unconfirmed membership exists.
 CREATE TEMPORARY TABLE __vw_permanent_authority_guard (
     blocked INTEGER NOT NULL PRIMARY KEY
@@ -65,6 +101,10 @@ SELECT 1
 FROM users_organizations AS uo
 WHERE uo.atype = 4
   AND (uo.edit_any_collection = TRUE OR uo.delete_any_collection = TRUE)
+  AND NOT (
+    uo.create_new_collections = TRUE
+    AND uo.uuid IN (SELECT users_organizations_uuid FROM __vw_custom_role_legacy_manager)
+  )
   AND EXISTS (
     SELECT 1
     FROM groups_users AS gu
