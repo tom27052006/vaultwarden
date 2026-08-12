@@ -1083,6 +1083,19 @@ pub(crate) async fn can_edit_collection(
     can_manage_collection(collection_edit_access(membership), membership, collection_uuid, conn).await
 }
 
+/// Whether `membership` may read a collection's user/group access mappings.
+///
+/// Keep body/bulk endpoints on exactly the same authorization rule as `CollectionReadHeaders`:
+/// Admin/Owner, Edit-any/Delete-any, or a real per-collection Manage assignment. Ordinary read
+/// access and group `access_all` deliberately do not qualify.
+pub(crate) async fn can_read_collection_access(
+    membership: &Membership,
+    collection_uuid: &CollectionId,
+    conn: &DbConn,
+) -> bool {
+    can_manage_collection(collection_read_access(membership), membership, collection_uuid, conn).await
+}
+
 /// ManagerHeaders authorizes collection updates. A Custom member with Edit any collection can
 /// update every collection; otherwise the caller must be a Custom member (or above) holding the
 /// per-collection Manage permission. Read and delete use separate guards so Edit cannot

@@ -19,8 +19,8 @@
 -- ours to choose, so this migration stops and hands the decision to an owner. It grants nothing and
 -- revokes nothing itself.
 --
--- On a database that never combined the legacy Manager role with an `access_all` group -- the common
--- case -- there is nothing to decide and this is a no-op.
+-- On a database with no Custom membership that both has edit/delete authority and belongs to an
+-- organization-local `access_all` group, there is nothing to decide and this is a no-op.
 --
 -- Vaultwarden's startup preflight looks ahead for exactly the condition below and refuses with the
 -- full text (`RefuseUnconfirmedPermanentCollectionAuthority` in `src/db/mod.rs`), from the legacy
@@ -46,17 +46,11 @@
 --
 -- Reading the result:
 --
---   * `was_legacy_manager = t` and `create_new_collections = f` -- the conversion described above.
---     This membership's collection authority came from the group, and it is about to become
---     permanent. This is the row the question is actually about.
---   * `was_legacy_manager = t` and `create_new_collections = t` -- the authority came from the
---     membership's *own* `access_all` bit, which was never bound to a group. 2026-07-16-120000 turns
---     that stored value into all three permissions. `create_new_collections` is only ever written
---     from that stored bit -- by that statement, and by 2026-07-23-120000's second one, which
---     repeats it under the same `access_all = TRUE` condition; the group-derived grant deliberately
---     never sets it. So the flag is what still tells the two apart after 2026-07-24-120000 has
---     dropped the column they came from, and this row is excluded from the guard below -- nothing
---     changes for it.
+--   * `was_legacy_manager = t` -- a converted Manager. Review it even when
+--     `create_new_collections = t`: that independent permission can be changed after an earlier
+--     revision materialized group-derived edit/delete, so its current value cannot prove where those
+--     two permissions came from. A membership whose own legacy `access_all` supplied all three may
+--     therefore be listed conservatively even though its authority was already permanent.
 --   * `was_legacy_manager = f` -- never a Manager. On a database first upgraded by revision bf54088c
 --     they may carry permissions that revision's 2026-08-09-120000 granted in bulk, which nothing can
 --     distinguish from a deliberate grant any more -- check them against what you intended.
@@ -78,10 +72,9 @@
 --
 -- The acknowledgement is consumed at the end of this file, so one decision covers one upgrade.
 --
--- The legacy-Manager record has to exist already: the predicate below reads it to tell a
--- group-derived conversion from a membership that always held its authority outright. Refuse rather
--- than let the reference fail as `relation does not exist` half a statement later; see
--- 2026-07-23-120000 for why this never creates it.
+-- The legacy-Manager record has to exist already: the chain and supported rollback use it as the
+-- immutable role-provenance record. Refuse a damaged history here too; see 2026-07-23-120000 for why
+-- this never creates it.
 --
 -- The duplicate key aborts the migration. It is only inserted while the record table is absent.
 CREATE TEMPORARY TABLE __vw_legacy_manager_record_guard (
@@ -103,10 +96,6 @@ SELECT 1
 FROM users_organizations AS uo
 WHERE uo.atype = 4
   AND (uo.edit_any_collection = TRUE OR uo.delete_any_collection = TRUE)
-  AND NOT (
-    uo.create_new_collections = TRUE
-    AND uo.uuid IN (SELECT users_organizations_uuid FROM __vw_custom_role_legacy_manager)
-  )
   AND EXISTS (
     SELECT 1
     FROM groups_users AS gu
