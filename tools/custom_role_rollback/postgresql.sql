@@ -204,11 +204,9 @@ BEGIN
         ns_name
     );
 
-    -- Bookkeeping tables this feature may have left behind. None of them carries state a later
-    -- re-upgrade needs: it reads the restored `atype = 3` rows directly, and it asks for its own
-    -- acknowledgements again.
+    -- The two decisions this rollback required. A later re-upgrade needs neither: it reads the
+    -- restored `atype = 3` rows directly and converts them deterministically.
     EXECUTE format('DROP TABLE IF EXISTS %I.__vw_allow_custom_role_downgrade', ns_name);
-    EXECUTE format('DROP TABLE IF EXISTS %I.__vw_ack_permanent_collection_authority', ns_name);
     EXECUTE format('DROP TABLE IF EXISTS %I.__vw_rollback_manager_allowlist', ns_name);
 
     -- Finally forget the migration, so the older binary does not see a ledger from the future and a

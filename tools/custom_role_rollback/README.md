@@ -84,48 +84,47 @@ Edit-any-collection deliberately does **not** become `access_all` on its own: in
 flag also carried the legacy "manage all collections" authority including deletion, so a member who
 only held Edit must not come back with delete rights.
 
-## The upgrade asks one question of its own
+## How group-derived Manager authority is migrated
 
-The upgrade — not the rollback — stops when a legacy **Manager** whose own `access_all` bit is
-`FALSE` belongs to an organization-local group with `accessAll`. It grants nothing and revokes
-nothing; it exists because that combination is the one place where the new model cannot reproduce the
-old semantics.
+Before the Custom role, a Manager could reach every collection of an organization in two ways: the
+membership's own `access_all` bit, or membership of an organization-local group with `accessAll`.
+The upgrade preserves both, deterministically and without asking:
 
-Before the Custom role, a Manager who reached every collection through such a group held that
-authority *while* the group relationship lasted: it ended when the group was deleted, when its
-`accessAll` was cleared, when the member left it, and it was inert whenever `ORG_GROUPS_ENABLED` was
-false. Nothing in the new model expresses a permission bound to a group like that — the permissions
-live on the membership. The migration therefore writes the authority onto the membership, and the
-result is deliberately not identical to what it replaces:
+| Legacy Manager has | After the upgrade |
+|---|---|
+| membership `access_all = TRUE` | `createNewCollections` + `editAnyCollection` + `deleteAnyCollection` |
+| only an organization-local `accessAll` group | `editAnyCollection` + `deleteAnyCollection` |
+| neither | no collection permission |
+
+Collection *creation* is deliberately not granted in the second row: it always required the
+membership bit, never the group.
+
+The second row is a policy choice worth knowing about. The group-derived capability used to be
+dynamic — it ended when the group was deleted, when its `accessAll` was cleared, when the member left
+it, and it was inert whenever `ORG_GROUPS_ENABLED` was false. Nothing in the new model is bound to a
+group like that, so it becomes a membership permission and therefore:
 
 - it no longer lapses when the last qualifying group disappears, or when `accessAll` is cleared;
 - it applies even with the groups feature switched off;
 - `editAnyCollection` additionally satisfies `has_full_access()`, so the member reaches every
   collection directly rather than through the group.
 
-Doing that silently would be a migration granting durable organization-wide collection edit and
-delete on its own authority; dropping it silently would take a capability away. Neither is the
-migration's call, so it hands the decision to an owner. On a database with no such membership there
-is nothing to decide and the upgrade runs straight through.
+That is accepted on purpose. The alternatives are worse: silently dropping the permission would
+revoke access these members have today, and refusing to migrate would block an ordinary upgrade from
+an official Vaultwarden database. After the upgrade the permission is visible in the member's
+permission list and an owner can clear it with a checkbox — which is more than the old model offered,
+where the same authority was invisible on the membership.
 
-A Manager who also carries the membership `access_all` bit is deliberately **not** part of the
-question: that bit is already a durable membership-level grant, so turning it into the three
-collection permissions changes no meaning. An invited, accepted or revoked membership *is* asked
-about — it holds no authority today, but the permission is what it would come back with if the
-membership is ever restored, and by then the group may be gone.
+`groups.access_all` and every `groups_users` row are left exactly as they are, so the group keeps
+granting collection *access* to its members as before. A `groups_users` row pointing at another
+organization's `accessAll` group conveys nothing, exactly as it conveys nothing today.
 
-**Start Vaultwarden once to get the question.** The startup preflight evaluates the migration's own
-predicate before Diesel runs and refuses with the review query, the three differences above and the
-acknowledgement statement (`RefuseUnconfirmedPermanentCollectionAuthority` in `src/db/mod.rs`). The
-migration keeps its own guard as the backstop for a bare `diesel migration run`, but Diesel reports
-only the driver error there, so on that path the question arrives as nothing but a duplicate-key
-violation on `__vw_permanent_authority_guard`.
+Status is not part of the rule: an invited, accepted or revoked membership is converted like a
+confirmed one. None of them holds authority in that state, and the permission is what the membership
+would come back with if it is ever restored — which is exactly what `access_all` would have done.
 
-Declining the authority for a membership means ending the group relationship it comes from, either
-for one membership (`DELETE FROM groups_users …`) or for the whole group
-(`UPDATE groups SET access_all = FALSE …`) — the permission columns do not exist yet at that point.
-They can equally be cleared after the upgrade: Vaultwarden does not start until the acknowledgement
-is recorded, so nothing is ever live in between. The refusal prints both statements.
+The only state the upgrade refuses outright is a plain **User** carrying membership `access_all`; see
+above.
 
 ## How to run it
 
@@ -196,8 +195,8 @@ only exists since SQLite 3.35 — the same reason the forward migration rebuilds
 also works against the older system SQLite that `sqlite_system` builds link.
 
 Afterwards start the older Vaultwarden version. Upgrading again later re-applies the migration from a
-clean state: it reads the restored `atype = 3` rows directly and asks for its own acknowledgement
-again, so the round trip converges.
+clean state: it reads the restored `atype = 3` rows directly and converts them deterministically,
+so the round trip converges.
 
 ## Reverting with the Diesel CLI instead
 

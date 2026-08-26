@@ -478,36 +478,6 @@ impl<'r> FromRequest<'r> for DbConn {
 /// review query and the way out instead.
 const CUSTOM_ROLE_PERMISSIONS_MIGRATION: &str = "20260630120000";
 
-/// An owner's decision that the collection authority a legacy Manager held *through a group* may
-/// become a permanent membership permission.
-///
-/// Written by an operator, read and consumed by {`CUSTOM_ROLE_PERMISSIONS_MIGRATION`}.
-const PERMANENT_COLLECTION_AUTHORITY_ACK_TABLE: &str = "__vw_ack_permanent_collection_authority";
-
-/// Counts the memberships {`CUSTOM_ROLE_PERMISSIONS_MIGRATION`} refuses to convert without
-/// [`PERMANENT_COLLECTION_AUTHORITY_ACK_TABLE`].
-///
-/// Deliberately the same predicate as the guard inside that file, phrased against the same legacy
-/// schema: the migration has not run yet whenever this is evaluated. The two must never disagree --
-/// `the_preflight_lookahead_agrees_with_the_migration` pins that against the real file.
-///
-/// `groups` is the backend's quoting of the reserved identifier.
-fn permanent_authority_lookahead_query(groups: &str) -> String {
-    format!(
-        "SELECT COUNT(*) AS count FROM users_organizations AS uo \
-         WHERE uo.atype = 3 \
-           AND uo.access_all = FALSE \
-           AND EXISTS ( \
-               SELECT 1 \
-               FROM groups_users AS gu \
-               INNER JOIN {groups} AS g ON g.uuid = gu.groups_uuid \
-               WHERE gu.users_organizations_uuid = uo.uuid \
-                 AND g.organizations_uuid = uo.org_uuid \
-                 AND g.access_all = TRUE \
-           )"
-    )
-}
-
 const LEGACY_USER_ACCESS_ALL_RECOVERY: &str = concat!(
     "\n\nList the affected memberships:\n",
     "SELECT uuid, user_uuid, org_uuid, status\n",
@@ -543,67 +513,6 @@ const LEGACY_USER_ACCESS_ALL_RECOVERY: &str = concat!(
     "the supported, visible and revocable equivalent."
 );
 
-/// The one question this feature has to ask.
-///
-/// {`CUSTOM_ROLE_PERMISSIONS_MIGRATION`} refuses the same condition from inside the migration, as the
-/// backstop for a bare migration runner. On the normal startup path that abort would reach the
-/// operator as nothing but `UNIQUE constraint failed: __vw_permanent_authority_guard.blocked` (or
-/// `Duplicate entry '1' for key 'PRIMARY'` on MySQL/MariaDB), so the decision, the review query and
-/// the acknowledgement all have to be printed from here.
-const PERMANENT_COLLECTION_AUTHORITY_RECOVERY: &str = concat!(
-    "\n\nBefore the Custom role, a Manager who reached every collection through an organization-local ",
-    "group with access_all held that authority *while* the group relationship lasted: it ended with ",
-    "the group, with its accessAll, and with the membership leaving it, and it was inert whenever ",
-    "ORG_GROUPS_ENABLED was false. The new model has no permission that is bound to a group like ",
-    "that -- edit_any_collection and delete_any_collection live on the membership -- so the upgrade ",
-    "writes the authority onto the membership, and the result is deliberately not identical to what ",
-    "it replaces:\n",
-    "  * it no longer lapses when the last qualifying group disappears, or when accessAll is ",
-    "cleared;\n",
-    "  * it applies even with the groups feature switched off;\n",
-    "  * edit_any_collection additionally satisfies has_full_access(), so the member reaches every ",
-    "collection of the organization directly rather than through the group.\n\n",
-    "Granting that silently would be a migration handing out durable organization-wide collection ",
-    "edit and delete on its own authority; skipping it silently would take a capability away. ",
-    "Neither is Vaultwarden's to choose, so an owner decides. Review the affected memberships with ",
-    "every Vaultwarden instance stopped and a backup taken:\n",
-    "SELECT uo.uuid, uo.user_uuid, uo.org_uuid, uo.status\n",
-    "FROM users_organizations uo\n",
-    "WHERE uo.atype = 3\n",
-    "  AND uo.access_all = FALSE\n",
-    "  AND EXISTS (\n",
-    "    SELECT 1 FROM groups_users gu\n",
-    "    INNER JOIN \"groups\" g ON g.uuid = gu.groups_uuid\n",
-    "      AND g.organizations_uuid = uo.org_uuid\n",
-    "    WHERE gu.users_organizations_uuid = uo.uuid AND g.access_all = TRUE);\n\n",
-    "(Quote `groups` with backticks instead of double quotes on MySQL/MariaDB.)\n\n",
-    "An invited, accepted or revoked membership is listed too, and deliberately so. It holds no ",
-    "authority today -- every guard requires a confirmed membership -- but the permission is what it ",
-    "would come back with if the membership is ever restored, and by then the group it came from may ",
-    "be gone.\n\n",
-    "A Manager whose own membership access_all bit is set is not listed: that bit is already a ",
-    "durable membership-level grant, so converting it into the three collection permissions changes ",
-    "no meaning.\n\n",
-    "To decline the authority for a membership, end the group relationship it comes from -- for the ",
-    "one membership, or for the whole group at once:\n",
-    "DELETE FROM groups_users\n",
-    "WHERE users_organizations_uuid = '<MEMBERSHIP_UUID>'\n",
-    "  AND groups_uuid = '<GROUP_UUID>';\n",
-    "UPDATE \"groups\" SET access_all = FALSE WHERE uuid = '<GROUP_UUID>';\n\n",
-    "That also takes away the access the membership has today, which is the same decision either ",
-    "way -- just made before the upgrade rather than after it. Whatever still matches the query ",
-    "above is what the acknowledgement covers; the permissions can equally be cleared afterwards, ",
-    "since Vaultwarden does not start until the decision is recorded and nothing is ever live in ",
-    "between:\n",
-    "UPDATE users_organizations\n",
-    "SET edit_any_collection = FALSE, delete_any_collection = FALSE\n",
-    "WHERE uuid = '<MEMBERSHIP_UUID>';\n\n",
-    "Then record the decision once, and restart:\n",
-    "CREATE TABLE __vw_ack_permanent_collection_authority (acknowledged INTEGER NOT NULL PRIMARY KEY);\n\n",
-    "The acknowledgement is consumed by the migration, so one decision covers one upgrade. It grants ",
-    "nothing and revokes nothing by itself -- whatever you leave in place is what the members keep."
-);
-
 const MISSING_ACCESS_ALL_RECOVERY: &str = concat!(
     "\n\nThe upgrade derives every Custom collection permission from that column, so it cannot run ",
     "without it, and neither of the two questions above it can be answered. This state does not arise ",
@@ -616,19 +525,12 @@ const MISSING_ACCESS_ALL_RECOVERY: &str = concat!(
 
 /// What the preflight reads. All of it comes from the schema and the migration ledger.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "These are independent facts read from a database schema and its migration ledger"
-)]
 struct CustomRoleMigrationFacts {
     memberships_table_exists: bool,
     /// {`CUSTOM_ROLE_PERMISSIONS_MIGRATION`} is recorded, i.e. this database is already upgraded.
     migration_applied: bool,
     access_all_column_exists: bool,
     legacy_user_access_all_count: i64,
-    permanent_collection_authority_ack: bool,
-    /// See [`permanent_authority_lookahead_query`].
-    unconfirmed_permanent_authority_count: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -636,7 +538,6 @@ enum CustomRolePreflightDecision {
     Proceed,
     RefuseMissingAccessAll,
     RefuseLegacyUserAccessAll,
-    RefuseUnconfirmedPermanentCollectionAuthority,
 }
 
 fn custom_role_preflight_decision(facts: CustomRoleMigrationFacts) -> CustomRolePreflightDecision {
@@ -668,12 +569,11 @@ fn custom_role_preflight_decision(facts: CustomRoleMigrationFacts) -> CustomRole
         return CustomRolePreflightDecision::RefuseLegacyUserAccessAll;
     }
 
-    // The schema is fine and the upgrade is ready to run, but one step of it changes a meaning that
-    // nothing in the new model can express, and that is an owner's decision rather than a migration's.
-    if !facts.permanent_collection_authority_ack && facts.unconfirmed_permanent_authority_count != 0 {
-        return CustomRolePreflightDecision::RefuseUnconfirmedPermanentCollectionAuthority;
-    }
-
+    // A legacy Manager whose organization-wide collection management comes from an organization-local
+    // `access_all` group is deliberately *not* a question. That is a valid, ordinary current-main
+    // state, and the migration maps the capability the owner configured into `edit_any_collection` /
+    // `delete_any_collection`. Refusing it would block a normal upgrade; see the migration file for
+    // why membership-bound permissions are the accepted trade-off.
     CustomRolePreflightDecision::Proceed
 }
 
@@ -689,13 +589,6 @@ fn custom_role_preflight_error(decision: CustomRolePreflightDecision, facts: Cus
              every collection without any management authority.",
             facts.legacy_user_access_all_count
         ),
-        CustomRolePreflightDecision::RefuseUnconfirmedPermanentCollectionAuthority => format!(
-            "Found {} legacy Manager membership(s) whose organization-wide collection authority comes \
-             only from an organization-local group with access_all. Migration \
-             {CUSTOM_ROLE_PERMISSIONS_MIGRATION} would turn that group-bound capability into a \
-             permanent membership permission, which is an owner's decision.",
-            facts.unconfirmed_permanent_authority_count
-        ),
         CustomRolePreflightDecision::Proceed => {
             unreachable!("Proceed is not an error")
         }
@@ -704,9 +597,6 @@ fn custom_role_preflight_error(decision: CustomRolePreflightDecision, facts: Cus
     let recovery = match decision {
         CustomRolePreflightDecision::RefuseMissingAccessAll => MISSING_ACCESS_ALL_RECOVERY,
         CustomRolePreflightDecision::RefuseLegacyUserAccessAll => LEGACY_USER_ACCESS_ALL_RECOVERY,
-        CustomRolePreflightDecision::RefuseUnconfirmedPermanentCollectionAuthority => {
-            PERMANENT_COLLECTION_AUTHORITY_RECOVERY
-        }
         CustomRolePreflightDecision::Proceed => "",
     };
 
@@ -786,22 +676,11 @@ mod sqlite_migrations {
         } else {
             0
         };
-        let unconfirmed_permanent_authority_count = if access_all_column_exists {
-            count(connection, super::permanent_authority_lookahead_query("\"groups\""))?
-        } else {
-            0
-        };
-
         let facts = super::CustomRoleMigrationFacts {
             memberships_table_exists,
             migration_applied,
             access_all_column_exists,
             legacy_user_access_all_count,
-            permanent_collection_authority_ack: table_exists(
-                connection,
-                super::PERMANENT_COLLECTION_AUTHORITY_ACK_TABLE,
-            )?,
-            unconfirmed_permanent_authority_count,
         };
 
         let decision = super::custom_role_preflight_decision(facts);
@@ -905,22 +784,11 @@ mod mysql_migrations {
         } else {
             0
         };
-        let unconfirmed_permanent_authority_count = if access_all_column_exists {
-            count(connection, super::permanent_authority_lookahead_query("`groups`"))?
-        } else {
-            0
-        };
-
         let facts = super::CustomRoleMigrationFacts {
             memberships_table_exists,
             migration_applied,
             access_all_column_exists,
             legacy_user_access_all_count,
-            permanent_collection_authority_ack: table_exists(
-                connection,
-                super::PERMANENT_COLLECTION_AUTHORITY_ACK_TABLE,
-            )?,
-            unconfirmed_permanent_authority_count,
         };
 
         let decision = super::custom_role_preflight_decision(facts);
@@ -1024,22 +892,11 @@ mod postgresql_migrations {
         } else {
             0
         };
-        let unconfirmed_permanent_authority_count = if access_all_column_exists {
-            count(connection, super::permanent_authority_lookahead_query("\"groups\""))?
-        } else {
-            0
-        };
-
         let facts = super::CustomRoleMigrationFacts {
             memberships_table_exists,
             migration_applied,
             access_all_column_exists,
             legacy_user_access_all_count,
-            permanent_collection_authority_ack: table_exists(
-                connection,
-                super::PERMANENT_COLLECTION_AUTHORITY_ACK_TABLE,
-            )?,
-            unconfirmed_permanent_authority_count,
         };
 
         let decision = super::custom_role_preflight_decision(facts);
@@ -1078,9 +935,6 @@ mod custom_role_migration_sql_tests {
 
     const ADD_CUSTOM_ROLE_PERMISSIONS: &str =
         include_str!("../../migrations/sqlite/2026-06-30-120000_add_custom_role_permissions/up.sql");
-
-    const PERMANENT_AUTHORITY_ACK: &str =
-        "CREATE TABLE __vw_ack_permanent_collection_authority (acknowledged INTEGER NOT NULL PRIMARY KEY)";
 
     /// `users_organizations` exactly as current upstream main leaves it: membership `access_all`, the
     /// retired Manager role, and none of the nine permission columns.
@@ -1172,10 +1026,6 @@ mod custom_role_migration_sql_tests {
         connection
     }
 
-    fn acknowledge(connection: &mut SqliteConnection) {
-        connection.batch_execute(PERMANENT_AUTHORITY_ACK).unwrap();
-    }
-
     /// Applies the migration the way Diesel's harness does: inside a transaction, so a refusal rolls
     /// back the temporary guard tables as well and a retry starts from the same state a restart would.
     fn migrate(connection: &mut SqliteConnection) -> Result<(), diesel::result::Error> {
@@ -1214,7 +1064,6 @@ mod custom_role_migration_sql_tests {
     #[test]
     fn the_conversion_maps_every_legacy_shape_exactly_once() {
         let mut connection = connect(LEGACY_MEMBERSHIPS);
-        acknowledge(&mut connection);
         migrate(&mut connection).unwrap();
 
         assert_eq!(
@@ -1255,7 +1104,6 @@ mod custom_role_migration_sql_tests {
     #[test]
     fn the_rebuilt_table_has_the_final_shape() {
         let mut connection = connect(LEGACY_MEMBERSHIPS);
-        acknowledge(&mut connection);
         migrate(&mut connection).unwrap();
 
         assert_eq!(
@@ -1303,7 +1151,6 @@ mod custom_role_migration_sql_tests {
                 ('m_user_all', 'u1', 'org1', TRUE, 2);
         ";
         let mut connection = connect(memberships);
-        acknowledge(&mut connection);
         let before = legacy_state(&mut connection);
 
         assert!(migrate(&mut connection).is_err());
@@ -1327,21 +1174,52 @@ mod custom_role_migration_sql_tests {
         );
     }
 
-    /// Materializing group-derived authority makes a group-bound capability permanent. That is the
-    /// one meaning the new model cannot reproduce, so it takes an owner's decision.
+    /// The whole point of this revision: a legacy Manager whose organization-wide collection
+    /// management comes from an organization-local `access_all` group is an ordinary, valid
+    /// current-main state. It must migrate straight through -- no acknowledgement table, no failed
+    /// first startup -- and land on edit + delete without collection creation.
     #[test]
-    fn group_derived_authority_needs_an_acknowledgement() {
-        let mut connection = connect(LEGACY_MEMBERSHIPS);
-        let before = legacy_state(&mut connection);
+    fn group_derived_authority_migrates_without_any_acknowledgement() {
+        let memberships = "
+            INSERT INTO groups (uuid, organizations_uuid, access_all) VALUES ('g_all', 'org1', TRUE);
+            INSERT INTO users_organizations (uuid, user_uuid, org_uuid, access_all, atype) VALUES
+                ('m_mgr_group', 'u1', 'org1', FALSE, 3);
+            INSERT INTO groups_users (groups_uuid, users_organizations_uuid) VALUES ('g_all', 'm_mgr_group');
+        ";
+        let mut connection = connect(memberships);
 
-        assert!(migrate(&mut connection).is_err());
-        assert_eq!(legacy_state(&mut connection), before);
+        migrate(&mut connection).expect("a valid current-main database must migrate on the first try");
 
-        acknowledge(&mut connection);
-        migrate(&mut connection).unwrap();
+        assert_eq!(state(&mut connection), ["m_mgr_group atype=4 011 000000"]);
+        // The group and its flag are what they were: only the membership row changed.
+        assert_eq!(
+            count(
+                &mut connection,
+                "SELECT COUNT(*) AS count FROM \"groups\" WHERE uuid = 'g_all' AND access_all = TRUE"
+            ),
+            1
+        );
+        assert_eq!(count(&mut connection, "SELECT COUNT(*) AS count FROM groups_users WHERE groups_uuid = 'g_all'"), 1);
     }
 
-    /// A Manager whose own `access_all` bit is set is not part of the question: that bit is already a
+    /// Nothing about the upgrade is conditional on operator state any more, so running it twice from
+    /// the same legacy database has to produce the same row both times.
+    #[test]
+    fn the_conversion_is_deterministic() {
+        let first = {
+            let mut connection = connect(LEGACY_MEMBERSHIPS);
+            migrate(&mut connection).unwrap();
+            state(&mut connection)
+        };
+        let second = {
+            let mut connection = connect(LEGACY_MEMBERSHIPS);
+            migrate(&mut connection).unwrap();
+            state(&mut connection)
+        };
+        assert_eq!(first, second);
+    }
+
+    /// A Manager whose own `access_all` bit is set    /// A Manager whose own `access_all` bit is set is not part of the question: that bit is already a
     /// durable membership-level grant, so converting it changes no meaning and must not stop an
     /// upgrade that has nothing else to decide.
     #[test]
@@ -1359,57 +1237,72 @@ mod custom_role_migration_sql_tests {
         assert_eq!(state(&mut connection), ["m_mgr_both atype=4 111 000000"]);
     }
 
-    /// One decision covers one upgrade. The acknowledgement is consumed, and a leftover downgrade
-    /// acknowledgement is cleared with it so consent is never inherited across a re-upgrade.
+    /// A leftover downgrade acknowledgement is cleared by the upgrade, so consent from an earlier
+    /// revert is never inherited by a later one.
     #[test]
-    fn the_acknowledgements_are_consumed_by_the_upgrade() {
+    fn a_leftover_downgrade_acknowledgement_is_cleared() {
         let mut connection = connect(LEGACY_MEMBERSHIPS);
-        acknowledge(&mut connection);
         connection
             .batch_execute("CREATE TABLE __vw_allow_custom_role_downgrade (acknowledged INTEGER NOT NULL PRIMARY KEY)")
             .unwrap();
 
         migrate(&mut connection).unwrap();
 
-        assert!(!table_exists(&mut connection, super::PERMANENT_COLLECTION_AUTHORITY_ACK_TABLE));
         assert!(!table_exists(&mut connection, "__vw_allow_custom_role_downgrade"));
     }
 
-    /// The preflight refuses before Diesel starts; the migration refuses from inside. They read the
-    /// same condition, so they have to answer identically for every shape -- otherwise Vaultwarden
-    /// either asks a question the migration would not have asked, or lets the migration abort with
-    /// nothing but a duplicate-key error.
+    /// The upgrade must not depend on, or leave behind, any bookkeeping table of its own.
     #[test]
-    fn the_preflight_lookahead_agrees_with_the_migration() {
-        let cases: [(&str, &str); 6] = [
+    fn the_upgrade_creates_no_bookkeeping_table() {
+        let mut connection = connect(LEGACY_MEMBERSHIPS);
+        migrate(&mut connection).unwrap();
+
+        assert_eq!(
+            count(
+                &mut connection,
+                "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name LIKE '__vw_%'"
+            ),
+            0
+        );
+    }
+
+    /// Every shape a valid current-main database can hold has to migrate on the first try. Only the
+    /// one legacy state that cannot be represented at all may abort -- and it is the last case here.
+    #[test]
+    fn every_valid_current_main_shape_migrates_on_the_first_try() {
+        let cases: [(&str, &str, bool); 7] = [
             (
-                "nothing to decide",
+                "Manager, nothing else",
                 "INSERT INTO users_organizations (uuid, user_uuid, org_uuid, access_all, atype) \
-                 VALUES ('m', 'u', 'org1', FALSE, 3);",
+              VALUES ('m', 'u', 'org1', FALSE, 3);",
+                true,
             ),
             (
-                "group without accessAll",
+                "Manager in a group without accessAll",
                 "
                 INSERT INTO groups (uuid, organizations_uuid, access_all) VALUES ('g', 'org1', FALSE);
                 INSERT INTO users_organizations (uuid, user_uuid, org_uuid, access_all, atype) VALUES
                     ('m', 'u', 'org1', FALSE, 3);
                 INSERT INTO groups_users (groups_uuid, users_organizations_uuid) VALUES ('g', 'm');",
+                true,
             ),
             (
-                "group with accessAll",
+                "Manager in an accessAll group",
                 "
                 INSERT INTO groups (uuid, organizations_uuid, access_all) VALUES ('g', 'org1', TRUE);
                 INSERT INTO users_organizations (uuid, user_uuid, org_uuid, access_all, atype) VALUES
                     ('m', 'u', 'org1', FALSE, 3);
                 INSERT INTO groups_users (groups_uuid, users_organizations_uuid) VALUES ('g', 'm');",
+                true,
             ),
             (
-                "membership access_all as well",
+                "Manager with membership access_all as well",
                 "
                 INSERT INTO groups (uuid, organizations_uuid, access_all) VALUES ('g', 'org1', TRUE);
                 INSERT INTO users_organizations (uuid, user_uuid, org_uuid, access_all, atype) VALUES
                     ('m', 'u', 'org1', TRUE, 3);
                 INSERT INTO groups_users (groups_uuid, users_organizations_uuid) VALUES ('g', 'm');",
+                true,
             ),
             (
                 "plain User in an accessAll group",
@@ -1418,25 +1311,33 @@ mod custom_role_migration_sql_tests {
                 INSERT INTO users_organizations (uuid, user_uuid, org_uuid, access_all, atype) VALUES
                     ('m', 'u', 'org1', FALSE, 2);
                 INSERT INTO groups_users (groups_uuid, users_organizations_uuid) VALUES ('g', 'm');",
+                true,
             ),
             (
-                "accessAll group of another organization",
+                "Manager in another organization's accessAll group",
                 "
                 INSERT INTO groups (uuid, organizations_uuid, access_all) VALUES ('g', 'org2', TRUE);
                 INSERT INTO users_organizations (uuid, user_uuid, org_uuid, access_all, atype) VALUES
                     ('m', 'u', 'org1', FALSE, 3);
                 INSERT INTO groups_users (groups_uuid, users_organizations_uuid) VALUES ('g', 'm');",
+                true,
+            ),
+            (
+                "plain User carrying membership access_all",
+                "INSERT INTO users_organizations (uuid, user_uuid, org_uuid, access_all, atype) \
+              VALUES ('m', 'u', 'org1', TRUE, 2);",
+                false,
             ),
         ];
 
-        for (name, memberships) in cases {
+        for (name, memberships, should_migrate) in cases {
             let mut connection = connect(memberships);
-            let predicted = count(&mut connection, &super::permanent_authority_lookahead_query("\"groups\"")) != 0;
-            let refused = migrate(&mut connection).is_err();
-            assert_eq!(predicted, refused, "preflight and migration disagree for: {name}");
+            assert_eq!(migrate(&mut connection).is_ok(), should_migrate, "unexpected outcome for: {name}");
         }
     }
 }
+
+/// Runs the real migration, then `tools/custom_role_rollback/sqlite.sql`}
 
 /// Runs the real migration, then `tools/custom_role_rollback/sqlite.sql`, then the migration again --
 /// against a throwaway SQLite database, with the real files on both legs.
@@ -1456,8 +1357,6 @@ mod custom_role_rollback_sql_tests {
 
     const VERSION: &str = "20260630120000";
 
-    const PERMANENT_AUTHORITY_ACK: &str =
-        "CREATE TABLE __vw_ack_permanent_collection_authority (acknowledged INTEGER NOT NULL PRIMARY KEY)";
     const DOWNGRADE_ACK: &str =
         "CREATE TABLE __vw_allow_custom_role_downgrade (acknowledged INTEGER NOT NULL PRIMARY KEY)";
     const ALLOWLIST: &str =
@@ -1552,7 +1451,6 @@ mod custom_role_rollback_sql_tests {
 
     /// Applies the migration, recording its version the way Diesel would.
     fn upgrade(connection: &mut SqliteConnection) -> Result<(), diesel::result::Error> {
-        connection.batch_execute(PERMANENT_AUTHORITY_ACK)?;
         connection.batch_execute(MIGRATION)?;
         connection.batch_execute(&format!("INSERT INTO __diesel_schema_migrations (version) VALUES ('{VERSION}')"))
     }
@@ -1718,8 +1616,6 @@ mod custom_role_migration_preflight_tests {
             migration_applied: false,
             access_all_column_exists: true,
             legacy_user_access_all_count: 0,
-            permanent_collection_authority_ack: false,
-            unconfirmed_permanent_authority_count: 0,
         }
     }
 
@@ -1773,57 +1669,27 @@ mod custom_role_migration_preflight_tests {
         assert!(message.contains("INSERT INTO users_collections"), "{message}");
     }
 
+    /// The state this revision stopped refusing: a legacy Manager reaching every collection through
+    /// an organization-local `access_all` group. The preflight has no fact for it any more, so there
+    /// is nothing left that could stop an ordinary upgrade.
     #[test]
-    fn unconfirmed_permanent_collection_authority_is_refused_with_the_question() {
-        let facts = CustomRoleMigrationFacts {
-            unconfirmed_permanent_authority_count: 3,
-            ..ready()
-        };
-        let decision = custom_role_preflight_decision(facts);
-        assert_eq!(decision, CustomRolePreflightDecision::RefuseUnconfirmedPermanentCollectionAuthority);
-
-        let message = message(decision, facts);
-        assert!(message.contains("Found 3 legacy Manager membership(s)"), "{message}");
-        assert!(message.contains("CREATE TABLE __vw_ack_permanent_collection_authority"), "{message}");
-        assert!(message.contains("has_full_access()"), "{message}");
+    fn group_derived_collection_authority_never_stops_startup() {
+        assert_eq!(custom_role_preflight_decision(ready()), CustomRolePreflightDecision::Proceed);
     }
 
-    /// One decision covers one upgrade, and it is asked before the migration -- never after.
+    /// A damaged legacy schema outranks the unrepresentable-state check: its answer would be
+    /// unreadable, and the migration cannot run either way.
     #[test]
-    fn the_acknowledgement_answers_the_question_exactly_once() {
-        let facts = CustomRoleMigrationFacts {
-            unconfirmed_permanent_authority_count: 3,
-            permanent_collection_authority_ack: true,
-            ..ready()
-        };
-        assert_eq!(custom_role_preflight_decision(facts), CustomRolePreflightDecision::Proceed);
-    }
-
-    /// A damaged legacy schema outranks the owner's question: the answer would be unreadable, and the
-    /// migration cannot run either way.
-    #[test]
-    fn a_damaged_schema_outranks_the_permanent_authority_question() {
+    fn a_damaged_schema_outranks_the_legacy_user_check() {
         let facts = CustomRoleMigrationFacts {
             access_all_column_exists: false,
             legacy_user_access_all_count: 1,
-            unconfirmed_permanent_authority_count: 1,
             ..ready()
         };
         assert_eq!(custom_role_preflight_decision(facts), CustomRolePreflightDecision::RefuseMissingAccessAll);
     }
 
-    /// The state that must never be converted silently outranks the one that only needs a decision.
-    #[test]
-    fn the_unrepresentable_state_outranks_the_question() {
-        let facts = CustomRoleMigrationFacts {
-            legacy_user_access_all_count: 1,
-            unconfirmed_permanent_authority_count: 1,
-            ..ready()
-        };
-        assert_eq!(custom_role_preflight_decision(facts), CustomRolePreflightDecision::RefuseLegacyUserAccessAll);
-    }
-
-    /// Both refusals promise the operator that startup stopped before anything was touched. The
+    /// Every refusal promises the operator that startup stopped before anything was touched. The
     /// preflight only ever reads, so that promise holds by construction -- this pins the wording that
     /// carries it.
     #[test]
@@ -1831,7 +1697,6 @@ mod custom_role_migration_preflight_tests {
         for decision in [
             CustomRolePreflightDecision::RefuseMissingAccessAll,
             CustomRolePreflightDecision::RefuseLegacyUserAccessAll,
-            CustomRolePreflightDecision::RefuseUnconfirmedPermanentCollectionAuthority,
         ] {
             let message = message(decision, ready());
             assert!(message.contains("Nothing has been changed."), "{decision:?}: {message}");
