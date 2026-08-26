@@ -79,9 +79,9 @@ FROM (
 ) AS c
 WHERE c.n <> 9;
 
--- 3) All nine Custom-role migrations have to be recorded.
+-- 3) The Custom-role migration has to be recorded.
 SELECT CONCAT(
-    'REFUSED, nothing was changed: expected all nine Custom-role migrations in ',
+    'REFUSED, nothing was changed: expected the Custom-role migration in ',
     '__diesel_schema_migrations, found ', c.n, '. Schema and ledger disagree, so restore the backup ',
     'taken before the upgrade and start over.'
 ) AS rollback_precondition_failure
@@ -89,39 +89,23 @@ FROM (
     SELECT COUNT(*) AS n
     FROM __diesel_schema_migrations
     WHERE version IN (
-        '20260630120000',
-        '20260715120000',
-        '20260716120000',
-        '20260723120000',
-        '20260724120000',
-        '20260724130000',
-        '20260724140000',
-        '20260809120000',
-        '20260810120000'
+        '20260630120000'
     )
 ) AS c
-WHERE c.n <> 9;
+WHERE c.n <> 1;
 INSERT INTO __vw_rollback_precondition (ok)
 SELECT 1
 FROM (
     SELECT COUNT(*) AS n
     FROM __diesel_schema_migrations
     WHERE version IN (
-        '20260630120000',
-        '20260715120000',
-        '20260716120000',
-        '20260723120000',
-        '20260724120000',
-        '20260724130000',
-        '20260724140000',
-        '20260809120000',
-        '20260810120000'
+        '20260630120000'
     )
 ) AS c
-WHERE c.n <> 9;
+WHERE c.n <> 1;
 
 -- 4) No migration newer than the Custom-role change may be recorded: this script does not know what
---    such a migration changed, and removing only the nine versions below would leave the ledger
+--    such a migration changed, and removing only the one version below would leave the ledger
 --    claiming a migration whose schema objects this script may have undone.
 SELECT CONCAT(
     'REFUSED, nothing was changed: ', c.n, ' migration(s) newer than the Custom-role change are ',
@@ -130,7 +114,7 @@ SELECT CONCAT(
 FROM (
     SELECT COUNT(*) AS n
     FROM __diesel_schema_migrations
-    WHERE version > '20260810120000'
+    WHERE version > '20260630120000'
 ) AS c
 WHERE c.n <> 0;
 INSERT INTO __vw_rollback_precondition (ok)
@@ -138,36 +122,11 @@ SELECT 1
 FROM (
     SELECT COUNT(*) AS n
     FROM __diesel_schema_migrations
-    WHERE version > '20260810120000'
+    WHERE version > '20260630120000'
 ) AS c
 WHERE c.n <> 0;
 
--- 5) The upgrade records that this database's Custom-role history is accounted for. Without that
---    marker the database was migrated by an earlier revision of the change, whose migrations had
---    different effects.
-SELECT CONCAT(
-    'REFUSED, nothing was changed: __vw_custom_role_history_verified does not exist, so this ',
-    'database was migrated by an earlier revision of the Custom-role change. Start Vaultwarden once ',
-    'and follow the recovery it prints before rolling back.'
-) AS rollback_precondition_failure
-FROM (
-    SELECT COUNT(*) AS n
-    FROM information_schema.tables
-    WHERE table_schema = DATABASE()
-      AND table_name = '__vw_custom_role_history_verified'
-) AS c
-WHERE c.n <> 1;
-INSERT INTO __vw_rollback_precondition (ok)
-SELECT 1
-FROM (
-    SELECT COUNT(*) AS n
-    FROM information_schema.tables
-    WHERE table_schema = DATABASE()
-      AND table_name = '__vw_custom_role_history_verified'
-) AS c
-WHERE c.n <> 1;
-
--- 6) Which memberships come back as legacy Manager has to be decided for *this* rollback. An empty
+-- 5) Which memberships come back as legacy Manager has to be decided for *this* rollback. An empty
 --    list is a valid answer and maps every Custom member to plain User.
 SELECT CONCAT(
     'REFUSED, nothing was changed: __vw_rollback_manager_allowlist does not exist. See README.md, ',
@@ -248,9 +207,8 @@ ALTER TABLE users_organizations ADD COLUMN access_all BOOLEAN NOT NULL DEFAULT F
 -- `users_collections.manage`, `collections_groups.manage` or `groups.access_all`, and reads member
 -- and collection ACL details through `ManagerHeadersLoose`, none of which needs a permission flag in
 -- the old schema -- so handing it out on anything less than a current, deliberate decision would
--- *grant* authority during a downgrade. `__vw_custom_role_legacy_manager` is not that decision: it
--- records who was a Manager before the first upgrade and is never updated afterwards, so a member
--- whose powers an owner has since reduced would get all of them back.
+-- *grant* authority during a downgrade. Historical provenance would not be that decision either: a
+-- member whose powers an owner has since reduced would get all of them back.
 --
 -- Everything else becomes a plain User and keeps its per-collection assignments.
 --
@@ -288,36 +246,22 @@ ALTER TABLE users_organizations
   DROP COLUMN access_import_export,
   DROP COLUMN access_reports;
 
--- Bookkeeping tables this feature may have left behind. The legacy-Manager record goes too: a later
--- re-upgrade rebuilds it from the very `atype = 3` rows this script just restored, so the round trip
--- converges.
-DROP TABLE IF EXISTS __vw_custom_role_same_run_0716;
+-- Bookkeeping tables this feature may have left behind. None of them carries state a later
+-- re-upgrade needs: it reads the restored `atype = 3` rows directly, and it asks for its own
+-- acknowledgements again.
 DROP TABLE IF EXISTS __vw_allow_custom_role_downgrade;
-DROP TABLE IF EXISTS __vw_allow_unresumable_mysql_downgrade;
 DROP TABLE IF EXISTS __vw_ack_permanent_collection_authority;
 DROP TABLE IF EXISTS __vw_rollback_manager_allowlist;
-DROP TABLE IF EXISTS __vw_custom_role_legacy_manager;
-DROP TABLE IF EXISTS __vw_custom_role_history_verified;
 
--- Finally forget the nine migrations, so the older binary does not see a ledger from the future
--- and a later upgrade applies them again from a clean state.
+-- Finally forget the migration, so the older binary does not see a ledger from the future
+-- and a later upgrade applies it again from a clean state.
 DELETE FROM __diesel_schema_migrations
-WHERE version IN (
-  '20260630120000',
-  '20260715120000',
-  '20260716120000',
-  '20260723120000',
-  '20260724120000',
-  '20260724130000',
-  '20260724140000',
-  '20260809120000',
-  '20260810120000'
-);
+WHERE version = '20260630120000';
 
 -- Every statement above except this DELETE is DDL and was therefore committed implicitly the moment
 -- it ran. The DELETE is plain DML: under `autocommit = 0` -- which `mysql --init-command`, a my.cnf
 -- default, or a connection pool can all set -- it would be rolled back on disconnect, leaving the
--- schema rolled back but all nine migrations still marked as applied. A later upgrade would then
--- skip them and start new code against the old schema. Commit it explicitly; harmless when
+-- schema rolled back but the migration still marked as applied. A later upgrade would then skip
+-- it and start new code against the old schema. Commit it explicitly; harmless when
 -- autocommit is already on.
 COMMIT;
