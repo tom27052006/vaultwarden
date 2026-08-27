@@ -124,7 +124,10 @@ confirmed one. None of them holds authority in that state, and the permission is
 would come back with if it is ever restored — which is exactly what `access_all` would have done.
 
 The only state the upgrade refuses outright is a plain **User** carrying membership `access_all`; see
-above.
+above. That refusal can also be resolved without any SQL, once for the whole instance, by setting
+`LEGACY_USER_ACCESS_ALL_MIGRATION` to `drop` (clear the flag; each member keeps the collections they
+are explicitly assigned to) or `materialize` (write the reach out as explicit assignments first,
+confirmed memberships only, then clear it). The setting is read only while that migration is pending.
 
 ## How to run it
 

@@ -749,15 +749,6 @@ impl OrgHeaders {
     fn can_manage_policies(&self) -> bool {
         self.is_confirmed() && (self.membership_type >= MembershipType::Admin || self.membership.has_manage_policies())
     }
-    // Reading the full member/group *details* (PII, 2FA status, permission flags, access mappings)
-    // requires the ability to manage users or groups, matching Bitwarden's `ReadAll`/`ReadAllWithAccess`
-    // authorization. Basic member mini-details and the plain group list remain member-readable.
-    fn can_manage_users_or_groups(&self) -> bool {
-        self.is_confirmed()
-            && (self.membership_type >= MembershipType::Admin
-                || self.membership.has_manage_users()
-                || self.membership.has_manage_groups())
-    }
     fn can_access_event_logs(&self) -> bool {
         self.is_confirmed()
             && (self.membership_type >= MembershipType::Admin || self.membership.has_access_event_logs())
@@ -956,11 +947,11 @@ generate_manage_headers!(
     can_manage_policies,
     "You need the 'Manage Policies' permission, or to be an Admin or Owner, to call this endpoint"
 );
-generate_manage_headers!(
-    ManageUsersOrGroupsHeaders,
-    can_manage_users_or_groups,
-    "You need the 'Manage Users' or 'Manage Groups' permission, or to be an Admin or Owner, to call this endpoint"
-);
+// NOTE: no `ManageUsersOrGroupsHeaders`. Reading group *details* is not a single-permission
+// question -- organization-wide collection reach grants it too, which is what main gated it on -- so
+// both group-details routes take `ManagerHeadersLoose` and ask `can_read_group_details`, keeping the
+// list and the single-group view on one condition. Reading the full *member* list is a
+// single-permission question and keeps `ManageUsersHeaders`.
 generate_manage_headers!(
     AccessEventLogsHeaders,
     can_access_event_logs,

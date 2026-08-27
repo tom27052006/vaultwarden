@@ -13,8 +13,8 @@ use crate::{
     },
     auth::{
         AccessImportExportHeaders, AdminHeaders, CollectionDeleteHeaders, CollectionReadHeaders, Headers,
-        ManageGroupsHeaders, ManagePoliciesHeaders, ManageUsersHeaders, ManageUsersOrGroupsHeaders, ManagerHeaders,
-        ManagerHeadersLoose, OrgMemberHeaders, OwnerHeaders, can_read_collection_access, decode_invite,
+        ManageGroupsHeaders, ManagePoliciesHeaders, ManageUsersHeaders, ManagerHeaders, ManagerHeadersLoose,
+        OrgMemberHeaders, OwnerHeaders, can_read_collection_access, decode_invite,
     },
     db::{
         DbConn,
@@ -3133,23 +3133,32 @@ async fn restore_member_impl(
     Ok(())
 }
 
+/// Whether `membership` may read group→collection/user mappings.
+///
+/// Two independent routes to the same data: the 'Manage Users'/'Manage Groups' permissions, which is
+/// what Bitwarden gates ReadAll/ReadAllWithAccess on — and organization-wide collection reach, which
+/// is what every released Vaultwarden gated it on before the Custom role existed. `get_groups_data`
+/// has always computed both, but the route guards only admitted the first, so a member holding
+/// `edit_any_collection` (or reaching every collection through an `access_all` group) was rejected
+/// before that second arm could ever run. A legacy Manager with "Manage all collections" ticked read
+/// these mappings on official main and must keep doing so after the migration converts them.
+///
+/// The single-group view returns exactly this data, so it has to ask exactly this question.
+async fn can_read_group_details(org_id: &OrganizationId, membership: &Membership, conn: &DbConn) -> bool {
+    membership.has_manage_users()
+        || membership.has_manage_groups()
+        || membership.has_full_access()
+        || (CONFIG.org_groups_enabled() && GroupUser::has_full_access_by_member(org_id, &membership.uuid, conn).await)
+}
+
 async fn get_groups_data(details: bool, org_id: OrganizationId, membership: &Membership, conn: DbConn) -> JsonResult {
-    // The details view (group→collection/user mappings) needs full org access; the plain list only
-    // needs manage access to a collection, so a manager of a collection (directly or via a group)
-    // can load it to assign groups.
-    // Custom roles: the 'Manage Users'/'Manage Groups' permissions are the authority for reading the
-    // group mappings (they are what the route guards enforce for the details view), so they satisfy
-    // this check as well even when the member reaches no collection of their own.
-    let has_full_access = membership.has_full_access()
-        || (CONFIG.org_groups_enabled()
-            && GroupUser::has_full_access_by_member(&org_id, &membership.uuid, &conn).await);
-    let can_manage_users_or_groups = membership.has_manage_users() || membership.has_manage_groups();
+    let can_read_details = can_read_group_details(&org_id, membership, &conn).await;
+    // The plain list (id, name, externalId) carries no access mappings, so it additionally opens to
+    // anyone who manages a single collection: they need the group names to assign groups to it.
     let allowed = if details {
-        has_full_access || can_manage_users_or_groups
+        can_read_details
     } else {
-        has_full_access
-            || can_manage_users_or_groups
-            || Collection::has_manageable_collection_by_user(&org_id, &membership.user_uuid, &conn).await
+        can_read_details || Collection::has_manageable_collection_by_user(&org_id, &membership.user_uuid, &conn).await
     };
     if !allowed {
         err_code!("Resource not found.", "User does not have access", rocket::http::Status::NotFound.code);
@@ -3193,12 +3202,14 @@ async fn get_groups(org_id: OrganizationId, headers: ManagerHeadersLoose, conn: 
     get_groups_data(false, org_id, &headers.membership, conn).await
 }
 
-// Security (audit M-1): group *details* expose accessAll, external IDs and collection mappings, so
-// reading them requires the 'Manage Users' or 'Manage Groups' permission (or Admin/Owner), matching
-// Bitwarden's ReadAll/ReadAllWithAccess authorization.
+// Group *details* expose accessAll, external IDs and collection mappings. The exact condition is
+// `can_read_group_details`, enforced in `get_groups_data`: the 'Manage Users' or 'Manage Groups'
+// permission (matching Bitwarden's ReadAll/ReadAllWithAccess), or organization-wide collection
+// reach, which is what main gated this on. Keeping the guard loose and the condition in one place is
+// what stops the two from drifting apart, as they had.
 #[get("/organizations/<org_id>/groups/details", rank = 1)]
-async fn get_groups_details(org_id: OrganizationId, headers: ManageUsersOrGroupsHeaders, conn: DbConn) -> JsonResult {
-    if org_id != headers.org_id {
+async fn get_groups_details(org_id: OrganizationId, headers: ManagerHeadersLoose, conn: DbConn) -> JsonResult {
+    if org_id != headers.membership.org_uuid {
         err!("Organization not found", "Organization id's do not match");
     }
     get_groups_data(true, org_id, &headers.membership, conn).await
@@ -3713,23 +3724,25 @@ async fn add_update_group(
     })))
 }
 
-// Reads a single group's details (accessAll, externalId, collection mappings). This is the same
-// data the `/groups/details` list endpoint returns, so it uses the same guard: Manage Users OR
-// Manage Groups (or Admin/Owner). Requiring Manage Groups here while the list only requires Manage
-// Users-or-Groups would let a manage_users member read every group's details in bulk but be denied
-// the single-group view of the same data.
+// Reads a single group's details (accessAll, externalId, collection mappings). This is the same data
+// the `/groups/details` list endpoint returns, so it asks the same question — `can_read_group_details`.
+// Any divergence would let a member read every group's details in bulk but be denied the single-group
+// view of the same data, or the reverse.
 #[get("/organizations/<org_id>/groups/<group_id>/details")]
 async fn get_group_details(
     org_id: OrganizationId,
     group_id: GroupId,
-    headers: ManageUsersOrGroupsHeaders,
+    headers: ManagerHeadersLoose,
     conn: DbConn,
 ) -> JsonResult {
-    if org_id != headers.org_id {
+    if org_id != headers.membership.org_uuid {
         err!("Organization not found", "Organization id's do not match");
     }
     if !CONFIG.org_groups_enabled() {
         err!("Group support is disabled");
+    }
+    if !can_read_group_details(&org_id, &headers.membership, &conn).await {
+        err_code!("Resource not found.", "User does not have access", rocket::http::Status::NotFound.code);
     }
 
     let Some(group) = Group::find_by_uuid_and_org(&group_id, &org_id, &conn).await else {

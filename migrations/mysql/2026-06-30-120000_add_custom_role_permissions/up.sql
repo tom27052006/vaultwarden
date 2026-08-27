@@ -74,8 +74,24 @@ ALTER TABLE users_organizations
 -- clear it with a checkbox.
 --
 -- The management (manage_users / manage_groups / manage_policies) and access (event logs /
--- import-export / reports) permissions keep their FALSE default: the legacy Manager role had no
--- equivalent of any of them, so granting one here would be a new privilege, not a preserved one.
+-- import-export / reports) permissions keep their FALSE default. Nothing they unlock was a Manager
+-- capability: on the previous release every member mutation (`send_invite`, `delete_member`,
+-- `revoke_member`), every policy write (`put_policy`), the organization export (`get_org_export`)
+-- and both event-log routes were gated on Admin/Owner. Granting one here would be a new privilege,
+-- not a preserved one.
+--
+-- One *read* is deliberately not carried over, and it is the single place where this conversion
+-- takes something away. A Manager who reached every collection -- through the membership bit, or
+-- through an organization-local `access_all` group -- also satisfied the `has_full_access` check
+-- that guarded the full member list (`GET /organizations/<org>/users`), so they could read every
+-- member's name, e-mail, two-factor state and assignments. They could not change any of it.
+-- `manage_users` is not granted to restore that read, because it also carries invite, confirm,
+-- revoke, restore and delete, which the Manager role never had -- handing out member administration
+-- to preserve a read would be exactly the widening the paragraph above avoids. Such members keep
+-- the member-readable `/users/mini-details` list, and an owner who wants the full list back grants
+-- `manage_users` as a deliberate act. The group mappings the same Manager could read *are*
+-- preserved: reading them follows organization-wide collection reach, which `edit_any_collection`
+-- carries.
 --
 -- Role conversion and permission values are one statement, so `atype = 3` unambiguously still means
 -- Manager everywhere it is read.
