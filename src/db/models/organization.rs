@@ -869,6 +869,26 @@ impl Membership {
         self.atype >= MembershipType::Admin || self.has_edit_any_collection()
     }
 
+    /// Whether enabling an organization policy may revoke this membership as part of enforcing it.
+    ///
+    /// Two exclusions, and both apply to every policy whose enforcement revokes non-compliant
+    /// members (currently Two-Factor Authentication and Single Organization):
+    ///
+    /// * Admins and Owners are never revoked by policy enforcement. `atype < Admin` is deliberately
+    ///   the *ceiling* comparison used everywhere else, so an unknown stored role stays sweepable.
+    /// * The member who performed the policy change is never revoked by their own change. Until the
+    ///   Custom role existed this was implied by the first rule, because only Admins and Owners
+    ///   could reach the policy endpoints. `managePolicies` can now be held by a Custom member, who
+    ///   *is* sweepable: enabling Two-Factor Authentication without a second factor configured, or
+    ///   Single Organization while holding a membership elsewhere, would otherwise revoke the caller
+    ///   in the middle of their own request. Upstream Bitwarden excludes the acting user from these
+    ///   sweeps for the same reason.
+    ///
+    /// This says nothing about *peers*: they are still revoked exactly as before.
+    pub fn is_policy_enforcement_target(&self, acting_user: &UserId) -> bool {
+        self.atype < MembershipType::Admin && &self.user_uuid != acting_user
+    }
+
     // The granular custom permission flags are only meaningful while the membership is of
     // the Custom type. Gating them on the type here ensures that a stale flag left over from
     // a type change (e.g. via the admin panel) can never grant anything.
@@ -917,9 +937,10 @@ impl Membership {
     /// permissions, member of such a group") was not sound — that shape is also what every newly
     /// created flagless Custom member has, so assigning one to an ordinary `access_all` group handed
     /// out organization-wide collection edit and delete, and *removing* a collection permission
-    /// activated it. The repair migration `2026-07-23-120000` materializes that authority into the
-    /// visible `edit_any_collection` / `delete_any_collection` columns instead, where an owner can
-    /// see and revoke it.
+    /// activated it. The Custom-role migration
+    /// (`2026-06-30-120000_add_custom_role_permissions`) writes that authority into the visible
+    /// `edit_any_collection` / `delete_any_collection` columns while it converts the membership, so
+    /// an owner can see and revoke it.
     pub async fn has_explicit_collection_manage_access(&self, collection_uuid: &CollectionId, conn: &DbConn) -> bool {
         let membership_uuid = self.uuid.clone();
         let user_uuid = self.user_uuid.clone();
@@ -1544,6 +1565,44 @@ mod tests {
         assert!(MembershipType::Admin > MembershipType::Custom as i32);
         assert!((MembershipType::Custom as i32) < MembershipType::Admin);
         assert!(MembershipType::Custom >= MembershipType::Custom as i32);
+    }
+
+    /// Policy enforcement revokes non-compliant peers, never Admins/Owners, and never the member
+    /// who enabled the policy. Before `managePolicies` existed the last rule was implied by the
+    /// second one; a Custom member can now trigger a sweep it would otherwise be caught by.
+    #[test]
+    fn policy_enforcement_never_targets_admins_or_the_acting_member() {
+        let actor: UserId = "actor".to_owned().into();
+        let other: UserId = "other".to_owned().into();
+
+        for role in [MembershipType::Owner, MembershipType::Admin] {
+            let mut member = membership(role);
+            member.user_uuid = other.clone();
+            assert!(!member.is_policy_enforcement_target(&actor), "admins and owners are never swept");
+            member.user_uuid = actor.clone();
+            assert!(!member.is_policy_enforcement_target(&actor));
+        }
+
+        for role in [MembershipType::User, MembershipType::Custom] {
+            let mut member = membership(role);
+
+            // A peer of that role is still a target -- enforcement itself is unchanged.
+            member.user_uuid = other.clone();
+            assert!(member.is_policy_enforcement_target(&actor), "peers must still be revoked");
+
+            // The member performing the policy change is not.
+            member.user_uuid = actor.clone();
+            assert!(!member.is_policy_enforcement_target(&actor), "the acting member must be excluded");
+        }
+
+        // An unknown stored role keeps the pre-existing fail-closed behaviour of the `< Admin`
+        // ceiling: it is still a target, and the actor exclusion still applies to it.
+        let mut corrupt = membership(MembershipType::User);
+        corrupt.atype = 42;
+        corrupt.user_uuid = other;
+        assert!(corrupt.is_policy_enforcement_target(&actor));
+        corrupt.user_uuid = actor.clone();
+        assert!(!corrupt.is_policy_enforcement_target(&actor));
     }
 
     #[test]

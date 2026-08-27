@@ -757,10 +757,18 @@ where
     }
 }
 
-pub async fn retry_db<F, T, E>(mut func: F, max_tries: u32) -> Result<T, E>
+/// Retry `func` while the database is unavailable.
+///
+/// `should_retry` classifies a failure. Waiting only helps for a database that is not reachable
+/// *yet*; a failure that is already decided -- a migration preflight that refuses this schema, say
+/// -- returns the same answer every time, and retrying it just repeats its output under a
+/// "Can't connect to database" heading that misdescribes the problem. Returning `false` there stops
+/// immediately and leaves the reporting to the caller.
+pub async fn retry_db<F, T, E, R>(mut func: F, max_tries: u32, should_retry: R) -> Result<T, E>
 where
     F: FnMut() -> Result<T, E>,
     E: std::error::Error,
+    R: Fn(&E) -> bool,
 {
     let mut tries = 0;
 
@@ -769,6 +777,10 @@ where
             ok @ Ok(_) => return ok,
             Err(e) => {
                 tries += 1;
+
+                if !should_retry(&e) {
+                    return Err(e);
+                }
 
                 if tries >= max_tries && max_tries > 0 {
                     return Err(e);

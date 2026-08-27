@@ -1285,22 +1285,56 @@ struct CustomRolePermissions {
 }
 
 impl CustomRolePermissions {
-    fn from_request(member_type: MembershipType, permissions: &HashMap<String, Value>) -> Self {
-        if member_type != MembershipType::Custom {
-            return Self::default();
+    /// Read one known permission key.
+    ///
+    /// An absent key is `false` — that is what the permissions object means: it is the complete
+    /// set the caller wants, so anything it does not name is off. A key that *is* present must be a
+    /// JSON boolean. Accepting `"true"`, `1` or `null` as "not `Value::Bool(true)`" silently turned
+    /// a malformed request into a permission *removal*: an edit carrying one bad value cleared
+    /// every granted permission and still answered 200, so client and server disagreed about the
+    /// member's authority with nothing in the response to show it.
+    fn read_known(permissions: &HashMap<String, Value>, key: &str) -> Result<bool, crate::Error> {
+        match permissions.get(key) {
+            None => Ok(false),
+            Some(Value::Bool(value)) => Ok(*value),
+            Some(other) => {
+                let found = match other {
+                    Value::Null => "null",
+                    Value::String(_) => "a string",
+                    Value::Number(_) => "a number",
+                    Value::Array(_) => "an array",
+                    Value::Object(_) => "an object",
+                    Value::Bool(_) => unreachable!("booleans are handled above"),
+                };
+                err!(format!("Invalid permissions: '{key}' must be true or false, but is {found}"))
+            }
         }
+    }
 
-        let enabled = |key: &str| matches!(permissions.get(key), Some(Value::Bool(true)));
-        Self {
-            manage_users: enabled("manageUsers"),
-            manage_groups: enabled("manageGroups"),
-            manage_policies: enabled("managePolicies"),
-            create_new_collections: enabled("createNewCollections"),
-            edit_any_collection: enabled("editAnyCollection"),
-            delete_any_collection: enabled("deleteAnyCollection"),
-            access_event_logs: enabled("accessEventLogs"),
-            access_import_export: enabled("accessImportExport"),
-            access_reports: enabled("accessReports"),
+    /// Parse a permissions object.
+    ///
+    /// Every known key is type-checked even when the requested role makes the flags inert, so a
+    /// malformed request is rejected the same way whatever role it names, and the rejection always
+    /// happens before the caller mutates anything. Keys this server does not know are ignored:
+    /// Bitwarden already sends `manageSso`, `manageScim` and `manageResetPassword`, and may add
+    /// more, so rejecting them would break clients over permissions Vaultwarden does not implement.
+    fn from_request(member_type: MembershipType, permissions: &HashMap<String, Value>) -> Result<Self, crate::Error> {
+        let parsed = Self {
+            manage_users: Self::read_known(permissions, "manageUsers")?,
+            manage_groups: Self::read_known(permissions, "manageGroups")?,
+            manage_policies: Self::read_known(permissions, "managePolicies")?,
+            create_new_collections: Self::read_known(permissions, "createNewCollections")?,
+            edit_any_collection: Self::read_known(permissions, "editAnyCollection")?,
+            delete_any_collection: Self::read_known(permissions, "deleteAnyCollection")?,
+            access_event_logs: Self::read_known(permissions, "accessEventLogs")?,
+            access_import_export: Self::read_known(permissions, "accessImportExport")?,
+            access_reports: Self::read_known(permissions, "accessReports")?,
+        };
+
+        if member_type == MembershipType::Custom {
+            Ok(parsed)
+        } else {
+            Ok(Self::default())
         }
     }
 
@@ -1319,9 +1353,9 @@ impl CustomRolePermissions {
         member_type: MembershipType,
         permissions: Option<&HashMap<String, Value>>,
         membership: &Membership,
-    ) -> Self {
-        match permissions {
-            Some(permissions) => Self::from_request(member_type, permissions),
+    ) -> Result<Self, crate::Error> {
+        Ok(match permissions {
+            Some(permissions) => Self::from_request(member_type, permissions)?,
             None if member_type == MembershipType::Custom && membership.atype == MembershipType::Custom as i32 => {
                 Self {
                     manage_users: membership.manage_users,
@@ -1336,7 +1370,7 @@ impl CustomRolePermissions {
                 }
             }
             None => Self::default(),
-        }
+        })
     }
 
     fn differs_from(self, membership: &Membership) -> bool {
@@ -1429,7 +1463,9 @@ async fn send_invite(
     // manageAllCollections is a client-only aggregate. Persist its three children independently.
     // Whether the member reaches every collection (Admin/Owner, or Custom + Edit any collection)
     // decides whether we skip creating individual per-collection assignments below.
-    let custom_permissions = CustomRolePermissions::from_request(new_type, &data.permissions);
+    // Parsed (and type-checked) before the loop below creates any user, invitation or membership,
+    // so a malformed permission value leaves nothing behind.
+    let custom_permissions = CustomRolePermissions::from_request(new_type, &data.permissions)?;
     let grants_full_access = custom_permissions.grants_full_collection_access(new_type);
 
     // Security: only callers who can manage collections (Admins/Owners, or users with full access)
@@ -1777,7 +1813,22 @@ async fn bulk_confirm_invite(
     match data.keys {
         Some(keys) => {
             for invite in keys {
-                let member_id = invite.id.unwrap();
+                // The id is request-controlled and optional in the payload. Unwrapping it aborted
+                // the Rocket worker with a 500 for `{"keys":[{"key":"x"}]}` and for an explicit
+                // `"id": null` -- and because the panic unwound mid-loop it also discarded the
+                // response for every entry already confirmed in the same batch. Report a missing id
+                // as a per-entry error instead, exactly as an id that is present but empty is
+                // already reported by `confirm_invite_impl`.
+                let Some(member_id) = invite.id else {
+                    bulk_response.push(json!(
+                        {
+                            "object": "OrganizationBulkConfirmResponseModel",
+                            "id": null,
+                            "error": "Key or UserId is not set, unable to process request"
+                        }
+                    ));
+                    continue;
+                };
                 let user_key = invite.key.unwrap_or_default();
                 let err_msg = match confirm_invite_impl(&org_id, &member_id, &user_key, &headers, &conn, &nt).await {
                     Ok(()) => String::new(),
@@ -1964,8 +2015,11 @@ async fn edit_member(
         err!("The specified user isn't member of the organization")
     };
 
+    // Parsed (and type-checked) here, long before the write phase further down, so a malformed
+    // permission value leaves the role, the permission flags, the collection assignments and the
+    // group memberships exactly as they were.
     let custom_permissions =
-        CustomRolePermissions::from_edit_request(new_type, data.permissions.as_ref(), &member_to_edit);
+        CustomRolePermissions::from_edit_request(new_type, data.permissions.as_ref(), &member_to_edit)?;
     let grants_full_access = custom_permissions.grants_full_collection_access(new_type);
 
     if new_type != member_to_edit.atype
@@ -2753,10 +2807,11 @@ async fn put_policy(
     // When enabling the SingleOrg policy, remove this org's members that are members of other orgs
     if pol_type_enum == OrgPolicyType::SingleOrg && data.enabled {
         for mut member in Membership::find_by_org(&org_id, &conn).await {
-            // Policy only applies to non-Owner/non-Admin members who have accepted joining the org
+            // Policy only applies to non-Owner/non-Admin members who have accepted joining the org,
+            // and never to the member enabling it -- see `Membership::is_policy_enforcement_target`.
             // Exclude invited and revoked users when checking for this policy.
             // Those users will not be allowed to accept or be activated because of the policy checks done there.
-            if member.atype < MembershipType::Admin
+            if member.is_policy_enforcement_target(&headers.user.uuid)
                 && member.status != MembershipStatus::Invited as i32
                 && Membership::count_accepted_and_confirmed_by_user(&member.user_uuid, &member.org_uuid, &conn).await
                     > 0
@@ -4695,7 +4750,7 @@ mod tests {
                 ("deleteAnyCollection".to_owned(), json!(delete)),
             ]);
 
-            let parsed = CustomRolePermissions::from_request(MembershipType::Custom, &permissions);
+            let parsed = CustomRolePermissions::from_request(MembershipType::Custom, &permissions).unwrap();
             assert_eq!(parsed.create_new_collections, create, "mask={mask:03b}");
             assert_eq!(parsed.edit_any_collection, edit, "mask={mask:03b}");
             assert_eq!(parsed.delete_any_collection, delete, "mask={mask:03b}");
@@ -4704,22 +4759,25 @@ mod tests {
         }
     }
 
-    #[test]
-    fn custom_permission_parser_is_strict_and_non_custom_roles_are_fail_closed() {
-        let permissions = HashMap::from([
-            ("manageUsers".to_owned(), Value::String("true".to_owned())),
-            ("manageGroups".to_owned(), json!(true)),
-            ("managePolicies".to_owned(), json!(true)),
-            ("createNewCollections".to_owned(), json!(true)),
-            ("editAnyCollection".to_owned(), json!(true)),
-            ("deleteAnyCollection".to_owned(), json!(true)),
-            ("accessEventLogs".to_owned(), json!(true)),
-            ("accessImportExport".to_owned(), json!(true)),
-            ("accessReports".to_owned(), json!(true)),
-        ]);
+    const KNOWN_PERMISSION_KEYS: [&str; 9] = [
+        "manageUsers",
+        "manageGroups",
+        "managePolicies",
+        "createNewCollections",
+        "editAnyCollection",
+        "deleteAnyCollection",
+        "accessEventLogs",
+        "accessImportExport",
+        "accessReports",
+    ];
 
-        let custom = CustomRolePermissions::from_request(MembershipType::Custom, &permissions);
-        assert!(!custom.manage_users, "string values must not be accepted as booleans");
+    #[test]
+    fn custom_permission_parser_accepts_only_booleans_and_non_custom_roles_are_fail_closed() {
+        let all_true: HashMap<String, Value> =
+            KNOWN_PERMISSION_KEYS.iter().map(|key| ((*key).to_owned(), json!(true))).collect();
+
+        let custom = CustomRolePermissions::from_request(MembershipType::Custom, &all_true).unwrap();
+        assert!(custom.manage_users);
         assert!(custom.manage_groups);
         assert!(custom.manage_policies);
         assert!(custom.create_new_collections);
@@ -4729,13 +4787,81 @@ mod tests {
         assert!(custom.access_import_export);
         assert!(custom.access_reports);
 
-        let user = CustomRolePermissions::from_request(MembershipType::User, &permissions);
+        let user = CustomRolePermissions::from_request(MembershipType::User, &all_true).unwrap();
         assert_eq!(user, CustomRolePermissions::default());
         assert!(!user.grants_full_collection_access(MembershipType::User));
 
-        let admin = CustomRolePermissions::from_request(MembershipType::Admin, &permissions);
+        let admin = CustomRolePermissions::from_request(MembershipType::Admin, &all_true).unwrap();
         assert_eq!(admin, CustomRolePermissions::default());
         assert!(admin.grants_full_collection_access(MembershipType::Admin));
+    }
+
+    /// A known key carrying anything other than a JSON boolean is a malformed request. It used to be
+    /// read as `false`, which turned a client bug into a silent permission removal.
+    #[test]
+    fn a_known_permission_with_a_non_boolean_value_is_rejected() {
+        let bad_values = [
+            json!("true"),
+            json!("false"),
+            json!(""),
+            json!(1),
+            json!(0),
+            json!(1.5),
+            Value::Null,
+            json!({}),
+            json!([]),
+            json!(["manageUsers"]),
+        ];
+
+        for key in KNOWN_PERMISSION_KEYS {
+            for value in &bad_values {
+                let permissions = HashMap::from([(key.to_owned(), value.clone())]);
+                for member_type in
+                    [MembershipType::Custom, MembershipType::User, MembershipType::Admin, MembershipType::Owner]
+                {
+                    assert!(
+                        CustomRolePermissions::from_request(member_type, &permissions).is_err(),
+                        "{key} = {value} must be rejected for {}",
+                        member_type as i32
+                    );
+                }
+
+                let membership = confirmed_member(MembershipType::Custom);
+                assert!(
+                    CustomRolePermissions::from_edit_request(MembershipType::Custom, Some(&permissions), &membership)
+                        .is_err(),
+                    "{key} = {value} must be rejected on the edit path"
+                );
+            }
+
+            // ... while both booleans stay valid for the same key.
+            for value in [true, false] {
+                let permissions = HashMap::from([(key.to_owned(), json!(value))]);
+                let parsed = CustomRolePermissions::from_request(MembershipType::Custom, &permissions)
+                    .expect("a boolean is always valid");
+                assert_eq!(parsed != CustomRolePermissions::default(), value, "{key} = {value}");
+            }
+        }
+    }
+
+    /// Bitwarden already sends permission keys Vaultwarden does not implement (`manageSso`,
+    /// `manageScim`, `manageResetPassword`) and may add more. Unknown keys stay ignored, whatever
+    /// they contain, so the strictness above cannot break a newer client.
+    #[test]
+    fn unknown_permission_keys_are_ignored_whatever_they_contain() {
+        let permissions = HashMap::from([
+            ("manageUsers".to_owned(), json!(true)),
+            ("manageSso".to_owned(), Value::String("yes".to_owned())),
+            ("manageScim".to_owned(), Value::Null),
+            ("manageResetPassword".to_owned(), json!(0)),
+            ("someFuturePermission".to_owned(), json!({"nested": true})),
+        ]);
+
+        let parsed = CustomRolePermissions::from_request(MembershipType::Custom, &permissions)
+            .expect("unknown keys must not make a request invalid");
+        assert!(parsed.manage_users);
+        assert!(!parsed.manage_groups);
+        assert!(!parsed.edit_any_collection);
     }
 
     #[test]
@@ -4778,7 +4904,7 @@ mod tests {
         membership.access_import_export = true;
         membership.access_reports = true;
 
-        let preserved = CustomRolePermissions::from_edit_request(MembershipType::Custom, None, &membership);
+        let preserved = CustomRolePermissions::from_edit_request(MembershipType::Custom, None, &membership).unwrap();
         assert!(preserved.manage_users);
         assert!(preserved.manage_groups);
         assert!(preserved.manage_policies);
@@ -4792,11 +4918,12 @@ mod tests {
 
         let explicit_reset = HashMap::new();
         assert_eq!(
-            CustomRolePermissions::from_edit_request(MembershipType::Custom, Some(&explicit_reset), &membership),
+            CustomRolePermissions::from_edit_request(MembershipType::Custom, Some(&explicit_reset), &membership)
+                .unwrap(),
             CustomRolePermissions::default()
         );
         assert_eq!(
-            CustomRolePermissions::from_edit_request(MembershipType::User, None, &membership),
+            CustomRolePermissions::from_edit_request(MembershipType::User, None, &membership).unwrap(),
             CustomRolePermissions::default()
         );
     }
@@ -4814,7 +4941,7 @@ mod tests {
         membership.access_import_export = true;
         membership.access_reports = true;
 
-        let requested = CustomRolePermissions::from_edit_request(MembershipType::User, None, &membership);
+        let requested = CustomRolePermissions::from_edit_request(MembershipType::User, None, &membership).unwrap();
         assert_eq!(requested, CustomRolePermissions::default());
         assert!(!requested.differs_from(&membership));
 

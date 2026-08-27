@@ -478,6 +478,61 @@ impl<'r> FromRequest<'r> for DbConn {
 /// review query and the way out instead.
 const CUSTOM_ROLE_PERMISSIONS_MIGRATION: &str = "20260630120000";
 
+/// The nine permission columns the migration adds.
+const CUSTOM_ROLE_PERMISSION_COLUMNS: [&str; 9] = [
+    "manage_users",
+    "manage_groups",
+    "manage_policies",
+    "create_new_collections",
+    "edit_any_collection",
+    "delete_any_collection",
+    "access_event_logs",
+    "access_import_export",
+    "access_reports",
+];
+
+/// Every column `users_organizations` has once the migration has run, and nothing else.
+///
+/// Used as a fingerprint rather than as a schema definition: a table that carries exactly these
+/// eighteen names is the table this migration produces. One column more or fewer means the database
+/// is somewhere else entirely, and nothing may be inferred about it.
+const EXPECTED_MEMBERSHIP_COLUMNS: [&str; 18] = [
+    "uuid",
+    "user_uuid",
+    "org_uuid",
+    "akey",
+    "status",
+    "atype",
+    "reset_password_key",
+    "external_id",
+    "invited_by_email",
+    "manage_users",
+    "manage_groups",
+    "manage_policies",
+    "create_new_collections",
+    "edit_any_collection",
+    "delete_any_collection",
+    "access_event_logs",
+    "access_import_export",
+    "access_reports",
+];
+
+/// The one-line reason the Custom-role preflight refused to start, once it has.
+///
+/// The refusal is deterministic: it reads schema and ledger state that no retry can change, so
+/// trying again only produces the same answer. `create_db_pool` reads this to stop immediately
+/// instead of treating the refusal as a transient connection problem -- which used to introduce it
+/// with "Can't connect to database, retrying" and repeat the whole multi-kilobyte recovery
+/// procedure once per retry. It also gives the startup path a plain sentence to print: `Error`'s
+/// `Display` renders the JSON API body, and its `Debug` form escapes newlines.
+static CUSTOM_ROLE_PREFLIGHT_REFUSAL: OnceLock<String> = OnceLock::new();
+
+/// Why startup was stopped by the Custom-role preflight, if it was. `None` means the database was
+/// simply not reachable (yet), which is worth retrying.
+pub fn custom_role_preflight_refusal() -> Option<&'static str> {
+    CUSTOM_ROLE_PREFLIGHT_REFUSAL.get().map(String::as_str)
+}
+
 const LEGACY_USER_ACCESS_ALL_RECOVERY: &str = concat!(
     "\n\nList the affected memberships:\n",
     "SELECT uuid, user_uuid, org_uuid, status\n",
@@ -515,27 +570,87 @@ const LEGACY_USER_ACCESS_ALL_RECOVERY: &str = concat!(
 
 const MISSING_ACCESS_ALL_RECOVERY: &str = concat!(
     "\n\nThe upgrade derives every Custom collection permission from that column, so it cannot run ",
-    "without it, and neither of the two questions above it can be answered. This state does not arise ",
-    "from any Vaultwarden version: the column is only ever removed together with the ledger entry ",
-    "that records the removal.\n\n",
+    "without it, and neither of the two questions above it can be answered.\n\n",
+    "One way to reach this state *is* recoverable and is repaired automatically: on MySQL and ",
+    "MariaDB every ALTER TABLE commits on its own, so a process that dies after the migration's ",
+    "final DROP COLUMN and before Diesel records the migration leaves a database that is already ",
+    "fully converted and only missing its ledger row. That is not this database -- the checks below ",
+    "did not all pass, so the schema is not the one the completed migration produces and nothing may ",
+    "be assumed about how far it got:\n",
+    "  * all nine Custom-role permission columns present and NOT NULL\n",
+    "  * users_organizations carrying exactly the eighteen expected columns\n",
+    "  * no membership left on the legacy Manager role (atype = 3)\n",
+    "  * a migration ledger that exists and records nothing newer than this migration\n\n",
     "If the database was rolled back with tools/custom_role_rollback/, run that script to completion ",
     "-- it restores the column and the ledger together. Otherwise restore the backup taken before the ",
-    "schema was changed by hand and start again from there."
+    "schema was changed and start again from there."
 );
 
 /// What the preflight reads. All of it comes from the schema and the migration ledger.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+// Each field is an independent observation about the database, not a mode: they are combined by
+// `custom_role_preflight_decision` and `custom_role_migration_is_complete`, which is exactly what
+// the lint would have them replaced by.
+#[allow(clippy::struct_excessive_bools)]
 struct CustomRoleMigrationFacts {
     memberships_table_exists: bool,
     /// {`CUSTOM_ROLE_PERMISSIONS_MIGRATION`} is recorded, i.e. this database is already upgraded.
     migration_applied: bool,
     access_all_column_exists: bool,
     legacy_user_access_all_count: i64,
+    /// The migration ledger table exists, so a missing entry means "not recorded" rather than
+    /// "nowhere to look".
+    migration_ledger_exists: bool,
+    /// How many of [`CUSTOM_ROLE_PERMISSION_COLUMNS`] exist, and how many of those are NOT NULL.
+    permission_columns_present: i64,
+    permission_columns_not_null: i64,
+    /// Total number of columns on `users_organizations`, and how many of them are names from
+    /// [`EXPECTED_MEMBERSHIP_COLUMNS`]. Both have to equal the expected count: the first rules out a
+    /// column this build knows nothing about, the second rules out a missing one.
+    membership_column_count: i64,
+    expected_membership_columns_present: i64,
+    /// Memberships still carrying the legacy persisted Manager role.
+    legacy_manager_rows: i64,
+    /// A migration newer than the Custom-role one is recorded. Diesel applies migrations in order,
+    /// so this can only mean the ledger was edited or the binary is older than the database.
+    newer_migration_recorded: bool,
+}
+
+/// Whether the facts prove that the Custom-role migration ran to completion and only its ledger
+/// entry is missing.
+///
+/// Deliberately a conjunction of everything that must be true rather than "the legacy column is
+/// gone". Dropping `access_all` is the migration's *last* schema statement, so its absence alone is
+/// also what a hand-edited or half-rolled-back database looks like; recording the migration there
+/// would start the server against a schema the code does not match. Each condition rules out a
+/// different way of arriving here with the column already gone:
+///
+/// * the two earlier MySQL/MariaDB interruption points still have `access_all`, so they never reach
+///   this function at all and keep failing closed;
+/// * a database where the column was dropped by hand fails the permission-column checks;
+/// * a partially applied later schema change fails the exact-column-count check;
+/// * a half-finished conversion still has `atype = 3` rows;
+/// * a tampered ledger fails the newer-migration check.
+fn custom_role_migration_is_complete(facts: CustomRoleMigrationFacts) -> bool {
+    let counted = |count: i64, expected: usize| usize::try_from(count).is_ok_and(|found| found == expected);
+
+    facts.memberships_table_exists
+        && !facts.migration_applied
+        && !facts.access_all_column_exists
+        && facts.migration_ledger_exists
+        && !facts.newer_migration_recorded
+        && counted(facts.permission_columns_present, CUSTOM_ROLE_PERMISSION_COLUMNS.len())
+        && counted(facts.permission_columns_not_null, CUSTOM_ROLE_PERMISSION_COLUMNS.len())
+        && counted(facts.membership_column_count, EXPECTED_MEMBERSHIP_COLUMNS.len())
+        && counted(facts.expected_membership_columns_present, EXPECTED_MEMBERSHIP_COLUMNS.len())
+        && facts.legacy_manager_rows == 0
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CustomRolePreflightDecision {
     Proceed,
+    /// The migration finished but its ledger entry never committed. Record it and continue.
+    RecordCompletedMigration,
     RefuseMissingAccessAll,
     RefuseLegacyUserAccessAll,
 }
@@ -554,7 +669,15 @@ fn custom_role_preflight_decision(facts: CustomRoleMigrationFacts) -> CustomRole
 
     // The migration is pending, so the legacy column has to be there -- both questions below read it,
     // and the conversion derives all three collection permissions from it.
+    //
+    // Unless the migration already ran and only its ledger entry is missing. MySQL and MariaDB
+    // commit every ALTER TABLE on their own, so a process killed between the migration's final
+    // `DROP COLUMN access_all` and Diesel's ledger insert leaves exactly that: a fully converted
+    // database that looks pending. Record the entry instead of sending the operator to a backup.
     if !facts.access_all_column_exists {
+        if custom_role_migration_is_complete(facts) {
+            return CustomRolePreflightDecision::RecordCompletedMigration;
+        }
         return CustomRolePreflightDecision::RefuseMissingAccessAll;
     }
 
@@ -577,7 +700,11 @@ fn custom_role_preflight_decision(facts: CustomRoleMigrationFacts) -> CustomRole
     CustomRolePreflightDecision::Proceed
 }
 
-fn custom_role_preflight_error(decision: CustomRolePreflightDecision, facts: CustomRoleMigrationFacts) -> Error {
+/// The full operator-facing text for a refusal: what was found, and what to do about it.
+///
+/// Kept separate from the `Error` so it can be logged with `Display` (the only formatting that
+/// preserves the newlines the SQL below depends on) and asserted on in tests.
+fn custom_role_preflight_report(decision: CustomRolePreflightDecision, facts: CustomRoleMigrationFacts) -> String {
     let detail = match decision {
         CustomRolePreflightDecision::RefuseMissingAccessAll => format!(
             "The membership access_all column is missing while migration \
@@ -589,21 +716,70 @@ fn custom_role_preflight_error(decision: CustomRolePreflightDecision, facts: Cus
              every collection without any management authority.",
             facts.legacy_user_access_all_count
         ),
-        CustomRolePreflightDecision::Proceed => {
-            unreachable!("Proceed is not an error")
+        CustomRolePreflightDecision::Proceed | CustomRolePreflightDecision::RecordCompletedMigration => {
+            unreachable!("only a refusal is an error")
         }
     };
 
     let recovery = match decision {
         CustomRolePreflightDecision::RefuseMissingAccessAll => MISSING_ACCESS_ALL_RECOVERY,
         CustomRolePreflightDecision::RefuseLegacyUserAccessAll => LEGACY_USER_ACCESS_ALL_RECOVERY,
-        CustomRolePreflightDecision::Proceed => "",
+        CustomRolePreflightDecision::Proceed | CustomRolePreflightDecision::RecordCompletedMigration => "",
     };
 
-    std::io::Error::other(format!(
-        "Custom-role migration preflight stopped startup: {detail} Nothing has been changed.{recovery}"
-    ))
-    .into()
+    format!("Custom-role migration preflight stopped startup. Nothing has been changed.\n\n{detail}{recovery}")
+}
+
+/// `'a', 'b', 'c'` — a literal list for an `IN (...)` predicate. The names are compile-time
+/// constants from this file, never request data.
+fn sql_name_list(names: &[&str]) -> String {
+    names.iter().map(|name| format!("'{name}'")).collect::<Vec<_>>().join(", ")
+}
+
+/// Report a refusal and produce the error that stops startup.
+///
+/// The report is printed here, through `Display`, and only here. The startup path logs a failed
+/// pool with `{e:?}`, and `Error`'s `Debug` formatting escapes the newlines -- so the SQL an
+/// operator is meant to read and copy used to arrive as one unbroken line of `\n` sequences. Pool
+/// creation is also retried, so the whole multi-kilobyte block was emitted once per attempt, each
+/// time introduced by "Can't connect to database", which is not what happened. Log it once,
+/// readable; flag the refusal so the retry loop stops; and let a one-line error travel back.
+fn custom_role_preflight_error(decision: CustomRolePreflightDecision, facts: CustomRoleMigrationFacts) -> Error {
+    error!("{}", custom_role_preflight_report(decision, facts));
+
+    let detail = match decision {
+        CustomRolePreflightDecision::RefuseMissingAccessAll => {
+            "the membership access_all column is missing while the Custom-role migration is still pending"
+        }
+        CustomRolePreflightDecision::RefuseLegacyUserAccessAll => {
+            "a plain User membership still carries the legacy access_all bit"
+        }
+        CustomRolePreflightDecision::Proceed | CustomRolePreflightDecision::RecordCompletedMigration => {
+            unreachable!("only a refusal is an error")
+        }
+    };
+
+    let summary = format!(
+        "The Custom-role migration preflight refused to start: {detail}. \
+         Nothing has been changed; the recovery procedure is printed above."
+    );
+    // First refusal wins; a second would say the same thing about the same database.
+    drop(CUSTOM_ROLE_PREFLIGHT_REFUSAL.set(summary.clone()));
+
+    std::io::Error::other(summary).into()
+}
+
+/// Record a migration that finished but whose ledger entry never committed.
+///
+/// `sql` is the backend's idempotent insert, so a second startup that races or repeats this is a
+/// no-op rather than a duplicate-key failure.
+fn log_recorded_completed_migration() {
+    warn!(
+        "Custom-role migration {CUSTOM_ROLE_PERMISSIONS_MIGRATION}: the schema is fully converted but the \
+         migration was not recorded. This is what an interrupted migration leaves behind on MySQL and \
+         MariaDB, where every ALTER TABLE commits on its own. Every completed-schema check passed, so the \
+         missing ledger entry has been recorded and startup continues; no data was changed."
+    );
 }
 
 // Embed the migrations from the migrations folder into the application
@@ -642,13 +818,19 @@ mod sqlite_migrations {
         .map(|value| value != 0)
     }
 
+    /// Read-only, with exactly one exception: the idempotent ledger insert that records a migration
+    /// which provably already ran (see `custom_role_migration_is_complete`).
+    ///
+    /// `pragma_table_xinfo` rather than `table_info`: the latter omits generated columns entirely,
+    /// so one would pass the exact-column-count fingerprint unseen.
     fn preflight(connection: &mut diesel::sqlite::SqliteConnection) -> Result<(), super::Error> {
         let memberships_table_exists = table_exists(connection, "users_organizations")?;
         if !memberships_table_exists {
             return Ok(());
         }
 
-        let migration_applied = table_exists(connection, "__diesel_schema_migrations")?
+        let migration_ledger_exists = table_exists(connection, "__diesel_schema_migrations")?;
+        let migration_applied = migration_ledger_exists
             && count(
                 connection,
                 format!(
@@ -657,11 +839,49 @@ mod sqlite_migrations {
                     super::CUSTOM_ROLE_PERMISSIONS_MIGRATION
                 ),
             )? != 0;
+        let newer_migration_recorded = migration_ledger_exists
+            && count(
+                connection,
+                format!(
+                    "SELECT COUNT(*) AS count FROM __diesel_schema_migrations \
+                     WHERE version > '{}'",
+                    super::CUSTOM_ROLE_PERMISSIONS_MIGRATION
+                ),
+            )? != 0;
         let access_all_column_exists = count(
             connection,
-            "SELECT COUNT(*) AS count FROM pragma_table_info('users_organizations') \
+            "SELECT COUNT(*) AS count FROM pragma_table_xinfo('users_organizations') \
              WHERE name = 'access_all'",
         )? != 0;
+
+        let permission_columns_present = count(
+            connection,
+            format!(
+                "SELECT COUNT(*) AS count FROM pragma_table_xinfo('users_organizations') \
+                 WHERE name IN ({})",
+                super::sql_name_list(&super::CUSTOM_ROLE_PERMISSION_COLUMNS)
+            ),
+        )?;
+        let permission_columns_not_null = count(
+            connection,
+            format!(
+                "SELECT COUNT(*) AS count FROM pragma_table_xinfo('users_organizations') \
+                 WHERE name IN ({}) AND \"notnull\" = 1",
+                super::sql_name_list(&super::CUSTOM_ROLE_PERMISSION_COLUMNS)
+            ),
+        )?;
+        let membership_column_count =
+            count(connection, "SELECT COUNT(*) AS count FROM pragma_table_xinfo('users_organizations')")?;
+        let expected_membership_columns_present = count(
+            connection,
+            format!(
+                "SELECT COUNT(*) AS count FROM pragma_table_xinfo('users_organizations') \
+                 WHERE name IN ({})",
+                super::sql_name_list(&super::EXPECTED_MEMBERSHIP_COLUMNS)
+            ),
+        )?;
+        let legacy_manager_rows =
+            count(connection, "SELECT COUNT(*) AS count FROM users_organizations WHERE atype = 3")?;
 
         // Status is deliberately not part of this count: an invited, accepted or revoked membership
         // carrying the bit is exactly the state that must never become durable direct assignments, so
@@ -681,13 +901,28 @@ mod sqlite_migrations {
             migration_applied,
             access_all_column_exists,
             legacy_user_access_all_count,
+            migration_ledger_exists,
+            permission_columns_present,
+            permission_columns_not_null,
+            membership_column_count,
+            expected_membership_columns_present,
+            legacy_manager_rows,
+            newer_migration_recorded,
         };
 
-        let decision = super::custom_role_preflight_decision(facts);
-        if decision == super::CustomRolePreflightDecision::Proceed {
-            Ok(())
-        } else {
-            Err(super::custom_role_preflight_error(decision, facts))
+        match super::custom_role_preflight_decision(facts) {
+            super::CustomRolePreflightDecision::Proceed => Ok(()),
+            super::CustomRolePreflightDecision::RecordCompletedMigration => {
+                diesel::sql_query(format!(
+                    "INSERT OR IGNORE INTO __diesel_schema_migrations (version, run_on) \
+                     VALUES ('{}', CURRENT_TIMESTAMP)",
+                    super::CUSTOM_ROLE_PERMISSIONS_MIGRATION
+                ))
+                .execute(connection)?;
+                super::log_recorded_completed_migration();
+                Ok(())
+            }
+            decision => Err(super::custom_role_preflight_error(decision, facts)),
         }
     }
 
@@ -748,18 +983,33 @@ mod mysql_migrations {
         .map(|value| value != 0)
     }
 
+    /// Read-only, with exactly one exception: the idempotent ledger insert that records a migration
+    /// which provably already ran (see `custom_role_migration_is_complete`). This is the backend
+    /// that produces that state in the first place -- MySQL and MariaDB commit every ALTER TABLE on
+    /// their own, so a process killed after the migration's final `DROP COLUMN access_all` and
+    /// before Diesel's ledger insert leaves a fully converted database that still looks pending.
     fn preflight(connection: &mut diesel::mysql::MysqlConnection) -> Result<(), super::Error> {
         let memberships_table_exists = table_exists(connection, "users_organizations")?;
         if !memberships_table_exists {
             return Ok(());
         }
 
-        let migration_applied = table_exists(connection, "__diesel_schema_migrations")?
+        let migration_ledger_exists = table_exists(connection, "__diesel_schema_migrations")?;
+        let migration_applied = migration_ledger_exists
             && count(
                 connection,
                 format!(
                     "SELECT COUNT(*) AS count FROM __diesel_schema_migrations \
                      WHERE version = '{}'",
+                    super::CUSTOM_ROLE_PERMISSIONS_MIGRATION
+                ),
+            )? != 0;
+        let newer_migration_recorded = migration_ledger_exists
+            && count(
+                connection,
+                format!(
+                    "SELECT COUNT(*) AS count FROM __diesel_schema_migrations \
+                     WHERE version > '{}'",
                     super::CUSTOM_ROLE_PERMISSIONS_MIGRATION
                 ),
             )? != 0;
@@ -770,6 +1020,45 @@ mod mysql_migrations {
                AND table_name = 'users_organizations' \
                AND column_name = 'access_all'",
         )? != 0;
+
+        let permission_columns_present = count(
+            connection,
+            format!(
+                "SELECT COUNT(*) AS count FROM information_schema.columns \
+                 WHERE table_schema = DATABASE() \
+                   AND table_name = 'users_organizations' \
+                   AND column_name IN ({})",
+                super::sql_name_list(&super::CUSTOM_ROLE_PERMISSION_COLUMNS)
+            ),
+        )?;
+        let permission_columns_not_null = count(
+            connection,
+            format!(
+                "SELECT COUNT(*) AS count FROM information_schema.columns \
+                 WHERE table_schema = DATABASE() \
+                   AND table_name = 'users_organizations' \
+                   AND column_name IN ({}) \
+                   AND is_nullable = 'NO'",
+                super::sql_name_list(&super::CUSTOM_ROLE_PERMISSION_COLUMNS)
+            ),
+        )?;
+        let membership_column_count = count(
+            connection,
+            "SELECT COUNT(*) AS count FROM information_schema.columns \
+             WHERE table_schema = DATABASE() AND table_name = 'users_organizations'",
+        )?;
+        let expected_membership_columns_present = count(
+            connection,
+            format!(
+                "SELECT COUNT(*) AS count FROM information_schema.columns \
+                 WHERE table_schema = DATABASE() \
+                   AND table_name = 'users_organizations' \
+                   AND column_name IN ({})",
+                super::sql_name_list(&super::EXPECTED_MEMBERSHIP_COLUMNS)
+            ),
+        )?;
+        let legacy_manager_rows =
+            count(connection, "SELECT COUNT(*) AS count FROM users_organizations WHERE atype = 3")?;
 
         // Status is deliberately not part of this count: an invited, accepted or revoked membership
         // carrying the bit is exactly the state that must never become durable direct assignments, so
@@ -789,9 +1078,26 @@ mod mysql_migrations {
             migration_applied,
             access_all_column_exists,
             legacy_user_access_all_count,
+            migration_ledger_exists,
+            permission_columns_present,
+            permission_columns_not_null,
+            membership_column_count,
+            expected_membership_columns_present,
+            legacy_manager_rows,
+            newer_migration_recorded,
         };
 
         let decision = super::custom_role_preflight_decision(facts);
+        if decision == super::CustomRolePreflightDecision::RecordCompletedMigration {
+            diesel::sql_query(format!(
+                "INSERT IGNORE INTO __diesel_schema_migrations (version, run_on) \
+                 VALUES ('{}', CURRENT_TIMESTAMP)",
+                super::CUSTOM_ROLE_PERMISSIONS_MIGRATION
+            ))
+            .execute(connection)?;
+            super::log_recorded_completed_migration();
+            return Ok(());
+        }
         if decision == super::CustomRolePreflightDecision::Proceed {
             Ok(())
         } else {
@@ -852,18 +1158,32 @@ mod postgresql_migrations {
             .map(|value| value != 0)
     }
 
+    /// Read-only, with exactly one exception: the idempotent ledger insert that records a migration
+    /// which provably already ran (see `custom_role_migration_is_complete`). PostgreSQL has
+    /// transactional DDL, so it never produces that state itself -- the repair is here so a database
+    /// restored or copied from a MySQL-side incident is handled identically on every backend.
     fn preflight(connection: &mut diesel::pg::PgConnection) -> Result<(), super::Error> {
         let memberships_table_exists = table_exists(connection, "users_organizations")?;
         if !memberships_table_exists {
             return Ok(());
         }
 
-        let migration_applied = table_exists(connection, "__diesel_schema_migrations")?
+        let migration_ledger_exists = table_exists(connection, "__diesel_schema_migrations")?;
+        let migration_applied = migration_ledger_exists
             && count(
                 connection,
                 format!(
                     "SELECT COUNT(*) AS count FROM __diesel_schema_migrations \
                      WHERE version = '{}'",
+                    super::CUSTOM_ROLE_PERMISSIONS_MIGRATION
+                ),
+            )? != 0;
+        let newer_migration_recorded = migration_ledger_exists
+            && count(
+                connection,
+                format!(
+                    "SELECT COUNT(*) AS count FROM __diesel_schema_migrations \
+                     WHERE version > '{}'",
                     super::CUSTOM_ROLE_PERMISSIONS_MIGRATION
                 ),
             )? != 0;
@@ -878,6 +1198,45 @@ mod postgresql_migrations {
                AND NOT attisdropped \
                AND attname = 'access_all'",
         )? != 0;
+
+        let permission_columns_present = count(
+            connection,
+            format!(
+                "SELECT COUNT(*) AS count FROM pg_attribute \
+                 WHERE attrelid = to_regclass('users_organizations') \
+                   AND attnum > 0 AND NOT attisdropped \
+                   AND attname IN ({})",
+                super::sql_name_list(&super::CUSTOM_ROLE_PERMISSION_COLUMNS)
+            ),
+        )?;
+        let permission_columns_not_null = count(
+            connection,
+            format!(
+                "SELECT COUNT(*) AS count FROM pg_attribute \
+                 WHERE attrelid = to_regclass('users_organizations') \
+                   AND attnum > 0 AND NOT attisdropped AND attnotnull \
+                   AND attname IN ({})",
+                super::sql_name_list(&super::CUSTOM_ROLE_PERMISSION_COLUMNS)
+            ),
+        )?;
+        let membership_column_count = count(
+            connection,
+            "SELECT COUNT(*) AS count FROM pg_attribute \
+             WHERE attrelid = to_regclass('users_organizations') \
+               AND attnum > 0 AND NOT attisdropped",
+        )?;
+        let expected_membership_columns_present = count(
+            connection,
+            format!(
+                "SELECT COUNT(*) AS count FROM pg_attribute \
+                 WHERE attrelid = to_regclass('users_organizations') \
+                   AND attnum > 0 AND NOT attisdropped \
+                   AND attname IN ({})",
+                super::sql_name_list(&super::EXPECTED_MEMBERSHIP_COLUMNS)
+            ),
+        )?;
+        let legacy_manager_rows =
+            count(connection, "SELECT COUNT(*) AS count FROM users_organizations WHERE atype = 3")?;
 
         // Status is deliberately not part of this count: an invited, accepted or revoked membership
         // carrying the bit is exactly the state that must never become durable direct assignments, so
@@ -897,13 +1256,28 @@ mod postgresql_migrations {
             migration_applied,
             access_all_column_exists,
             legacy_user_access_all_count,
+            migration_ledger_exists,
+            permission_columns_present,
+            permission_columns_not_null,
+            membership_column_count,
+            expected_membership_columns_present,
+            legacy_manager_rows,
+            newer_migration_recorded,
         };
 
-        let decision = super::custom_role_preflight_decision(facts);
-        if decision == super::CustomRolePreflightDecision::Proceed {
-            Ok(())
-        } else {
-            Err(super::custom_role_preflight_error(decision, facts))
+        match super::custom_role_preflight_decision(facts) {
+            super::CustomRolePreflightDecision::Proceed => Ok(()),
+            super::CustomRolePreflightDecision::RecordCompletedMigration => {
+                diesel::sql_query(format!(
+                    "INSERT INTO __diesel_schema_migrations (version, run_on) \
+                     VALUES ('{}', CURRENT_TIMESTAMP) ON CONFLICT (version) DO NOTHING",
+                    super::CUSTOM_ROLE_PERMISSIONS_MIGRATION
+                ))
+                .execute(connection)?;
+                super::log_recorded_completed_migration();
+                Ok(())
+            }
+            decision => Err(super::custom_role_preflight_error(decision, facts)),
         }
     }
 
@@ -1595,18 +1969,13 @@ mod custom_role_rollback_sql_tests {
 #[cfg(test)]
 mod custom_role_migration_preflight_tests {
     use super::{
-        CustomRoleMigrationFacts, CustomRolePreflightDecision, custom_role_preflight_decision,
-        custom_role_preflight_error,
+        CUSTOM_ROLE_PERMISSION_COLUMNS, CustomRoleMigrationFacts, CustomRolePreflightDecision,
+        EXPECTED_MEMBERSHIP_COLUMNS, custom_role_preflight_decision, custom_role_preflight_report,
     };
-    use std::error::Error as _;
 
-    /// The refusal text, read through the I/O error the preflight wraps -- `Error`'s own `Display`
-    /// renders the JSON API error body instead.
+    /// The operator-facing refusal text.
     fn message(decision: CustomRolePreflightDecision, facts: CustomRoleMigrationFacts) -> String {
-        custom_role_preflight_error(decision, facts)
-            .source()
-            .expect("preflight error should retain its I/O error source")
-            .to_string()
+        custom_role_preflight_report(decision, facts)
     }
 
     /// A database that has not been upgraded yet and has nothing to decide.
@@ -1616,6 +1985,32 @@ mod custom_role_migration_preflight_tests {
             migration_applied: false,
             access_all_column_exists: true,
             legacy_user_access_all_count: 0,
+            migration_ledger_exists: true,
+            // The legacy schema: no permission columns yet, `access_all` instead of the nine.
+            permission_columns_present: 0,
+            permission_columns_not_null: 0,
+            membership_column_count: 10,
+            expected_membership_columns_present: 9,
+            legacy_manager_rows: 0,
+            newer_migration_recorded: false,
+        }
+    }
+
+    /// A database on which the migration ran to completion but whose ledger entry never committed --
+    /// what an interrupted migration leaves behind on MySQL and MariaDB.
+    fn completed_but_unrecorded() -> CustomRoleMigrationFacts {
+        CustomRoleMigrationFacts {
+            memberships_table_exists: true,
+            migration_applied: false,
+            access_all_column_exists: false,
+            legacy_user_access_all_count: 0,
+            migration_ledger_exists: true,
+            permission_columns_present: i64::try_from(CUSTOM_ROLE_PERMISSION_COLUMNS.len()).unwrap(),
+            permission_columns_not_null: i64::try_from(CUSTOM_ROLE_PERMISSION_COLUMNS.len()).unwrap(),
+            membership_column_count: i64::try_from(EXPECTED_MEMBERSHIP_COLUMNS.len()).unwrap(),
+            expected_membership_columns_present: i64::try_from(EXPECTED_MEMBERSHIP_COLUMNS.len()).unwrap(),
+            legacy_manager_rows: 0,
+            newer_migration_recorded: false,
         }
     }
 
@@ -1651,6 +2046,136 @@ mod custom_role_migration_preflight_tests {
             ..ready()
         };
         assert_eq!(custom_role_preflight_decision(facts), CustomRolePreflightDecision::RefuseMissingAccessAll);
+    }
+
+    /// The state an interrupted migration leaves on MySQL/MariaDB: every ALTER TABLE committed on
+    /// its own, so the schema is final, but the process died before Diesel recorded the migration.
+    /// The database is already correct; only the ledger entry is missing.
+    #[test]
+    fn a_completed_migration_with_no_ledger_entry_is_recorded_instead_of_refused() {
+        assert_eq!(
+            custom_role_preflight_decision(completed_but_unrecorded()),
+            CustomRolePreflightDecision::RecordCompletedMigration
+        );
+    }
+
+    /// Every individual condition has to hold. Each mutation below is a different way of arriving at
+    /// "the legacy column is gone" without the migration having finished, and each one must fall
+    /// back to refusing rather than recording a migration that did not happen.
+    #[test]
+    fn an_incomplete_schema_is_never_mistaken_for_a_completed_migration() {
+        let complete = completed_but_unrecorded();
+        let permission_columns = i64::try_from(CUSTOM_ROLE_PERMISSION_COLUMNS.len()).unwrap();
+        let membership_columns = i64::try_from(EXPECTED_MEMBERSHIP_COLUMNS.len()).unwrap();
+
+        let broken = [
+            (
+                "one permission column missing",
+                CustomRoleMigrationFacts {
+                    permission_columns_present: permission_columns - 1,
+                    permission_columns_not_null: permission_columns - 1,
+                    membership_column_count: membership_columns - 1,
+                    expected_membership_columns_present: membership_columns - 1,
+                    ..complete
+                },
+            ),
+            (
+                "a permission column is nullable",
+                CustomRoleMigrationFacts {
+                    permission_columns_not_null: permission_columns - 1,
+                    ..complete
+                },
+            ),
+            (
+                "an unexpected extra column",
+                CustomRoleMigrationFacts {
+                    membership_column_count: membership_columns + 1,
+                    ..complete
+                },
+            ),
+            (
+                "an expected column is missing but the count matches",
+                CustomRoleMigrationFacts {
+                    expected_membership_columns_present: membership_columns - 1,
+                    ..complete
+                },
+            ),
+            (
+                "memberships still on the legacy Manager role",
+                CustomRoleMigrationFacts {
+                    legacy_manager_rows: 1,
+                    ..complete
+                },
+            ),
+            (
+                "the ledger records something newer",
+                CustomRoleMigrationFacts {
+                    newer_migration_recorded: true,
+                    ..complete
+                },
+            ),
+            (
+                "there is no ledger to record into",
+                CustomRoleMigrationFacts {
+                    migration_ledger_exists: false,
+                    ..complete
+                },
+            ),
+        ];
+
+        for (label, facts) in broken {
+            assert_eq!(
+                custom_role_preflight_decision(facts),
+                CustomRolePreflightDecision::RefuseMissingAccessAll,
+                "{label} must not be treated as a completed migration"
+            );
+        }
+    }
+
+    /// The two earlier MySQL/MariaDB interruption points still have `access_all`, so they never
+    /// reach the completed-schema check at all: the migration is simply pending, and re-running it
+    /// fails on the duplicate column exactly as before.
+    #[test]
+    fn earlier_interruption_points_are_still_an_ordinary_pending_migration() {
+        let after_add_column = CustomRoleMigrationFacts {
+            permission_columns_present: i64::try_from(CUSTOM_ROLE_PERMISSION_COLUMNS.len()).unwrap(),
+            permission_columns_not_null: i64::try_from(CUSTOM_ROLE_PERMISSION_COLUMNS.len()).unwrap(),
+            membership_column_count: i64::try_from(EXPECTED_MEMBERSHIP_COLUMNS.len()).unwrap() + 1,
+            expected_membership_columns_present: i64::try_from(EXPECTED_MEMBERSHIP_COLUMNS.len()).unwrap(),
+            legacy_manager_rows: 3,
+            ..ready()
+        };
+        assert_eq!(custom_role_preflight_decision(after_add_column), CustomRolePreflightDecision::Proceed);
+
+        let after_update = CustomRoleMigrationFacts {
+            legacy_manager_rows: 0,
+            ..after_add_column
+        };
+        assert_eq!(custom_role_preflight_decision(after_update), CustomRolePreflightDecision::Proceed);
+    }
+
+    /// An already-recorded migration is never re-examined, so the repair cannot fire twice.
+    #[test]
+    fn recording_the_migration_is_idempotent() {
+        let recorded = CustomRoleMigrationFacts {
+            migration_applied: true,
+            ..completed_but_unrecorded()
+        };
+        assert_eq!(custom_role_preflight_decision(recorded), CustomRolePreflightDecision::Proceed);
+    }
+
+    /// The refusal text used to claim this state could not occur, and sent the operator to a backup.
+    #[test]
+    fn the_missing_column_recovery_text_no_longer_denies_the_state_can_occur() {
+        let message = message(
+            CustomRolePreflightDecision::RefuseMissingAccessAll,
+            CustomRoleMigrationFacts {
+                access_all_column_exists: false,
+                ..ready()
+            },
+        );
+        assert!(!message.contains("does not arise from any Vaultwarden version"), "{message}");
+        assert!(message.contains("repaired automatically"), "{message}");
     }
 
     #[test]
