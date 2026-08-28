@@ -1495,6 +1495,21 @@ async fn send_invite(
         }
     }
 
+    // Security (audit M-1): every group named here is an *addition* -- the membership does not exist
+    // yet -- so putting the invitee into an organization-wide (`access_all`) group is the same
+    // durable grant `edit_member` and the group endpoints reserve for Admins and Owners. Without
+    // this, a Custom member holding `manageUsers` and `manageGroups` alongside `editAnyCollection`
+    // satisfies `caller_can_manage_collections` through `has_full_access()` and could invite an
+    // account of their choosing straight into such a group, leaving it with organization-wide
+    // collection access that outlives the flag the invite was made under.
+    if !may_grant_access_all_group(headers.membership_type) {
+        for group_id in &data.groups {
+            if group_grants_access_to_all_collections(group_id, &org_id, &conn).await {
+                err!("Only Admins and Owners can invite a member into a group with access to all collections")
+            }
+        }
+    }
+
     for email in &data.emails {
         let mut member_status = MembershipStatus::Invited as i32;
         // Scoped to this iteration on purpose. A single flag hoisted out of the loop stays `true`
@@ -2193,6 +2208,18 @@ async fn edit_member(
         }
     }
 
+    // Security (audit M-1): adding this member to a group carrying `access_all` grants durable
+    // organization-wide collection access, so it is Admin/Owner authority — a caller whose own reach
+    // comes from `editAnyCollection` must not be able to hand it out. Removals are unrestricted, so
+    // only the groups this request *adds* are examined.
+    if caller_can_manage_groups && !may_grant_access_all_group(headers.membership_type) {
+        for group_id in requested_groups.difference(&current_groups) {
+            if group_grants_access_to_all_collections(group_id, &org_id, &conn).await {
+                err!("Only Admins and Owners can add a member to a group with access to all collections")
+            }
+        }
+    }
+
     // Security (audit H-2): every requested group has to belong to this organization. Otherwise a
     // caller could link the member to a group of a foreign tenant (e.g. an access-all group), which
     // the direct cipher-access checks would then honor. Fail closed on the whole request.
@@ -2330,7 +2357,7 @@ async fn delete_member_impl(
         err!("User to delete isn't member of the organization")
     };
 
-    if !may_provision_stored_member_type(headers.membership_type, member_to_delete.atype) {
+    if !may_delete_stored_member_type(headers.membership_type, member_to_delete.atype) {
         err!("You don't have permission to delete this user")
     }
 
@@ -3006,7 +3033,7 @@ async fn revoke_member_impl(
             if member.user_uuid == headers.user.uuid {
                 err!("You cannot revoke yourself")
             }
-            if !may_manage_stored_member_type(headers.membership_type, member.atype) {
+            if !may_revoke_stored_member_type(headers.membership_type, member.atype) {
                 err!("You don't have permission to revoke this user")
             }
             if member.atype == MembershipType::Owner
@@ -3309,21 +3336,23 @@ async fn post_groups(
             None => false,
         };
 
-    // Security: `access_all` grants the group access to every collection, so it is a
-    // collection-access grant just like assigning collections. A custom user without
-    // collection-management rights must not be able to create an access_all group.
+    // Security (audit M-1): `groups.access_all` is a durable organization-wide grant that survives
+    // every later change to its members' roles, so creating one is reserved for Admins and Owners —
+    // `has_full_access()` (which `editAnyCollection` satisfies) is deliberately not enough here.
+    // See `may_grant_access_all_group`.
+    if group_request.access_all && !may_grant_access_all_group(headers.membership_type) {
+        err!("Only Admins and Owners can create a group with access to all collections")
+    }
+
+    // Security: assigning collections to a group is a collection-access grant, so it needs
+    // collection-management authority.
     //
     // API consistency: reject instead of silently creating a group without the requested access, so a
     // caller never believes it granted something the server dropped. A request that grants nothing
     // (no access_all, no collections) is still accepted, which is what the plain "new group" dialog
     // sends for such a caller.
-    if !caller_can_manage_collections {
-        if group_request.access_all {
-            err!("You don't have permission to create a group with access to all collections")
-        }
-        if !group_request.collections.is_empty() {
-            err!("You don't have permission to assign collections to a group")
-        }
+    if !caller_can_manage_collections && !group_request.collections.is_empty() {
+        err!("You don't have permission to assign collections to a group")
     }
 
     let group = group_request.to_group(&org_id);
@@ -3388,6 +3417,13 @@ async fn put_group(
             None => false,
         };
 
+    // Security (audit M-1): turning an ordinary group into an organization-wide one is the same
+    // durable grant as creating one, and is reserved for Admins and Owners. Clearing the flag is a
+    // reduction and keeps the existing rule below.
+    if group_request.access_all && !group.access_all && !may_grant_access_all_group(headers.membership_type) {
+        err!("Only Admins and Owners can give a group access to all collections")
+    }
+
     // API consistency: reject a collection-access change this caller may not make instead of
     // answering 200 and silently keeping the old value — the same rule `edit_member` and
     // `send_invite` follow. Only an actual difference is rejected (the regular group dialog echoes
@@ -3451,8 +3487,55 @@ async fn put_group(
 /// membership: adding would indirectly grant collection access, removing would revoke it.
 /// Callers who can manage collections may change any group's membership. This mirrors the
 /// restriction already enforced inline in `put_group_members` and `add_update_group`.
+///
+/// NOTE: this decides collection-*bearing* groups. Handing out membership of an organization-wide
+/// (`access_all`) group is a separate, stricter question — see [`may_grant_access_all_group`].
 fn may_change_group_membership(caller_can_manage_collections: bool, group_confers_collection_access: bool) -> bool {
     caller_can_manage_collections || !group_confers_collection_access
+}
+
+/// Whether `caller_type` may hand out organization-wide group access: create a group carrying
+/// `groups.access_all`, turn an existing group into one, or add a member to one.
+///
+/// Security (audit M-1): `groups.access_all` gives every member of the group read/write reach over
+/// every collection of the organization, present and future. Unlike a Custom permission it is not
+/// bound to the grantee's role — it keeps working unchanged after their permission flags are
+/// cleared — so it is a *durable* grant in exactly the sense a `users_collections.manage` row is.
+/// `caller_may_grant_collection_manage` already stops a Custom member from minting one of those;
+/// this is the same boundary for the group-shaped equivalent. Without it, a member holding
+/// `manageGroups` together with `editAnyCollection` satisfies `has_full_access()` and could create
+/// an access-all group containing itself, keeping organization-wide access after an Owner removed
+/// the flag it came from.
+///
+/// Deliberately *not* satisfied by `deleteAnyCollection`, nor by any other Custom permission: the
+/// grant outlives every one of them, so it stays with the two roles that cannot themselves be
+/// handed out and taken back by ticking a checkbox.
+///
+/// Only *granting* is restricted. Removing a member from an access-all group, clearing the flag and
+/// deleting such a group all reduce access and keep their existing rules.
+///
+/// Every path that creates such a grant has to ask this, and the complete set is:
+///
+///   * `post_groups`        -- creating a group with `access_all`
+///   * `put_group`          -- turning an existing group into one (`false` -> `true`)
+///   * `add_update_group`   -- adding members while the group carries it
+///   * `put_group_members`  -- replacing its member list with one that adds somebody
+///   * `edit_member`        -- adding an existing member to one
+///   * `send_invite`        -- inviting a new member straight into one
+///
+/// The last is easy to overlook because a brand-new membership has no current groups to diff
+/// against: every group named in an invite is an addition.
+fn may_grant_access_all_group(caller_type: MembershipType) -> bool {
+    caller_type >= MembershipType::Admin
+}
+
+/// Whether `requested` would add at least one member that `current` does not already contain.
+///
+/// Separates "this request adds someone to an access-all group" (restricted by
+/// [`may_grant_access_all_group`]) from "this request only removes someone" (always allowed) on the
+/// endpoints that replace a group's whole member list.
+fn adds_group_member(requested: &HashSet<&MembershipId>, current: &HashSet<&MembershipId>) -> bool {
+    !requested.is_subset(current)
 }
 
 /// Whether `requested` and `current` agree on every group that confers collection access.
@@ -3523,6 +3606,44 @@ fn may_provision_stored_member_type(caller_type: MembershipType, target_atype: i
         .is_some_and(|target_type| may_provision_member_type(caller_type, target_type))
 }
 
+/// Whether a caller may act on a membership whose stored `atype` this build cannot interpret.
+///
+/// Functional fix (audit L-1): a `users_organizations` row can carry an `atype` that
+/// [`MembershipType::from_i32`] rejects — a value written by a future build, by a partially
+/// rolled-back database, or by hand. Such a membership holds no authority at all: `OrgHeaders`
+/// refuses it and every permission flag on it is inert. But because the general helpers above fail
+/// closed on the unknown value, *nobody* could act on the row either, leaving an Owner with no way
+/// to remove it through the API at all — a regression against Vaultwarden, where an Owner could
+/// always delete such a membership.
+///
+/// Only an Owner, and only for the two actions that strictly *reduce* what the row can ever become:
+/// deleting it and revoking it. Neither can raise anyone's authority, and neither has to interpret
+/// the role. Editing, confirming, restoring and reinviting keep refusing, because each of those
+/// would preserve or reactivate a membership whose role the server cannot reason about.
+fn may_act_on_unknown_stored_member_type(caller_type: MembershipType) -> bool {
+    caller_type == MembershipType::Owner
+}
+
+/// Whether a caller may delete `target_atype`. Provisioning rules for a role this build knows;
+/// Owner-only for one it does not (see [`may_act_on_unknown_stored_member_type`]).
+fn may_delete_stored_member_type(caller_type: MembershipType, target_atype: i32) -> bool {
+    match MembershipType::from_i32(target_atype) {
+        Some(role) => may_provision_member_type(caller_type, role),
+        None => may_act_on_unknown_stored_member_type(caller_type),
+    }
+}
+
+/// Whether a caller may revoke `target_atype`. Management rules for a role this build knows;
+/// Owner-only for one it does not. Kept separate from [`may_delete_stored_member_type`] so revoking
+/// keeps the looser actor/target matrix it has always had (an Admin may revoke a peer Admin, which
+/// provisioning does not allow).
+fn may_revoke_stored_member_type(caller_type: MembershipType, target_atype: i32) -> bool {
+    match MembershipType::from_i32(target_atype) {
+        Some(role) => may_manage_member_type(caller_type, role),
+        None => may_act_on_unknown_stored_member_type(caller_type),
+    }
+}
+
 /// Returns true if being a member of `group_id` confers collection access — either because the
 /// group has `access_all` set, or because it has collections assigned.
 async fn group_confers_collection_access(group_id: &GroupId, org_id: &OrganizationId, conn: &DbConn) -> bool {
@@ -3530,6 +3651,14 @@ async fn group_confers_collection_access(group_id: &GroupId, org_id: &Organizati
         Some(group) => group.access_all || !CollectionGroup::find_by_group(group_id, org_id, conn).await.is_empty(),
         None => false,
     }
+}
+
+/// Returns true if `group_id` carries `groups.access_all`, i.e. membership of it reaches every
+/// collection of the organization. A group that does not exist in this organization confers
+/// nothing. See [`may_grant_access_all_group`] for why this is asked separately from
+/// [`group_confers_collection_access`].
+async fn group_grants_access_to_all_collections(group_id: &GroupId, org_id: &OrganizationId, conn: &DbConn) -> bool {
+    Group::find_by_uuid_and_org(group_id, org_id, conn).await.is_some_and(|group| group.access_all)
 }
 
 /// Whether `caller` may set a per-collection `manage` grant (`users_collections.manage` /
@@ -3657,6 +3786,19 @@ async fn add_update_group(
     // and keeping the old membership — same rule as `edit_member`/`send_invite`. Checked before the
     // first write so a rejected request leaves nothing behind. On create the group is brand new, so
     // it grants no collection access yet and this never triggers.
+    //
+    // Security (audit M-1): `group.access_all` is the value this request leaves behind, which is
+    // what actually grants. Adding a member to a group that carries it is Admin/Owner authority even
+    // for a caller who can manage collections; removals stay under the collection rule below.
+    if group.access_all && !may_grant_access_all_group(headers.membership_type) {
+        let requested: HashSet<&MembershipId> = members.iter().collect();
+        let current_members = GroupUser::find_by_group(&group.uuid, &org_id, conn).await;
+        let current: HashSet<&MembershipId> = current_members.iter().map(|gu| &gu.users_organizations_uuid).collect();
+        if adds_group_member(&requested, &current) {
+            err!("Only Admins and Owners can add a member to a group with access to all collections")
+        }
+    }
+
     if !caller_can_manage_collections
         && (group.access_all || !CollectionGroup::find_by_group(&group.uuid, &org_id, conn).await.is_empty())
     {
@@ -3959,6 +4101,18 @@ async fn put_group_members(
     }
 
     let assigned_members = data.into_inner();
+
+    // Security (audit M-1): adding a member to a group that carries `access_all` hands out durable
+    // organization-wide collection access, so it is Admin/Owner authority even for a caller who can
+    // manage collections. Removing one only reduces access and stays allowed.
+    if group.access_all && !may_grant_access_all_group(headers.membership_type) {
+        let current_members = GroupUser::find_by_group(&group_id, &org_id, &conn).await;
+        let current: HashSet<&MembershipId> = current_members.iter().map(|gu| &gu.users_organizations_uuid).collect();
+        let requested: HashSet<&MembershipId> = assigned_members.iter().collect();
+        if adds_group_member(&requested, &current) {
+            err!("Only Admins and Owners can add a member to a group with access to all collections")
+        }
+    }
 
     let org_memberships = Membership::find_by_org(&org_id, &conn).await;
     let org_membership_ids: HashSet<&MembershipId> = org_memberships.iter().map(|m| &m.uuid).collect();
@@ -4397,19 +4551,178 @@ mod tests {
 
     use super::{
         CollectionDetailsResponseScope, CustomRolePermissions, OrganizationImportTarget, OrganizationReportScope,
-        caller_manage_grant_role_check, collection_bearing_membership_unchanged, collection_details_response_scope,
-        filter_ciphers_for_organization, may_change_group_membership, may_change_member_type, may_delete_group,
-        may_export_entire_organization, may_import_to_collection, may_manage_member_type,
-        may_manage_stored_member_type, may_provision_member_type, may_provision_stored_member_type,
-        may_read_complete_collection_list, organization_report_scope,
+        adds_group_member, caller_manage_grant_role_check, collection_bearing_membership_unchanged,
+        collection_details_response_scope, filter_ciphers_for_organization, may_change_group_membership,
+        may_change_member_type, may_delete_group, may_delete_stored_member_type, may_export_entire_organization,
+        may_grant_access_all_group, may_import_to_collection, may_manage_member_type, may_manage_stored_member_type,
+        may_provision_member_type, may_provision_stored_member_type, may_read_complete_collection_list,
+        may_revoke_stored_member_type, organization_report_scope,
     };
-    use crate::db::models::{Cipher, GroupId, Membership, MembershipStatus, MembershipType, OrganizationId};
+    use crate::db::models::{
+        Cipher, GroupId, Membership, MembershipId, MembershipStatus, MembershipType, OrganizationId,
+    };
 
     fn confirmed_member(member_type: MembershipType) -> Membership {
         let mut m = Membership::new("test-user".to_owned().into(), "test-org".to_owned().into(), None);
         m.atype = member_type as i32;
         m.status = MembershipStatus::Confirmed as i32;
         m
+    }
+
+    /// Audit M-1: `groups.access_all` is a durable organization-wide grant -- it keeps working after
+    /// the grantee's Custom permissions are cleared -- so handing it out is Admin/Owner authority.
+    #[test]
+    fn only_admins_and_owners_may_hand_out_access_all_group_authority() {
+        assert!(may_grant_access_all_group(MembershipType::Owner));
+        assert!(may_grant_access_all_group(MembershipType::Admin));
+        assert!(!may_grant_access_all_group(MembershipType::Custom));
+        assert!(!may_grant_access_all_group(MembershipType::User));
+    }
+
+    /// Audit M-1: no Custom permission opens this, and in particular not the two that come closest.
+    ///
+    /// `editAnyCollection` satisfies `has_full_access()`, which is what gates every *other* group
+    /// operation -- and that is exactly the escalation this closes: such a member could mint an
+    /// access-all group containing itself and keep organization-wide reach after an Owner cleared the
+    /// flag. `deleteAnyCollection` is what `caller_may_grant_collection_manage` accepts for a
+    /// per-collection `manage` row, and it deliberately does not carry over here.
+    #[test]
+    fn no_custom_permission_grants_access_all_group_authority() {
+        let mut edit_any = confirmed_member(MembershipType::Custom);
+        edit_any.edit_any_collection = true;
+        assert!(edit_any.has_full_access(), "the escalation starts from a member who has full access");
+
+        let mut delete_any = confirmed_member(MembershipType::Custom);
+        delete_any.delete_any_collection = true;
+        assert_eq!(
+            caller_manage_grant_role_check(&delete_any),
+            Some(true),
+            "delete-any may still confer a per-collection manage grant"
+        );
+
+        // Neither, nor any combination, is organization-wide group authority.
+        assert!(!may_grant_access_all_group(MembershipType::Custom));
+    }
+
+    /// Audit M-1 (follow-up): `send_invite` is the sixth path that puts a member into a group, and
+    /// the one the first round of fixes missed. Its group gate is `caller_can_manage_collections`,
+    /// which `editAnyCollection` satisfies through `has_full_access()`, so the caller that reached
+    /// the hole is a Custom member holding manageUsers + manageGroups + editAnyCollection: it clears
+    /// every precondition the invite path checks before the access-all rule.
+    ///
+    /// A brand-new membership has no current groups to diff against, so every group named in an
+    /// invite is an addition and the rule applies unconditionally.
+    #[test]
+    fn inviting_into_an_access_all_group_is_admin_only() {
+        let mut inviter = confirmed_member(MembershipType::Custom);
+        inviter.manage_users = true;
+        inviter.manage_groups = true;
+        inviter.edit_any_collection = true;
+
+        // Everything `send_invite` checks before the access-all rule passes for this caller ...
+        assert!(inviter.has_manage_users(), "reaches send_invite at all");
+        assert!(inviter.has_manage_groups(), "satisfies caller_can_manage_groups");
+        assert!(inviter.has_full_access(), "satisfies caller_can_manage_collections");
+        assert!(
+            may_provision_member_type(MembershipType::Custom, MembershipType::User),
+            "and may invite the one role a Custom member can provision"
+        );
+
+        // ... and the organization-wide group is still out of reach.
+        assert!(!may_grant_access_all_group(MembershipType::Custom));
+        assert!(may_grant_access_all_group(MembershipType::Admin));
+        assert!(may_grant_access_all_group(MembershipType::Owner));
+    }
+
+    /// Audit M-1: only *adding* to an access-all group is restricted. Removing a member from one, and
+    /// leaving the set alone, reduce or preserve access and stay allowed.
+    #[test]
+    fn only_additions_to_an_access_all_group_are_restricted() {
+        let a: MembershipId = "member-a".to_owned().into();
+        let b: MembershipId = "member-b".to_owned().into();
+        let c: MembershipId = "member-c".to_owned().into();
+        let current: HashSet<&MembershipId> = HashSet::from([&a, &b]);
+
+        // unchanged, and pure removals
+        assert!(!adds_group_member(&HashSet::from([&a, &b]), &current));
+        assert!(!adds_group_member(&HashSet::from([&a]), &current));
+        assert!(!adds_group_member(&HashSet::new(), &current));
+
+        // any new member, including alongside a removal
+        assert!(adds_group_member(&HashSet::from([&a, &b, &c]), &current));
+        assert!(adds_group_member(&HashSet::from([&c]), &current));
+        assert!(adds_group_member(&HashSet::from([&a, &c]), &current));
+    }
+
+    /// The collection-bearing rule is untouched: it still admits any caller who can manage
+    /// collections, which is what keeps ordinary group management working for them.
+    #[test]
+    fn the_collection_bearing_group_rule_is_unchanged() {
+        assert!(may_change_group_membership(true, true));
+        assert!(!may_change_group_membership(false, true));
+        assert!(may_change_group_membership(false, false));
+    }
+
+    /// Audit L-1: a membership whose stored role this build cannot parse holds no authority, but it
+    /// still has to be removable. An Owner may delete or revoke it; nobody else may touch it, and no
+    /// action that would preserve or reactivate it opens up for anyone.
+    #[test]
+    fn an_owner_may_remove_a_membership_with_an_unknown_stored_role() {
+        // 3 is the retired Manager wire value, which this build never persists; the rest are values
+        // no Vaultwarden release writes at all.
+        for unknown in [3, 5, -1, i32::MAX, i32::MIN] {
+            // 0, 1, 2 and 4 are the only values `MembershipType::from_i32` accepts.
+            assert!(![0, 1, 2, 4].contains(&unknown), "{unknown} must not be a known role");
+
+            assert!(may_delete_stored_member_type(MembershipType::Owner, unknown), "{unknown}");
+            assert!(may_revoke_stored_member_type(MembershipType::Owner, unknown), "{unknown}");
+
+            for caller in [MembershipType::Admin, MembershipType::Custom, MembershipType::User] {
+                assert!(!may_delete_stored_member_type(caller, unknown), "caller={} target={unknown}", caller as i32);
+                assert!(!may_revoke_stored_member_type(caller, unknown), "caller={} target={unknown}", caller as i32);
+            }
+
+            // Editing, confirming, restoring and reinviting all still refuse, for every caller.
+            for caller in [MembershipType::Owner, MembershipType::Admin, MembershipType::Custom, MembershipType::User] {
+                assert!(!may_manage_stored_member_type(caller, unknown), "caller={} target={unknown}", caller as i32);
+                assert!(
+                    !may_provision_stored_member_type(caller, unknown),
+                    "caller={} target={unknown}",
+                    caller as i32
+                );
+            }
+        }
+    }
+
+    /// Audit L-1: the two new helpers must not loosen anything for a role this build does know --
+    /// delete keeps the provisioning matrix, revoke keeps the looser management one.
+    #[test]
+    fn known_roles_keep_their_existing_delete_and_revoke_matrices() {
+        for caller in [MembershipType::Owner, MembershipType::Admin, MembershipType::Custom, MembershipType::User] {
+            for target in [MembershipType::Owner, MembershipType::Admin, MembershipType::Custom, MembershipType::User] {
+                assert_eq!(
+                    may_delete_stored_member_type(caller, target as i32),
+                    may_provision_member_type(caller, target),
+                    "delete: caller={} target={}",
+                    caller as i32,
+                    target as i32
+                );
+                assert_eq!(
+                    may_revoke_stored_member_type(caller, target as i32),
+                    may_manage_member_type(caller, target),
+                    "revoke: caller={} target={}",
+                    caller as i32,
+                    target as i32
+                );
+            }
+        }
+
+        // The place the two matrices differ, kept intact: an Admin may revoke a peer Admin but may
+        // not delete one, while an Owner may do both.
+        assert!(may_revoke_stored_member_type(MembershipType::Admin, MembershipType::Admin as i32));
+        assert!(!may_delete_stored_member_type(MembershipType::Admin, MembershipType::Admin as i32));
+        assert!(may_revoke_stored_member_type(MembershipType::Owner, MembershipType::Admin as i32));
+        assert!(may_delete_stored_member_type(MembershipType::Owner, MembershipType::Admin as i32));
     }
 
     #[test]

@@ -582,6 +582,64 @@ impl LegacyUserAccessAllPolicy {
 /// what the migration drops it to prevent.
 const DROP_DOWNGRADE_ACK_SQL: &str = "DROP TABLE IF EXISTS __vw_allow_custom_role_downgrade";
 
+/// Whether this backend commits a migration's schema statements one at a time, so an interrupted
+/// upgrade can leave the migration half-applied.
+///
+/// MySQL and MariaDB do: every `ALTER TABLE` implicitly commits, so a process that dies part-way
+/// through a migration leaves it half-applied. SQLite and PostgreSQL run the whole migration inside
+/// one transaction, so a half-applied schema on those is not something an interrupted upgrade can
+/// produce -- it means something else changed the database, and nothing may be resumed on the
+/// assumption that this migration was the only writer. Each backend module below sets it.
+type InterruptibleSchemaChanges = bool;
+
+/// The migration's Manager -> Custom conversion, replayed when an interrupted upgrade is resumed.
+///
+/// Character for character the `UPDATE` in
+/// `migrations/mysql/2026-06-30-120000_add_custom_role_permissions/up.sql`. It is idempotent for the
+/// same reason it is safe there: it matches only `atype = 3` and leaves none behind, so a second run
+/// selects nothing. That is what lets one recovery path cover *both* MySQL interruption points
+/// without having to tell them apart -- if the interrupted run got as far as the conversion there is
+/// nothing left to convert, and if it did not, this is exactly the conversion it missed.
+///
+/// It reads `access_all`, so it has to run before that column is dropped.
+#[cfg(mysql)]
+const CUSTOM_ROLE_MANAGER_CONVERSION_SQL: &str = "\
+UPDATE users_organizations \
+SET create_new_collections = access_all, \
+    edit_any_collection = access_all \
+        OR EXISTS ( \
+            SELECT 1 \
+            FROM groups_users AS gu \
+            INNER JOIN `groups` AS g ON g.uuid = gu.groups_uuid \
+            WHERE gu.users_organizations_uuid = users_organizations.uuid \
+              AND g.organizations_uuid = users_organizations.org_uuid \
+              AND g.access_all = TRUE \
+        ), \
+    delete_any_collection = access_all \
+        OR EXISTS ( \
+            SELECT 1 \
+            FROM groups_users AS gu \
+            INNER JOIN `groups` AS g ON g.uuid = gu.groups_uuid \
+            WHERE gu.users_organizations_uuid = users_organizations.uuid \
+              AND g.organizations_uuid = users_organizations.org_uuid \
+              AND g.access_all = TRUE \
+        ), \
+    atype = 4 \
+WHERE atype = 3";
+
+/// The migration's final schema statement.
+#[cfg(mysql)]
+const DROP_ACCESS_ALL_SQL: &str = "ALTER TABLE users_organizations DROP COLUMN access_all";
+
+/// Everything an interrupted upgrade still owes, in the order it has to run: convert the legacy
+/// Managers, drop the legacy column, then drop any downgrade acknowledgement -- exactly what the
+/// migration file does from its `UPDATE` onwards. The caller records the ledger entry afterwards.
+///
+/// MySQL is the only backend an interrupted upgrade can be resumed on, so these are gated with it.
+#[cfg(mysql)]
+const CUSTOM_ROLE_RESUME_STATEMENTS: [&str; 3] =
+    [CUSTOM_ROLE_MANAGER_CONVERSION_SQL, DROP_ACCESS_ALL_SQL, DROP_DOWNGRADE_ACK_SQL];
+
 /// Relax the direct assignments of an affected membership before the bit goes away.
 ///
 /// `access_all` *overrode* `read_only` and `hide_passwords`: a member carrying it reached every
@@ -679,6 +737,24 @@ const LEGACY_USER_ACCESS_ALL_RECOVERY: &str = concat!(
     "the supported, visible and revocable equivalent."
 );
 
+const AMBIGUOUS_PARTIAL_MIGRATION_RECOVERY: &str = concat!(
+    "\n\nSome of the columns this migration adds already exist, so a previous attempt changed the ",
+    "table -- but the result is not the schema an interrupted run leaves behind, so how far it got ",
+    "cannot be established and finishing it would run the conversion against a table this build does ",
+    "not recognise.\n\n",
+    "An interruption is resumed automatically, and only on MySQL and MariaDB, where each ALTER TABLE ",
+    "commits on its own. It requires all of:\n",
+    "  * all nine Custom-role permission columns present and NOT NULL\n",
+    "  * users_organizations carrying exactly the eighteen expected columns plus access_all\n",
+    "  * a migration ledger that exists and records nothing newer than this migration\n",
+    "  * no plain User membership still carrying access_all\n\n",
+    "On SQLite and PostgreSQL the whole migration runs inside one transaction, so it cannot stop ",
+    "half-way: this schema was produced by something else and is never resumed.\n\n",
+    "Restore the backup taken before the schema was changed and start the upgrade again. If the ",
+    "database was rolled back with tools/custom_role_rollback/, run that script to completion first -- ",
+    "it restores the column set and the ledger together."
+);
+
 const MISSING_ACCESS_ALL_RECOVERY: &str = concat!(
     "\n\nThe upgrade derives every Custom collection permission from that column, so it cannot run ",
     "without it, and neither of the two questions above it can be answered.\n\n",
@@ -762,6 +838,9 @@ enum CustomRolePreflightDecision {
     Proceed,
     /// The migration finished but its ledger entry never committed. Record it and continue.
     RecordCompletedMigration,
+    /// The migration got as far as adding its columns -- and possibly as far as converting the
+    /// legacy Managers -- but not to the end. Finish it, then record it.
+    ResumeInterruptedMigration,
     /// Clear the legacy `User + access_all` bit, then continue.
     DropLegacyUserAccessAll,
     /// Write the reach of a confirmed legacy `User + access_all` membership out as explicit
@@ -769,11 +848,59 @@ enum CustomRolePreflightDecision {
     MaterializeLegacyUserAccessAll,
     RefuseMissingAccessAll,
     RefuseLegacyUserAccessAll,
+    /// Some of the migration's columns exist while it is still unrecorded, but the schema is not the
+    /// one an interrupted run leaves behind. Nothing may be assumed about how far it got.
+    RefuseAmbiguousPartialMigration,
+}
+
+/// Whether the facts prove the migration was interrupted after it added its columns, leaving a
+/// schema that can be finished rather than restored from a backup.
+///
+/// Deliberately an exact fingerprint of the one state an interrupted run produces, not "some of the
+/// columns are there": the table must carry precisely the finished set plus the legacy column that
+/// still has to go, all nine permission columns must exist and be `NOT NULL`, and the ledger must
+/// exist and record nothing newer. Any other shape means something changed this table that was not
+/// this migration, and resuming would run the conversion against a schema this build does not know.
+///
+/// `legacy_manager_rows` is deliberately *not* constrained. It is non-zero at the earlier
+/// interruption point and zero at the later one, and the conversion statement is idempotent, so one
+/// resume covers both without having to distinguish them. `legacy_user_access_all_count` must be
+/// zero, which the caller establishes by resolving that question first.
+fn custom_role_migration_is_resumable(facts: CustomRoleMigrationFacts) -> bool {
+    let counted = |count: i64, expected: usize| usize::try_from(count).is_ok_and(|found| found == expected);
+
+    facts.memberships_table_exists
+        && !facts.migration_applied
+        && facts.access_all_column_exists
+        && facts.legacy_user_access_all_count == 0
+        && facts.migration_ledger_exists
+        && !facts.newer_migration_recorded
+        && counted(facts.permission_columns_present, CUSTOM_ROLE_PERMISSION_COLUMNS.len())
+        && counted(facts.permission_columns_not_null, CUSTOM_ROLE_PERMISSION_COLUMNS.len())
+        // Exactly the finished table, plus the legacy column the migration has not dropped yet.
+        && counted(facts.membership_column_count, EXPECTED_MEMBERSHIP_COLUMNS.len() + 1)
+        && counted(facts.expected_membership_columns_present, EXPECTED_MEMBERSHIP_COLUMNS.len())
+}
+
+/// The decision to act on once any legacy `User + access_all` rows have been resolved.
+///
+/// Resolving them changes one fact, so the answer has to be recomputed: a database that is *both* a
+/// half-applied upgrade and carries such a row must still be resumed after the row is dealt with,
+/// rather than handed to Diesel — which would re-run `ALTER TABLE ... ADD COLUMN` and fail.
+fn custom_role_decision_after_legacy_resolution(
+    facts: CustomRoleMigrationFacts,
+    legacy_user_access_all: LegacyUserAccessAllPolicy,
+    interruptible_schema_changes: InterruptibleSchemaChanges,
+) -> CustomRolePreflightDecision {
+    let mut resolved = facts;
+    resolved.legacy_user_access_all_count = 0;
+    custom_role_preflight_decision(resolved, legacy_user_access_all, interruptible_schema_changes)
 }
 
 fn custom_role_preflight_decision(
     facts: CustomRoleMigrationFacts,
     legacy_user_access_all: LegacyUserAccessAllPolicy,
+    interruptible_schema_changes: InterruptibleSchemaChanges,
 ) -> CustomRolePreflightDecision {
     // A fresh installation: Diesel creates the schema from scratch and there is nothing to convert.
     if !facts.memberships_table_exists {
@@ -819,6 +946,19 @@ fn custom_role_preflight_decision(
         };
     }
 
+    // Nothing is left to resolve, and the legacy column is still there. If the migration's own
+    // columns are *also* already there, a previous run got part-way through and stopped: on MySQL and
+    // MariaDB every `ALTER TABLE` commits on its own, so a process killed between the migration's
+    // first `ALTER TABLE ... ADD COLUMN` and its final `DROP COLUMN` leaves exactly that. Handing the
+    // file back to Diesel would re-run the `ADD COLUMN` and abort with nothing but a driver-level
+    // duplicate-column error, which is what this branch exists to replace.
+    if facts.permission_columns_present != 0 {
+        if interruptible_schema_changes && custom_role_migration_is_resumable(facts) {
+            return CustomRolePreflightDecision::ResumeInterruptedMigration;
+        }
+        return CustomRolePreflightDecision::RefuseAmbiguousPartialMigration;
+    }
+
     // A legacy Manager whose organization-wide collection management comes from an organization-local
     // `access_all` group is deliberately *not* a question. That is a valid, ordinary current-main
     // state, and the migration maps the capability the owner configured into `edit_any_collection` /
@@ -843,12 +983,22 @@ fn custom_role_preflight_report(decision: CustomRolePreflightDecision, facts: Cu
              every collection without any management authority.",
             facts.legacy_user_access_all_count
         ),
+        CustomRolePreflightDecision::RefuseAmbiguousPartialMigration => format!(
+            "Migration {CUSTOM_ROLE_PERMISSIONS_MIGRATION} is still pending, but {} of its {} \
+             permission columns already exist on users_organizations ({} of them NOT NULL) and the \
+             table currently has {} columns.",
+            facts.permission_columns_present,
+            CUSTOM_ROLE_PERMISSION_COLUMNS.len(),
+            facts.permission_columns_not_null,
+            facts.membership_column_count
+        ),
         _ => unreachable!("only a refusal is an error"),
     };
 
     let recovery = match decision {
         CustomRolePreflightDecision::RefuseMissingAccessAll => MISSING_ACCESS_ALL_RECOVERY,
         CustomRolePreflightDecision::RefuseLegacyUserAccessAll => LEGACY_USER_ACCESS_ALL_RECOVERY,
+        CustomRolePreflightDecision::RefuseAmbiguousPartialMigration => AMBIGUOUS_PARTIAL_MIGRATION_RECOVERY,
         _ => "",
     };
 
@@ -878,6 +1028,9 @@ fn custom_role_preflight_error(decision: CustomRolePreflightDecision, facts: Cus
         }
         CustomRolePreflightDecision::RefuseLegacyUserAccessAll => {
             "a plain User membership still carries the legacy access_all bit"
+        }
+        CustomRolePreflightDecision::RefuseAmbiguousPartialMigration => {
+            "the Custom-role migration is partially applied and the schema is not one it can finish"
         }
         _ => unreachable!("only a refusal is an error"),
     };
@@ -938,6 +1091,19 @@ fn log_recorded_completed_migration() {
     );
 }
 
+#[cfg(mysql)]
+fn log_resumed_interrupted_migration(converted: usize) {
+    warn!(
+        "Custom-role migration {CUSTOM_ROLE_PERMISSIONS_MIGRATION}: its permission columns were already \
+         present while the migration was still unrecorded, which is what an interrupted upgrade leaves \
+         behind on MySQL and MariaDB, where every ALTER TABLE commits on its own. The schema matched the \
+         expected fingerprint exactly, so the migration was finished: {converted} legacy Manager \
+         membership(s) converted, the access_all column dropped and the migration recorded. The \
+         conversion is the migration's own statement and matches only atype = 3, so a run that had \
+         already converted them changed nothing here."
+    );
+}
+
 // Embed the migrations from the migrations folder into the application
 // This way, the program automatically migrates the database to the latest version
 // https://docs.rs/diesel_migrations/*/diesel_migrations/macro.embed_migrations.html
@@ -946,6 +1112,10 @@ mod sqlite_migrations {
     use diesel::{Connection, RunQueryDsl};
     use diesel_migrations::{EmbeddedMigrations, MigrationHarness};
     pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations/sqlite");
+
+    /// Diesel runs each SQLite migration inside a transaction, so a failure rolls the whole file
+    /// back and no half-applied schema can be left behind.
+    const INTERRUPTIBLE_SCHEMA_CHANGES: super::InterruptibleSchemaChanges = false;
 
     #[derive(diesel::QueryableByName)]
     struct Count {
@@ -1066,7 +1236,8 @@ mod sqlite_migrations {
             newer_migration_recorded,
         };
 
-        let decision = super::custom_role_preflight_decision(facts, super::LegacyUserAccessAllPolicy::configured());
+        let policy = super::LegacyUserAccessAllPolicy::configured();
+        let decision = super::custom_role_preflight_decision(facts, policy, INTERRUPTIBLE_SCHEMA_CHANGES);
         match decision {
             super::CustomRolePreflightDecision::Proceed => Ok(()),
             super::CustomRolePreflightDecision::RecordCompletedMigration => {
@@ -1089,8 +1260,20 @@ mod sqlite_migrations {
                     resolved = diesel::sql_query(*statement).execute(connection)?;
                 }
                 super::log_resolved_legacy_user_access_all(decision, resolved);
-                Ok(())
+                // Resolving the flag changes one fact, so the answer has to be recomputed before the
+                // file goes back to Diesel.
+                match super::custom_role_decision_after_legacy_resolution(facts, policy, INTERRUPTIBLE_SCHEMA_CHANGES) {
+                    super::CustomRolePreflightDecision::Proceed => Ok(()),
+                    followup => Err(super::custom_role_preflight_error(followup, facts)),
+                }
             }
+            // SQLite runs the whole migration inside one transaction, so it cannot stop half-way and
+            // `custom_role_preflight_decision` never resumes for it. Fail closed rather than rely on
+            // that from a distance.
+            super::CustomRolePreflightDecision::ResumeInterruptedMigration => Err(super::custom_role_preflight_error(
+                super::CustomRolePreflightDecision::RefuseAmbiguousPartialMigration,
+                facts,
+            )),
             decision => Err(super::custom_role_preflight_error(decision, facts)),
         }
     }
@@ -1124,6 +1307,11 @@ mod mysql_migrations {
     use diesel::{Connection, RunQueryDsl};
     use diesel_migrations::{EmbeddedMigrations, MigrationHarness};
     pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations/mysql");
+
+    /// MySQL and MariaDB commit every `ALTER TABLE` on their own, so a process killed part-way
+    /// through a migration leaves it half-applied. This is the only backend an interrupted upgrade
+    /// can be resumed on.
+    const INTERRUPTIBLE_SCHEMA_CHANGES: super::InterruptibleSchemaChanges = true;
 
     #[derive(diesel::QueryableByName)]
     struct Count {
@@ -1256,22 +1444,19 @@ mod mysql_migrations {
             newer_migration_recorded,
         };
 
-        let decision = super::custom_role_preflight_decision(facts, super::LegacyUserAccessAllPolicy::configured());
+        let policy = super::LegacyUserAccessAllPolicy::configured();
+        let decision = super::custom_role_preflight_decision(facts, policy, INTERRUPTIBLE_SCHEMA_CHANGES);
         match decision {
             super::CustomRolePreflightDecision::Proceed => Ok(()),
             super::CustomRolePreflightDecision::RecordCompletedMigration => {
                 // Diesel will not run the file, so the migration's own statements after its last
                 // schema change have to happen here.
                 diesel::sql_query(super::DROP_DOWNGRADE_ACK_SQL).execute(connection)?;
-                diesel::sql_query(format!(
-                    "INSERT IGNORE INTO __diesel_schema_migrations (version, run_on) \
-                     VALUES ('{}', CURRENT_TIMESTAMP)",
-                    super::CUSTOM_ROLE_PERMISSIONS_MIGRATION
-                ))
-                .execute(connection)?;
+                record_migration(connection)?;
                 super::log_recorded_completed_migration();
                 Ok(())
             }
+            super::CustomRolePreflightDecision::ResumeInterruptedMigration => resume_migration(connection),
             super::CustomRolePreflightDecision::DropLegacyUserAccessAll
             | super::CustomRolePreflightDecision::MaterializeLegacyUserAccessAll => {
                 let mut resolved = 0;
@@ -1279,10 +1464,49 @@ mod mysql_migrations {
                     resolved = diesel::sql_query(*statement).execute(connection)?;
                 }
                 super::log_resolved_legacy_user_access_all(decision, resolved);
-                Ok(())
+                // Resolving the flag changes one fact, so the answer has to be recomputed: this
+                // database may *also* be a half-applied upgrade, which must never be handed back to
+                // Diesel -- it would re-run `ALTER TABLE ... ADD COLUMN` and abort.
+                match super::custom_role_decision_after_legacy_resolution(facts, policy, INTERRUPTIBLE_SCHEMA_CHANGES) {
+                    super::CustomRolePreflightDecision::Proceed => Ok(()),
+                    super::CustomRolePreflightDecision::ResumeInterruptedMigration => resume_migration(connection),
+                    followup => Err(super::custom_role_preflight_error(followup, facts)),
+                }
             }
             decision => Err(super::custom_role_preflight_error(decision, facts)),
         }
+    }
+
+    /// Idempotent ledger insert, so a repeated or racing startup is a no-op rather than a
+    /// duplicate-key failure.
+    fn record_migration(connection: &mut diesel::mysql::MysqlConnection) -> Result<(), diesel::result::Error> {
+        diesel::sql_query(format!(
+            "INSERT IGNORE INTO __diesel_schema_migrations (version, run_on) \
+             VALUES ('{}', CURRENT_TIMESTAMP)",
+            super::CUSTOM_ROLE_PERMISSIONS_MIGRATION
+        ))
+        .execute(connection)
+        .map(|_| ())
+    }
+
+    /// Finish a migration that stopped between its first `ALTER TABLE` and its last.
+    ///
+    /// Only reached once `custom_role_migration_is_resumable` has confirmed the schema is exactly
+    /// what an interrupted run leaves behind, so the statements below are the ones that run has not
+    /// executed yet -- or, for the conversion, the one it may already have executed, which matches
+    /// nothing the second time. Diesel then finds the migration recorded and never opens the file, so
+    /// the `ADD COLUMN` that would otherwise abort startup is never reached.
+    fn resume_migration(connection: &mut diesel::mysql::MysqlConnection) -> Result<(), super::Error> {
+        let mut converted = 0;
+        for statement in super::CUSTOM_ROLE_RESUME_STATEMENTS {
+            let affected = diesel::sql_query(statement).execute(connection)?;
+            if statement == super::CUSTOM_ROLE_MANAGER_CONVERSION_SQL {
+                converted = affected;
+            }
+        }
+        record_migration(connection)?;
+        super::log_resumed_interrupted_migration(converted);
+        Ok(())
     }
 
     pub fn run_migrations(db_url: &str) -> Result<(), super::Error> {
@@ -1307,6 +1531,10 @@ mod postgresql_migrations {
     use diesel::{Connection, RunQueryDsl};
     use diesel_migrations::{EmbeddedMigrations, MigrationHarness};
     pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations/postgresql");
+
+    /// Diesel runs each PostgreSQL migration inside a transaction, and PostgreSQL DDL is
+    /// transactional, so a failure rolls the whole file back.
+    const INTERRUPTIBLE_SCHEMA_CHANGES: super::InterruptibleSchemaChanges = false;
 
     #[derive(diesel::QueryableByName)]
     struct Count {
@@ -1445,7 +1673,8 @@ mod postgresql_migrations {
             newer_migration_recorded,
         };
 
-        let decision = super::custom_role_preflight_decision(facts, super::LegacyUserAccessAllPolicy::configured());
+        let policy = super::LegacyUserAccessAllPolicy::configured();
+        let decision = super::custom_role_preflight_decision(facts, policy, INTERRUPTIBLE_SCHEMA_CHANGES);
         match decision {
             super::CustomRolePreflightDecision::Proceed => Ok(()),
             super::CustomRolePreflightDecision::RecordCompletedMigration => {
@@ -1468,8 +1697,20 @@ mod postgresql_migrations {
                     resolved = diesel::sql_query(*statement).execute(connection)?;
                 }
                 super::log_resolved_legacy_user_access_all(decision, resolved);
-                Ok(())
+                // Resolving the flag changes one fact, so the answer has to be recomputed before the
+                // file goes back to Diesel.
+                match super::custom_role_decision_after_legacy_resolution(facts, policy, INTERRUPTIBLE_SCHEMA_CHANGES) {
+                    super::CustomRolePreflightDecision::Proceed => Ok(()),
+                    followup => Err(super::custom_role_preflight_error(followup, facts)),
+                }
             }
+            // PostgreSQL runs the whole migration inside one transaction, so it cannot stop half-way
+            // and `custom_role_preflight_decision` never resumes for it. Fail closed rather than rely
+            // on that from a distance.
+            super::CustomRolePreflightDecision::ResumeInterruptedMigration => Err(super::custom_role_preflight_error(
+                super::CustomRolePreflightDecision::RefuseAmbiguousPartialMigration,
+                facts,
+            )),
             decision => Err(super::custom_role_preflight_error(decision, facts)),
         }
     }
@@ -1647,6 +1888,45 @@ mod custom_role_migration_sql_tests {
                  || ' ro=' || read_only || ' hide=' || hide_passwords || ' manage=' || manage AS value \
              FROM users_collections ORDER BY user_uuid, collection_uuid",
         )
+    }
+
+    /// Audit M-2: resuming an interrupted MySQL upgrade replays the migration's own conversion, so
+    /// it has to land on exactly what the migration produces -- and produce it again unchanged if the
+    /// interrupted run had already got that far. That idempotence is what lets one recovery path
+    /// cover both interruption points without having to tell them apart.
+    ///
+    /// Executed here on SQLite because that is the backend with an in-process harness; only the
+    /// statement is under test, not the backend it is replayed on. Its `DROP COLUMN` companion is
+    /// deliberately left out: SQLite before 3.35 cannot run it, which is why the migration itself
+    /// rebuilds the table instead.
+    #[cfg(mysql)]
+    #[test]
+    fn the_resume_conversion_matches_the_migration_and_is_idempotent() {
+        // What the migration produces when it runs to completion.
+        let mut finished = connect(LEGACY_MEMBERSHIPS);
+        migrate(&mut finished).unwrap();
+        let expected = state(&mut finished);
+
+        // The same database, interrupted straight after `ALTER TABLE ... ADD COLUMN`: the nine
+        // columns exist at their defaults, nothing is converted, `access_all` is still there.
+        let mut interrupted = connect(LEGACY_MEMBERSHIPS);
+        for column in super::CUSTOM_ROLE_PERMISSION_COLUMNS {
+            diesel::sql_query(format!(
+                "ALTER TABLE users_organizations ADD COLUMN {column} BOOLEAN NOT NULL DEFAULT FALSE"
+            ))
+            .execute(&mut interrupted)
+            .unwrap();
+        }
+        assert_ne!(state(&mut interrupted), expected, "the interrupted database must not already match");
+
+        let converted = diesel::sql_query(super::CUSTOM_ROLE_MANAGER_CONVERSION_SQL).execute(&mut interrupted).unwrap();
+        assert!(converted > 0, "the first replay has legacy Managers to convert");
+        assert_eq!(state(&mut interrupted), expected, "resuming must land on the migration's own result");
+
+        // The later interruption point: the conversion already ran, so replaying it matches nothing.
+        let replayed = diesel::sql_query(super::CUSTOM_ROLE_MANAGER_CONVERSION_SQL).execute(&mut interrupted).unwrap();
+        assert_eq!(replayed, 0, "the conversion must match nothing the second time");
+        assert_eq!(state(&mut interrupted), expected, "replaying the conversion must change nothing");
     }
 
     /// Every membership's role plus the six permissions the conversion can set, as one line each.
@@ -2265,8 +2545,8 @@ mod custom_role_migration_preflight_tests {
     use super::{
         CUSTOM_ROLE_PERMISSION_COLUMNS, CustomRoleMigrationFacts, CustomRolePreflightDecision,
         EXPECTED_MEMBERSHIP_COLUMNS, LEGACY_USER_ACCESS_ALL_CLEAR_SQL, LEGACY_USER_ACCESS_ALL_MATERIALIZE_SQL,
-        LEGACY_USER_ACCESS_ALL_RELAX_SQL, LegacyUserAccessAllPolicy, custom_role_preflight_decision,
-        custom_role_preflight_report, legacy_user_access_all_statements,
+        LEGACY_USER_ACCESS_ALL_RELAX_SQL, LegacyUserAccessAllPolicy, custom_role_decision_after_legacy_resolution,
+        custom_role_preflight_decision, custom_role_preflight_report, legacy_user_access_all_statements,
     };
 
     /// The operator-facing refusal text.
@@ -2275,8 +2555,15 @@ mod custom_role_migration_preflight_tests {
     }
 
     /// Refusing is the default policy; the tests that care about the other two pass them explicitly.
+    /// MySQL/MariaDB is the backend an interrupted upgrade can be resumed on, so it is the default
+    /// here too; `decide_atomic` covers SQLite and PostgreSQL.
     fn decide(facts: CustomRoleMigrationFacts) -> CustomRolePreflightDecision {
-        custom_role_preflight_decision(facts, LegacyUserAccessAllPolicy::Refuse)
+        custom_role_preflight_decision(facts, LegacyUserAccessAllPolicy::Refuse, true)
+    }
+
+    /// The same question on a backend that runs the whole migration in one transaction.
+    fn decide_atomic(facts: CustomRoleMigrationFacts) -> CustomRolePreflightDecision {
+        custom_role_preflight_decision(facts, LegacyUserAccessAllPolicy::Refuse, false)
     }
 
     /// A database that has not been upgraded yet and has nothing to decide.
@@ -2313,6 +2600,110 @@ mod custom_role_migration_preflight_tests {
             legacy_manager_rows: 0,
             newer_migration_recorded: false,
         }
+    }
+
+    /// What an interrupted MySQL/MariaDB upgrade leaves behind: the nine permission columns are
+    /// there, `access_all` has not been dropped yet, and the ledger entry never committed.
+    fn interrupted() -> CustomRoleMigrationFacts {
+        CustomRoleMigrationFacts {
+            permission_columns_present: i64::try_from(CUSTOM_ROLE_PERMISSION_COLUMNS.len()).unwrap(),
+            permission_columns_not_null: i64::try_from(CUSTOM_ROLE_PERMISSION_COLUMNS.len()).unwrap(),
+            // the finished table plus the legacy column that still has to go
+            membership_column_count: i64::try_from(EXPECTED_MEMBERSHIP_COLUMNS.len() + 1).unwrap(),
+            expected_membership_columns_present: i64::try_from(EXPECTED_MEMBERSHIP_COLUMNS.len()).unwrap(),
+            ..ready()
+        }
+    }
+
+    /// Audit M-2: the state that used to reach Diesel and abort with a bare duplicate-column error.
+    #[test]
+    fn an_interrupted_migration_is_resumed_instead_of_reaching_diesel() {
+        assert_eq!(decide(interrupted()), CustomRolePreflightDecision::ResumeInterruptedMigration);
+    }
+
+    /// SQLite and PostgreSQL run the whole migration in one transaction, so a half-applied schema
+    /// there was not produced by an interruption and must never be finished on that assumption.
+    #[test]
+    fn a_transactional_backend_never_resumes() {
+        assert_eq!(decide_atomic(interrupted()), CustomRolePreflightDecision::RefuseAmbiguousPartialMigration);
+    }
+
+    /// Every single deviation from the expected schema falls back to the controlled refusal.
+    #[test]
+    fn only_the_exact_interrupted_fingerprint_is_resumed() {
+        let mut partial_columns = interrupted();
+        partial_columns.permission_columns_present = 4;
+        let mut nullable_column = interrupted();
+        nullable_column.permission_columns_not_null -= 1;
+        let mut extra_column = interrupted();
+        extra_column.membership_column_count += 1;
+        let mut renamed_column = interrupted();
+        renamed_column.expected_membership_columns_present -= 1;
+        let mut tampered_ledger = interrupted();
+        tampered_ledger.newer_migration_recorded = true;
+        let mut no_ledger = interrupted();
+        no_ledger.migration_ledger_exists = false;
+
+        for (what, facts) in [
+            ("only some permission columns", partial_columns),
+            ("a nullable permission column", nullable_column),
+            ("an unknown extra column", extra_column),
+            ("a missing expected column", renamed_column),
+            ("a newer migration recorded", tampered_ledger),
+            ("no migration ledger", no_ledger),
+        ] {
+            assert_eq!(decide(facts), CustomRolePreflightDecision::RefuseAmbiguousPartialMigration, "{what}");
+        }
+    }
+
+    /// An untouched database still has none of the columns, so it is never mistaken for an
+    /// interrupted one on either kind of backend.
+    #[test]
+    fn an_untouched_pending_database_is_not_mistaken_for_an_interrupted_one() {
+        assert_eq!(decide(ready()), CustomRolePreflightDecision::Proceed);
+        assert_eq!(decide_atomic(ready()), CustomRolePreflightDecision::Proceed);
+    }
+
+    /// A completed-but-unrecorded database keeps its own answer: `access_all` is already gone there,
+    /// so it is recorded rather than resumed.
+    #[test]
+    fn a_completed_migration_is_recorded_not_resumed() {
+        assert_eq!(decide(completed_but_unrecorded()), CustomRolePreflightDecision::RecordCompletedMigration);
+    }
+
+    /// The legacy `User + access_all` question still comes first on an interrupted database — and
+    /// once it is resolved the resume must still happen, rather than the file going back to Diesel.
+    #[test]
+    fn the_legacy_flag_is_answered_before_an_interrupted_migration_is_resumed() {
+        let mut facts = interrupted();
+        facts.legacy_user_access_all_count = 2;
+
+        assert_eq!(decide(facts), CustomRolePreflightDecision::RefuseLegacyUserAccessAll);
+        for (policy, expected) in [
+            (LegacyUserAccessAllPolicy::Drop, CustomRolePreflightDecision::DropLegacyUserAccessAll),
+            (LegacyUserAccessAllPolicy::Materialize, CustomRolePreflightDecision::MaterializeLegacyUserAccessAll),
+        ] {
+            assert_eq!(custom_role_preflight_decision(facts, policy, true), expected, "{policy:?}");
+            assert_eq!(
+                custom_role_decision_after_legacy_resolution(facts, policy, true),
+                CustomRolePreflightDecision::ResumeInterruptedMigration,
+                "{policy:?} must still finish the interrupted migration"
+            );
+        }
+    }
+
+    /// The refusal has to say what was found and what to do about it, and must not claim the
+    /// database was changed.
+    #[test]
+    fn the_ambiguous_refusal_reports_the_schema_and_a_way_out() {
+        let mut facts = interrupted();
+        facts.permission_columns_present = 4;
+        let text = message(CustomRolePreflightDecision::RefuseAmbiguousPartialMigration, facts);
+
+        assert!(text.contains("Nothing has been changed"), "{text}");
+        assert!(text.contains("4 of its 9 permission columns"), "{text}");
+        assert!(text.contains("Restore the backup"), "{text}");
+        assert!(text.contains("SQLite and PostgreSQL"), "{text}");
     }
 
     #[test]
@@ -2427,11 +2818,12 @@ mod custom_role_migration_preflight_tests {
         }
     }
 
-    /// The two earlier MySQL/MariaDB interruption points still have `access_all`, so they never
-    /// reach the completed-schema check at all: the migration is simply pending, and re-running it
-    /// fails on the duplicate column exactly as before.
+    /// Audit M-2: the two earlier MySQL/MariaDB interruption points still have `access_all`, so they
+    /// never reach the completed-schema check. They used to fall through as an ordinary pending
+    /// migration, which handed the file back to Diesel and aborted startup on the duplicate column.
+    /// Both are now recognised and finished instead.
     #[test]
-    fn earlier_interruption_points_are_still_an_ordinary_pending_migration() {
+    fn both_earlier_interruption_points_are_resumed() {
         let after_add_column = CustomRoleMigrationFacts {
             permission_columns_present: i64::try_from(CUSTOM_ROLE_PERMISSION_COLUMNS.len()).unwrap(),
             permission_columns_not_null: i64::try_from(CUSTOM_ROLE_PERMISSION_COLUMNS.len()).unwrap(),
@@ -2440,13 +2832,13 @@ mod custom_role_migration_preflight_tests {
             legacy_manager_rows: 3,
             ..ready()
         };
-        assert_eq!(decide(after_add_column), CustomRolePreflightDecision::Proceed);
+        assert_eq!(decide(after_add_column), CustomRolePreflightDecision::ResumeInterruptedMigration);
 
         let after_update = CustomRoleMigrationFacts {
             legacy_manager_rows: 0,
             ..after_add_column
         };
-        assert_eq!(decide(after_update), CustomRolePreflightDecision::Proceed);
+        assert_eq!(decide(after_update), CustomRolePreflightDecision::ResumeInterruptedMigration);
     }
 
     /// An already-recorded migration is never re-examined, so the repair cannot fire twice.
@@ -2504,10 +2896,10 @@ mod custom_role_migration_preflight_tests {
             (LegacyUserAccessAllPolicy::Drop, CustomRolePreflightDecision::DropLegacyUserAccessAll),
             (LegacyUserAccessAllPolicy::Materialize, CustomRolePreflightDecision::MaterializeLegacyUserAccessAll),
         ] {
-            assert_eq!(custom_role_preflight_decision(affected, policy), expected, "{policy:?}");
+            assert_eq!(custom_role_preflight_decision(affected, policy, true), expected, "{policy:?}");
             // nothing to resolve -> the policy is inert
             assert_eq!(
-                custom_role_preflight_decision(ready(), policy),
+                custom_role_preflight_decision(ready(), policy, true),
                 CustomRolePreflightDecision::Proceed,
                 "{policy:?} must not change an unaffected database"
             );
@@ -2526,7 +2918,7 @@ mod custom_role_migration_preflight_tests {
             [LegacyUserAccessAllPolicy::Refuse, LegacyUserAccessAllPolicy::Drop, LegacyUserAccessAllPolicy::Materialize]
         {
             assert_eq!(
-                custom_role_preflight_decision(broken, policy),
+                custom_role_preflight_decision(broken, policy, true),
                 CustomRolePreflightDecision::RefuseMissingAccessAll,
                 "{policy:?}"
             );

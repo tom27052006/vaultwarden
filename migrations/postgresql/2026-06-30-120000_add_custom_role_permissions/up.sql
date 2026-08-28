@@ -1,15 +1,21 @@
 -- Replace the membership-level `access_all` flag with the persisted Custom role and its nine
 -- granular permissions.
 --
--- Before this migration a member could reach every collection of an organization in two ways that
--- the new model has to express as permissions: the membership's own `access_all` bit, and -- for a
--- Manager -- membership of an organization-local group with `access_all` (base
--- `Collection::is_coll_manageable_by_user` accepts either). The Custom role replaces the Manager
--- role and stores what a member may do, so both are written onto the membership here, while
--- `access_all` still exists and `atype = 3` still unambiguously means "legacy Manager".
+-- Two different columns are called `access_all`, and only one of them goes away here. Everything
+-- below depends on keeping them apart:
 --
--- `groups.access_all` itself is untouched: it is a separate, still-supported feature and keeps
--- granting group members access to every collection.
+--   * `users_organizations.access_all` -- the MEMBERSHIP-level bit. It is what this migration
+--     replaces, and it is dropped at the end of this file.
+--   * `groups.access_all` -- the GROUP-level flag. A separate, still-supported feature. It is only
+--     read here, to decide what a legacy Manager's permissions must be; it is never written, and it
+--     keeps granting group members access to every collection afterwards exactly as before.
+--
+-- Before this migration a Manager reached every collection of an organization through either of
+-- them: base `Collection::is_coll_manageable_by_user` accepts the membership bit and an
+-- organization-local group carrying the group flag. Only the membership bit has to be expressed as
+-- permissions, because only it is going away -- but the capability an owner configured through
+-- either route is preserved, so both are read below. While this file runs, `access_all` (the
+-- membership column) still exists and `atype = 3` still unambiguously means "legacy Manager".
 --
 -- One state cannot be converted at all and is refused before the first mutation; `src/db/mod.rs`
 -- evaluates the same condition at startup and prints the full recovery text, because Diesel would
@@ -57,14 +63,22 @@ ALTER TABLE users_organizations
 --   * a Manager with neither keeps all three at FALSE.
 --
 -- The second case is a deliberate policy choice, not an approximation. The group-derived capability
--- was dynamic: it ended with the group, with its `accessAll`, and with the member leaving it, and it
--- was inert while ORG_GROUPS_ENABLED was false. Nothing in the new model is bound to a group like
--- that, so it becomes a membership permission and therefore no longer lapses on its own -- and
--- `edit_any_collection` additionally satisfies `has_full_access()`. Preserving the capability an
--- owner configured is nevertheless the right trade-off: the alternative is either silently revoking
--- access these members have today, or refusing an ordinary upgrade from an official Vaultwarden
--- database. The permission is visible in the member's permission list afterwards and an owner can
--- clear it with a checkbox.
+-- was dynamic: it ended with the group, with the group's own `access_all`, and with the member
+-- leaving the group. It was NOT gated on ORG_GROUPS_ENABLED -- base
+-- `Collection::is_coll_manageable_by_user` reads `groups.access_all` in SQL with no configuration
+-- check, so a Manager in such a group could edit and delete every collection even on an instance
+-- that never turned groups on. Nothing in the new model is bound to a group like that, so the
+-- capability becomes a membership permission and therefore no longer lapses on its own.
+--
+-- `edit_any_collection` additionally satisfies `has_full_access()`, which opens two organization-wide
+-- reads to this member class that the group route did not: the organization collection list and
+-- `GET /ciphers/organization-details`. Both serve data these members could already reach through the
+-- group, so nothing becomes newly readable -- only the route does.
+--
+-- Preserving the capability an owner configured is nevertheless the right trade-off: the alternative
+-- is either silently revoking access these members have today, or refusing an ordinary upgrade from
+-- an official Vaultwarden database. The permission is visible in the member's permission list
+-- afterwards and an owner can clear it with a checkbox.
 --
 -- The management (manage_users / manage_groups / manage_policies) and access (event logs /
 -- import-export / reports) permissions keep their FALSE default. Nothing they unlock was a Manager
@@ -74,17 +88,23 @@ ALTER TABLE users_organizations
 -- not a preserved one.
 --
 -- One *read* is deliberately not carried over, and it is the single place where this conversion
--- takes something away. A Manager who reached every collection -- through the membership bit, or
--- through an organization-local `access_all` group -- also satisfied the `has_full_access` check
--- that guarded the full member list (`GET /organizations/<org>/users`), so they could read every
--- member's name, e-mail, two-factor state and assignments. They could not change any of it.
--- `manage_users` is not granted to restore that read, because it also carries invite, confirm,
--- revoke, restore and delete, which the Manager role never had -- handing out member administration
--- to preserve a read would be exactly the widening the paragraph above avoids. Such members keep
--- the member-readable `/users/mini-details` list, and an owner who wants the full list back grants
--- `manage_users` as a deliberate act. The group mappings the same Manager could read *are*
--- preserved: reading them follows organization-wide collection reach, which `edit_any_collection`
--- carries.
+-- takes something away -- and it only affects members who held the MEMBERSHIP bit. On the previous
+-- release `has_full_access()` read `self.access_all` and the membership's own role; it never
+-- consulted `groups.access_all`, and a Manager ranks below Admin. So it was satisfied by a Manager
+-- carrying membership `access_all`, and by nobody whose reach came from a group.
+--
+-- That check guarded the full member list (`GET /organizations/<org>/users`), so a Manager with the
+-- membership bit could read every member's name, e-mail, two-factor state and assignments. They
+-- could not change any of it. `manage_users` is not granted to restore that read, because it also
+-- carries invite, confirm, revoke, restore and delete, which the Manager role never had -- handing
+-- out member administration to preserve a read would be exactly the widening the paragraph above
+-- avoids. Such members keep the member-readable `/users/mini-details` list, and an owner who wants
+-- the full list back grants `manage_users` as a deliberate act.
+--
+-- A Manager whose reach came only from a group never had that list, and does not gain it here: it is
+-- gated on `manage_users`, which this migration grants to nobody. The group mappings such a Manager
+-- could read *are* preserved: reading them follows organization-wide collection reach, which
+-- `edit_any_collection` carries.
 --
 -- Role conversion and permission values are one statement, so `atype = 3` unambiguously still means
 -- Manager everywhere it is read.
