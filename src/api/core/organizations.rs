@@ -3380,14 +3380,45 @@ async fn put_group(
 
     let updated_group = group_request.update_group(group);
 
+    // Security (audit F-1): `add_update_group` asks this too, but it runs *after* the destructive
+    // `CollectionGroup::delete_all_by_group` below -- a refusal there answered 400 with the group's
+    // collection assignments already gone, revoking them for every member of the group. Ask it here,
+    // while nothing has been written. `updated_group.access_all` is the value this request leaves
+    // behind, which is what actually grants, and it is the same value the later check reads.
+    if !may_grant_access_all_group(headers.membership_type)
+        && adds_member_to_access_all_group(&updated_group, &group_request.users, &org_id, &conn).await
+    {
+        err!("Only Admins and Owners can add a member to a group with access to all collections")
+    }
+
     if caller_can_manage_collections {
         CollectionGroup::delete_all_by_group(&group_id, &org_id, &conn).await?;
     }
     // NOTE: group membership is replaced (and access-gated) inside add_update_group.
 
+    // Only pass collection changes through if the caller is allowed to manage collections.
+    let collections_to_apply = if caller_can_manage_collections {
+        group_request.collections
+    } else {
+        Vec::new()
+    };
+    let response = add_update_group(
+        updated_group,
+        collections_to_apply,
+        group_request.users,
+        org_id.clone(),
+        &headers,
+        &conn,
+        caller_can_manage_collections,
+    )
+    .await?;
+
+    // Logged once the update has actually been applied. `add_update_group` still refuses a membership
+    // change the caller may not make, and an event written before it recorded an update that never
+    // happened.
     log_event(
         EventType::GroupUpdated as i32,
-        &updated_group.uuid,
+        &group_id,
         &org_id,
         &headers.user.uuid,
         headers.device.atype,
@@ -3396,22 +3427,7 @@ async fn put_group(
     )
     .await;
 
-    // Only pass collection changes through if the caller is allowed to manage collections.
-    let collections_to_apply = if caller_can_manage_collections {
-        group_request.collections
-    } else {
-        Vec::new()
-    };
-    add_update_group(
-        updated_group,
-        collections_to_apply,
-        group_request.users,
-        org_id,
-        &headers,
-        &conn,
-        caller_can_manage_collections,
-    )
-    .await
+    Ok(response)
 }
 
 /// Whether a caller may change (add OR remove) a member's membership in a group.
@@ -3436,6 +3452,10 @@ fn may_change_group_membership(caller_can_manage_collections: bool, group_confer
 /// Asked by `post_groups`, `put_group`, `add_update_group`, `put_group_members`, `edit_member` and
 /// `send_invite` — the last needs it because a new membership has no current groups to diff against,
 /// so every group in an invite is an addition.
+///
+/// A missing call site is invisible to `cargo test`, so that list is the thing to check when a new
+/// group path is added. So is *where* the call sits: it has to precede every write the request makes,
+/// or a refusal leaves the endpoint half-applied (audit F-1).
 fn may_grant_access_all_group(caller_type: MembershipType) -> bool {
     caller_type >= MembershipType::Admin
 }
@@ -3446,6 +3466,26 @@ fn may_grant_access_all_group(caller_type: MembershipType) -> bool {
 /// the endpoints that replace a whole member list.
 fn adds_group_member(requested: &HashSet<&MembershipId>, current: &HashSet<&MembershipId>) -> bool {
     !requested.is_subset(current)
+}
+
+/// Whether replacing `group`'s member list with `members` adds someone to an organization-wide group.
+///
+/// The question `may_grant_access_all_group` gates, resolved against the database. Shared by
+/// `put_group` and `add_update_group` so the pre-write check and the one next to the write can never
+/// answer differently. Reads `group.access_all` first, so an ordinary group costs no query.
+async fn adds_member_to_access_all_group(
+    group: &Group,
+    members: &[MembershipId],
+    org_id: &OrganizationId,
+    conn: &DbConn,
+) -> bool {
+    if !group.access_all {
+        return false;
+    }
+
+    let current_members = GroupUser::find_by_group(&group.uuid, org_id, conn).await;
+    let current: HashSet<&MembershipId> = current_members.iter().map(|gu| &gu.users_organizations_uuid).collect();
+    adds_group_member(&members.iter().collect(), &current)
 }
 
 /// Whether `requested` and `current` agree on every group that confers collection access.
@@ -3674,14 +3714,12 @@ async fn add_update_group(
     //
     // `group.access_all` is the value this request leaves behind, which is what actually grants: adding a
     // member to it is Admin/Owner authority even for a caller who can manage collections. Removals stay
-    // under the collection rule below.
-    if group.access_all && !may_grant_access_all_group(headers.membership_type) {
-        let requested: HashSet<&MembershipId> = members.iter().collect();
-        let current_members = GroupUser::find_by_group(&group.uuid, &org_id, conn).await;
-        let current: HashSet<&MembershipId> = current_members.iter().map(|gu| &gu.users_organizations_uuid).collect();
-        if adds_group_member(&requested, &current) {
-            err!("Only Admins and Owners can add a member to a group with access to all collections")
-        }
+    // under the collection rule below. `put_group` asks the same question before its own destructive
+    // delete (audit F-1); this call covers `post_groups`, where nothing has been written yet either.
+    if !may_grant_access_all_group(headers.membership_type)
+        && adds_member_to_access_all_group(&group, &members, &org_id, conn).await
+    {
+        err!("Only Admins and Owners can add a member to a group with access to all collections")
     }
 
     if !caller_can_manage_collections

@@ -1221,17 +1221,24 @@ mod sqlite_migrations {
             }
             super::CustomRolePreflightDecision::DropLegacyUserAccessAll
             | super::CustomRolePreflightDecision::MaterializeLegacyUserAccessAll => {
+                // Resolving the flag changes one fact, so the answer has to be recomputed before the
+                // file goes back to Diesel.
+                //
+                // Data integrity (audit F-2): recomputed *before* the statements run. They commit
+                // immediately and cannot be undone -- `materialize` even relaxes `read_only` and
+                // `hide_passwords` on existing assignments -- so a database that would be refused
+                // afterwards anyway has to be refused now, while the refusal's "Nothing has been
+                // changed" is still true.
+                match super::custom_role_decision_after_legacy_resolution(facts, policy, INTERRUPTIBLE_SCHEMA_CHANGES) {
+                    super::CustomRolePreflightDecision::Proceed => {}
+                    followup => return Err(super::custom_role_preflight_error(followup, facts)),
+                }
                 let mut resolved = 0;
                 for statement in super::legacy_user_access_all_statements(decision) {
                     resolved = diesel::sql_query(*statement).execute(connection)?;
                 }
                 super::log_resolved_legacy_user_access_all(decision, resolved);
-                // Resolving the flag changes one fact, so the answer has to be recomputed before the
-                // file goes back to Diesel.
-                match super::custom_role_decision_after_legacy_resolution(facts, policy, INTERRUPTIBLE_SCHEMA_CHANGES) {
-                    super::CustomRolePreflightDecision::Proceed => Ok(()),
-                    followup => Err(super::custom_role_preflight_error(followup, facts)),
-                }
+                Ok(())
             }
             // SQLite runs the whole migration inside one transaction, so it cannot stop half-way and
             // `custom_role_preflight_decision` never resumes for it. Fail closed rather than rely on
@@ -1423,18 +1430,33 @@ mod mysql_migrations {
             super::CustomRolePreflightDecision::ResumeInterruptedMigration => resume_migration(connection),
             super::CustomRolePreflightDecision::DropLegacyUserAccessAll
             | super::CustomRolePreflightDecision::MaterializeLegacyUserAccessAll => {
+                // Resolving the flag changes one fact, so the answer has to be recomputed: this
+                // database may *also* be a half-applied upgrade, which must never be handed back to
+                // Diesel -- it would re-run `ALTER TABLE ... ADD COLUMN` and abort.
+                //
+                // Data integrity (audit F-2): recomputed *before* the statements run. They commit
+                // immediately and cannot be undone -- `materialize` even relaxes `read_only` and
+                // `hide_passwords` on existing assignments -- so a database that would be refused
+                // afterwards anyway has to be refused now, while the refusal's "Nothing has been
+                // changed" is still true. Resuming is not a refusal: those statements do run, and the
+                // interrupted migration is finished afterwards.
+                let followup =
+                    super::custom_role_decision_after_legacy_resolution(facts, policy, INTERRUPTIBLE_SCHEMA_CHANGES);
+                if !matches!(
+                    followup,
+                    super::CustomRolePreflightDecision::Proceed
+                        | super::CustomRolePreflightDecision::ResumeInterruptedMigration
+                ) {
+                    return Err(super::custom_role_preflight_error(followup, facts));
+                }
                 let mut resolved = 0;
                 for statement in super::legacy_user_access_all_statements(decision) {
                     resolved = diesel::sql_query(*statement).execute(connection)?;
                 }
                 super::log_resolved_legacy_user_access_all(decision, resolved);
-                // Resolving the flag changes one fact, so the answer has to be recomputed: this
-                // database may *also* be a half-applied upgrade, which must never be handed back to
-                // Diesel -- it would re-run `ALTER TABLE ... ADD COLUMN` and abort.
-                match super::custom_role_decision_after_legacy_resolution(facts, policy, INTERRUPTIBLE_SCHEMA_CHANGES) {
-                    super::CustomRolePreflightDecision::Proceed => Ok(()),
+                match followup {
                     super::CustomRolePreflightDecision::ResumeInterruptedMigration => resume_migration(connection),
-                    followup => Err(super::custom_role_preflight_error(followup, facts)),
+                    _ => Ok(()),
                 }
             }
             decision => Err(super::custom_role_preflight_error(decision, facts)),
@@ -1652,17 +1674,24 @@ mod postgresql_migrations {
             }
             super::CustomRolePreflightDecision::DropLegacyUserAccessAll
             | super::CustomRolePreflightDecision::MaterializeLegacyUserAccessAll => {
+                // Resolving the flag changes one fact, so the answer has to be recomputed before the
+                // file goes back to Diesel.
+                //
+                // Data integrity (audit F-2): recomputed *before* the statements run. They commit
+                // immediately and cannot be undone -- `materialize` even relaxes `read_only` and
+                // `hide_passwords` on existing assignments -- so a database that would be refused
+                // afterwards anyway has to be refused now, while the refusal's "Nothing has been
+                // changed" is still true.
+                match super::custom_role_decision_after_legacy_resolution(facts, policy, INTERRUPTIBLE_SCHEMA_CHANGES) {
+                    super::CustomRolePreflightDecision::Proceed => {}
+                    followup => return Err(super::custom_role_preflight_error(followup, facts)),
+                }
                 let mut resolved = 0;
                 for statement in super::legacy_user_access_all_statements(decision) {
                     resolved = diesel::sql_query(*statement).execute(connection)?;
                 }
                 super::log_resolved_legacy_user_access_all(decision, resolved);
-                // Resolving the flag changes one fact, so the answer has to be recomputed before the
-                // file goes back to Diesel.
-                match super::custom_role_decision_after_legacy_resolution(facts, policy, INTERRUPTIBLE_SCHEMA_CHANGES) {
-                    super::CustomRolePreflightDecision::Proceed => Ok(()),
-                    followup => Err(super::custom_role_preflight_error(followup, facts)),
-                }
+                Ok(())
             }
             // PostgreSQL runs the whole migration inside one transaction, so it cannot stop half-way
             // and `custom_role_preflight_decision` never resumes for it. Fail closed rather than rely
@@ -2639,6 +2668,61 @@ mod custom_role_migration_preflight_tests {
                 CustomRolePreflightDecision::ResumeInterruptedMigration,
                 "{policy:?} must still finish the interrupted migration"
             );
+        }
+    }
+
+    /// Audit F-2. Resolving the legacy flag writes -- and `materialize` also relaxes `read_only` and
+    /// `hide_passwords` on assignments that already exist. Those statements commit immediately, so
+    /// the preflight asks what the *resolved* database would answer before running any of them: a
+    /// schema no backend can finish has to be refused while "Nothing has been changed" is still true.
+    ///
+    /// The two cases that must not be confused: on a backend whose schema changes are interruptible
+    /// the exact fingerprint still resumes (the statements do run), while every other partial schema,
+    /// and every partial schema at all on a transactional backend, refuses without writing.
+    #[test]
+    fn a_partial_schema_is_refused_before_the_legacy_flag_is_resolved() {
+        let resolving = [LegacyUserAccessAllPolicy::Drop, LegacyUserAccessAllPolicy::Materialize];
+
+        let mut half_applied = interrupted();
+        half_applied.legacy_user_access_all_count = 3;
+        half_applied.permission_columns_present = 4;
+        half_applied.permission_columns_not_null = 4;
+        for policy in resolving {
+            for interruptible in [true, false] {
+                assert_eq!(
+                    custom_role_decision_after_legacy_resolution(half_applied, policy, interruptible),
+                    CustomRolePreflightDecision::RefuseAmbiguousPartialMigration,
+                    "{policy:?} interruptible={interruptible}: a 4-of-9 schema must refuse, not write first"
+                );
+            }
+        }
+
+        let mut fingerprinted = interrupted();
+        fingerprinted.legacy_user_access_all_count = 3;
+        for policy in resolving {
+            assert_eq!(
+                custom_role_decision_after_legacy_resolution(fingerprinted, policy, false),
+                CustomRolePreflightDecision::RefuseAmbiguousPartialMigration,
+                "{policy:?}: a transactional backend never resumes, so it must refuse before writing"
+            );
+            assert_eq!(
+                custom_role_decision_after_legacy_resolution(fingerprinted, policy, true),
+                CustomRolePreflightDecision::ResumeInterruptedMigration,
+                "{policy:?}: the exact fingerprint still resumes, and the statements do run"
+            );
+        }
+
+        // The control: with a schema that is not partial at all, resolving is all there is to do.
+        let mut ordinary = ready();
+        ordinary.legacy_user_access_all_count = 3;
+        for policy in resolving {
+            for interruptible in [true, false] {
+                assert_eq!(
+                    custom_role_decision_after_legacy_resolution(ordinary, policy, interruptible),
+                    CustomRolePreflightDecision::Proceed,
+                    "{policy:?} interruptible={interruptible}"
+                );
+            }
         }
     }
 
