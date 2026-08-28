@@ -2,9 +2,9 @@
 -- change expects, so that older binary starts again. Read README.md in this directory first --
 -- it lists exactly what is lost and how to run this safely.
 --
--- `ALTER TABLE ... DROP COLUMN` is avoided on purpose: it only exists since SQLite 3.35, and this
--- script has to work on the same older system SQLite the forward migrations support. Rebuilding the
--- table also recreates `access_all` and drops all nine permission columns in one step.
+-- `ALTER TABLE ... DROP COLUMN` is avoided on purpose -- it needs SQLite 3.35, and this script has to
+-- work on the same older system SQLite the forward migrations support. The rebuild recreates
+-- `access_all` and drops all nine permission columns in one step.
 
 -- Stop at the first error. Without this the sqlite3 shell keeps going after a failed statement,
 -- and a second run -- where the SELECT below can no longer see the permission columns -- would
@@ -153,23 +153,16 @@ CREATE TABLE users_organizations_rollback (
 -- Roles and the legacy flag are recomputed together, because in the old schema they are not
 -- independent.
 --
--- Only a membership on the allowlist comes back as Manager. The legacy Manager role is not a subset
--- of what a Custom member holds -- it manages, and deletes, every collection reachable through
--- `users_collections.manage`, `collections_groups.manage` or `groups.access_all`, and reads member
--- and collection ACL details through `ManagerHeadersLoose`, none of which needs a permission flag in
--- the old schema -- so handing it out on anything less than a current, deliberate decision would
--- *grant* authority during a downgrade. Historical provenance would not be that decision either: a
--- member whose powers an owner has since reduced would get all of them back.
+-- Only a membership on the allowlist comes back as Manager; everything else becomes a plain User and
+-- keeps every grant `users_collections` and `collections_groups` carry. The legacy role is not a
+-- subset of what a Custom member holds, so handing it out on less than a current, deliberate decision
+-- would *grant* authority during a downgrade -- and historical provenance is not that decision. See
+-- README.md.
 --
--- Everything else becomes a plain User. Per-collection assignments are untouched, so those members
--- keep every grant `users_collections` and `collections_groups` carry.
---
--- `access_all` follows the same mapping the down migrations use: everyone who reached every
--- collection keeps that reach, and a Custom member has to hold all three collection permissions --
--- Edit-only must not silently turn into the legacy "manage all collections" authority, which in that
--- older schema also carried collection deletion. A member mapped to plain User never keeps it:
--- `User + access_all` is the one legacy state the upgrade refuses, so leaving it set would make this
--- database unable to move forward again.
+-- `access_all` follows the mapping the down migrations use: a Custom member has to hold all three
+-- collection permissions, because in the old schema the bit also carried collection deletion. A
+-- member mapped to plain User never keeps it: `User + access_all` is the one state the upgrade
+-- refuses, so leaving it set would strand this database.
 INSERT INTO users_organizations_rollback (
   uuid, user_uuid, org_uuid, access_all, akey, status, atype,
   reset_password_key, external_id, invited_by_email

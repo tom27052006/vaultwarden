@@ -1,10 +1,7 @@
--- Lossy revert: it removes the nine Custom permissions and the Custom role itself, neither of which
--- the legacy role/`access_all` schema can represent. Two explicit operator decisions are therefore
--- required before anything is touched, and both are consumed at the end so one decision covers one
--- downgrade.
---
--- Operators who only need the older Vaultwarden version to start again do not need Diesel at all:
--- tools/custom_role_rollback/ has a self-contained script per backend that does exactly this.
+-- Lossy revert: the legacy role/`access_all` schema cannot represent the nine Custom permissions or
+-- the Custom role. Two explicit operator decisions are required before anything is touched, and both
+-- are consumed at the end, so one decision covers one downgrade. Operators who only need the older
+-- binary to start again can use the self-contained script per backend in tools/custom_role_rollback/.
 
 -- 1) Acknowledge the loss. Create this table with every Vaultwarden instance stopped:
 --
@@ -20,13 +17,10 @@ SELECT 1
 WHERE to_regclass('__vw_allow_custom_role_downgrade') IS NULL;
 DROP TABLE __vw_custom_role_downgrade_guard;
 
--- 2) Decide which Custom memberships come back as Manager. The legacy Manager role is not a subset
---    of what a Custom member holds -- it manages and deletes every collection reachable through
---    `users_collections.manage`, `collections_groups.manage` or `groups.access_all`, and reads
---    member and collection ACL details through `ManagerHeadersLoose`, none of which needs a
---    permission flag in the old schema. Handing it out automatically would *grant* authority during
---    a downgrade, so it takes a current, deliberate list. An empty list is a valid answer and maps
---    every Custom member to plain User; per-collection assignments are untouched either way.
+-- 2) Decide which Custom memberships come back as Manager. The legacy role is not a subset of what a
+--    Custom member holds, so handing it out automatically would *grant* authority during a
+--    downgrade; it takes a current, deliberate list. An empty list is a valid answer and maps every
+--    Custom member to plain User. See README.md in tools/custom_role_rollback/.
 --
 --        CREATE TABLE __vw_rollback_manager_allowlist (users_organizations_uuid CHAR(36) NOT NULL PRIMARY KEY);
 --        INSERT INTO __vw_rollback_manager_allowlist (users_organizations_uuid) VALUES ('<MEMBERSHIP_UUID>');

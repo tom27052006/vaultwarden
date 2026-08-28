@@ -1,10 +1,7 @@
--- Lossy revert: it removes the nine Custom permissions and the Custom role itself, neither of which
--- the legacy role/`access_all` schema can represent. Two explicit operator decisions are therefore
--- required before anything is touched, and both are consumed at the end so one decision covers one
--- downgrade.
---
--- Operators who only need the older Vaultwarden version to start again do not need Diesel at all:
--- tools/custom_role_rollback/ has a self-contained script per backend that does exactly this.
+-- Lossy revert: the legacy role/`access_all` schema cannot represent the nine Custom permissions or
+-- the Custom role. Two explicit operator decisions are required before anything is touched, and both
+-- are consumed at the end, so one decision covers one downgrade. Operators who only need the older
+-- binary to start again can use the self-contained script per backend in tools/custom_role_rollback/.
 
 -- 1) Acknowledge the loss. Create this table with every Vaultwarden instance stopped:
 --
@@ -23,13 +20,10 @@ WHERE NOT EXISTS (
 );
 DROP TABLE __vw_custom_role_downgrade_guard;
 
--- 2) Decide which Custom memberships come back as Manager. The legacy Manager role is not a subset
---    of what a Custom member holds -- it manages and deletes every collection reachable through
---    `users_collections.manage`, `collections_groups.manage` or `groups.access_all`, and reads
---    member and collection ACL details through `ManagerHeadersLoose`, none of which needs a
---    permission flag in the old schema. Handing it out automatically would *grant* authority during
---    a downgrade, so it takes a current, deliberate list. An empty list is a valid answer and maps
---    every Custom member to plain User; per-collection assignments are untouched either way.
+-- 2) Decide which Custom memberships come back as Manager. The legacy role is not a subset of what a
+--    Custom member holds, so handing it out automatically would *grant* authority during a
+--    downgrade; it takes a current, deliberate list. An empty list is a valid answer and maps every
+--    Custom member to plain User. See README.md in tools/custom_role_rollback/.
 --
 --        CREATE TABLE __vw_rollback_manager_allowlist (users_organizations_uuid TEXT NOT NULL PRIMARY KEY);
 --        INSERT INTO __vw_rollback_manager_allowlist (users_organizations_uuid) VALUES ('<MEMBERSHIP_UUID>');
@@ -47,20 +41,17 @@ WHERE NOT EXISTS (
 );
 DROP TABLE __vw_rollback_allowlist_guard;
 
--- Rebuild the pre-upgrade table. Roles and `access_all` are recomputed together, because in the old
--- schema they are not independent:
+-- Roles and `access_all` are recomputed together, because in the old schema they are not independent:
 --
 --   * Owners and Admins always carried the bit and it grants them nothing extra;
---   * an allowlisted Custom member becomes a Manager, and keeps the bit only if it holds all three
---     collection permissions -- in the old schema `access_all` also carried collection deletion, so
---     an Edit-only member must not silently gain it;
+--   * an allowlisted Custom member becomes a Manager, keeping the bit only with all three collection
+--     permissions -- `access_all` also carried collection deletion there, so an Edit-only member must
+--     not silently gain it;
 --   * everything else becomes a plain User without the bit. `User + access_all` is the one legacy
---     state the upgrade refuses, so leaving it set would make the database unable to move forward
---     again.
+--     state the upgrade refuses, so leaving it set would strand the database.
 --
--- Group-derived Manager authority is not restored here and does not need to be: `groups.access_all`
--- was never modified, so the older binary derives it again by itself for whoever comes back as
--- Manager.
+-- Group-derived Manager authority needs no restoring: `groups.access_all` was never modified, so the
+-- older binary derives it again for whoever comes back as Manager.
 CREATE TABLE users_organizations_old (
   uuid       TEXT    NOT NULL PRIMARY KEY,
   user_uuid  TEXT    NOT NULL REFERENCES users (uuid),

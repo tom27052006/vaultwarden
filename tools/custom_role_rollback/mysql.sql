@@ -8,22 +8,16 @@
 -- running it; if it is interrupted, restore and start over.
 
 -- ---------------------------------------------------------------------------------------------
--- Precondition. Read-only and session-local: it reads `information_schema` and the migration ledger,
--- prints the reason when the database does not fit, and aborts on a duplicate key in a TEMPORARY
--- table. No permanent object is created, altered or dropped, so a database this script does not fit
--- keeps its exact state -- which matters here precisely because DDL cannot be rolled back.
---
--- Without it, a partially upgraded database -- for example one where `access_all` was already dropped
--- but the access-permission columns were never added, which DDL autocommit makes reachable -- would
--- get through the first ADD COLUMN, the value rewrites, the type change and six DROP COLUMN statements before
--- failing on the seventh with error 1091, ending up *less* consistent than before.
+-- Precondition. Read-only and session-local: reads `information_schema` and the ledger, prints the
+-- reason when the database does not fit, and aborts on a duplicate key in a TEMPORARY table. No
+-- permanent object is touched, so a database this script does not fit keeps its exact state -- which
+-- matters because DDL here cannot be rolled back. Without it a partially upgraded database would get
+-- through several committed statements before failing on error 1091, ending up *less* consistent.
 --
 -- Deliberately not a stored procedure with SIGNAL: MySQL caps `MESSAGE_TEXT` at 128 characters and
--- answers a longer one with "ERROR 1648 Data too long for condition item 'MESSAGE_TEXT'" instead of
--- the diagnosis (MariaDB accepts it, so the difference is easy to miss), and CREATE PROCEDURE is a
--- permanent object that would have to be written *before* the checks have run -- replacing any
--- same-named routine, surviving a refusal, and requiring routine privileges this script otherwise
--- does not need.
+-- answers a longer one with error 1648 instead of the diagnosis (MariaDB accepts it, so the
+-- difference is easy to miss), and CREATE PROCEDURE is a permanent object that would have to be
+-- written before the checks run.
 -- ---------------------------------------------------------------------------------------------
 CREATE TEMPORARY TABLE __vw_rollback_precondition (
     ok INTEGER NOT NULL PRIMARY KEY
@@ -149,12 +143,10 @@ FROM (
 ) AS c
 WHERE c.n <> 1;
 
--- 7) ...and it has to have the shape the role mapping reads. Existence alone is not enough: a
---    hand-written or colliding table without a usable `users_organizations_uuid` column would pass
---    every check above and then fail on the first SELECT against it -- which happens *after* the
---    `ADD COLUMN` below has already committed implicitly, leaving a half-converted database.
---    Require exactly one non-nullable, uniquely indexed CHAR(36) column of that name. Checking the
---    type is part of the authorization boundary: MySQL/MariaDB compare a character UUID with a
+-- 7) ...and it has to have the shape the role mapping reads: exactly one non-nullable, uniquely
+--    indexed CHAR(36) `users_organizations_uuid`. A colliding table would otherwise pass every check
+--    above and fail on the first SELECT, *after* the `ADD COLUMN` below has committed implicitly. The
+--    type is part of the authorization boundary: MySQL/MariaDB compare a character UUID against a
 --    numeric allowlist as numbers, so an INT value such as 0 could match unrelated UUIDs.
 SELECT CONCAT(
     'REFUSED, nothing was changed: __vw_rollback_manager_allowlist must have exactly one column ',
@@ -202,21 +194,15 @@ DROP TEMPORARY TABLE __vw_rollback_precondition;
 
 ALTER TABLE users_organizations ADD COLUMN access_all BOOLEAN NOT NULL DEFAULT FALSE;
 
--- Only a membership on the allowlist comes back as Manager. The legacy Manager role is not a subset
--- of what a Custom member holds -- it manages, and deletes, every collection reachable through
--- `users_collections.manage`, `collections_groups.manage` or `groups.access_all`, and reads member
--- and collection ACL details through `ManagerHeadersLoose`, none of which needs a permission flag in
--- the old schema -- so handing it out on anything less than a current, deliberate decision would
--- *grant* authority during a downgrade. Historical provenance would not be that decision either: a
--- member whose powers an owner has since reduced would get all of them back.
+-- Only a membership on the allowlist comes back as Manager; everything else becomes a plain User and
+-- keeps its per-collection assignments. The legacy role is not a subset of what a Custom member
+-- holds, so handing it out on less than a current, deliberate decision would *grant* authority during
+-- a downgrade -- and historical provenance is not that decision. See README.md.
 --
--- Everything else becomes a plain User and keeps its per-collection assignments.
---
--- `access_all` follows the same mapping the down migrations use: everyone who reached every
--- collection keeps that reach, and a Custom member has to hold all three collection permissions --
--- Edit-only must not silently turn into the legacy "manage all collections" authority, which in that
--- older schema also carried collection deletion. A member mapped to plain User never keeps it:
--- `User + access_all` is the one legacy state the upgrade refuses.
+-- `access_all` follows the mapping the down migrations use: a Custom member has to hold all three
+-- collection permissions, because in the old schema the bit also carried collection deletion. A
+-- member mapped to plain User never keeps it: `User + access_all` is the one state the upgrade
+-- refuses.
 UPDATE users_organizations SET access_all = TRUE WHERE atype IN (0, 1);
 UPDATE users_organizations
 SET access_all = TRUE

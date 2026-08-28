@@ -470,12 +470,10 @@ impl<'r> FromRequest<'r> for DbConn {
 
 /// The single migration this feature adds.
 ///
-/// Everything in this section exists for one reason: two states that a real Vaultwarden database can
-/// be in cannot be converted without a decision that belongs to an owner rather than to a migration.
-/// The migration file refuses both of them itself, as the backstop for a bare migration runner, but
-/// Diesel reports only the driver-level duplicate-key error that refusal produces. The preflight
-/// evaluates the same two predicates before Diesel starts, so the operator gets the question, the
-/// review query and the way out instead.
+/// This section exists because some database states cannot be converted without a decision that
+/// belongs to an owner. The migration file refuses them itself as a backstop, but Diesel surfaces
+/// only the driver-level duplicate-key error that refusal produces; the preflight evaluates the same
+/// predicates first, so the operator gets the question and the way out instead.
 const CUSTOM_ROLE_PERMISSIONS_MIGRATION: &str = "20260630120000";
 
 /// The nine permission columns the migration adds.
@@ -493,9 +491,8 @@ const CUSTOM_ROLE_PERMISSION_COLUMNS: [&str; 9] = [
 
 /// Every column `users_organizations` has once the migration has run, and nothing else.
 ///
-/// Used as a fingerprint rather than as a schema definition: a table that carries exactly these
-/// eighteen names is the table this migration produces. One column more or fewer means the database
-/// is somewhere else entirely, and nothing may be inferred about it.
+/// A fingerprint, not a schema definition: a table carrying exactly these eighteen names is the one
+/// this migration produces. One column more or fewer and nothing may be inferred about it.
 const EXPECTED_MEMBERSHIP_COLUMNS: [&str; 18] = [
     "uuid",
     "user_uuid",
@@ -519,12 +516,10 @@ const EXPECTED_MEMBERSHIP_COLUMNS: [&str; 18] = [
 
 /// The one-line reason the Custom-role preflight refused to start, once it has.
 ///
-/// The refusal is deterministic: it reads schema and ledger state that no retry can change, so
-/// trying again only produces the same answer. `create_db_pool` reads this to stop immediately
-/// instead of treating the refusal as a transient connection problem -- which used to introduce it
-/// with "Can't connect to database, retrying" and repeat the whole multi-kilobyte recovery
-/// procedure once per retry. It also gives the startup path a plain sentence to print: `Error`'s
-/// `Display` renders the JSON API body, and its `Debug` form escapes newlines.
+/// The refusal is deterministic -- it reads schema and ledger state no retry can change -- so
+/// `create_db_pool` stops immediately instead of retrying it as a connection problem and repeating
+/// the whole recovery procedure each time. It also gives the startup path a plain sentence to print:
+/// `Error`'s `Display` renders the JSON API body and its `Debug` escapes newlines.
 static CUSTOM_ROLE_PREFLIGHT_REFUSAL: OnceLock<String> = OnceLock::new();
 
 /// Why startup was stopped by the Custom-role preflight, if it was. `None` means the database was
@@ -536,15 +531,13 @@ pub fn custom_role_preflight_refusal() -> Option<&'static str> {
 /// What to do with a legacy `User + access_all` membership, from `LEGACY_USER_ACCESS_ALL_MIGRATION`.
 ///
 /// The bit is a state official Vaultwarden wrote: until upstream commit `0d16da44` both the invite
-/// and the edit endpoint stored a client-supplied `access_all` regardless of the role requested, so
-/// any database written before that release can carry it. It has no representation in the new model
-/// -- it granted dynamic read/write reach over every collection, present and future, and nothing
-/// else -- so which meaning to keep is a decision about that member's access, not something the
-/// upgrade can infer.
+/// and the edit endpoint stored a client-supplied `access_all` regardless of the role requested. It
+/// has no representation in the new model -- it granted dynamic read/write reach over every
+/// collection, present and future, and nothing else -- so which meaning to keep is a decision about
+/// that member's access, not something the upgrade can infer.
 ///
-/// Refusing is therefore still the default. But making every affected operator hand-write SQL for a
-/// state their own Vaultwarden produced is a poor upgrade path, and the decision is the same for
-/// every affected membership on an instance. These two values let an owner take it once.
+/// Refusing stays the default; the other two let an owner take that decision once for the instance
+/// instead of hand-writing SQL per membership.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum LegacyUserAccessAllPolicy {
     /// Stop and print the recovery procedure.
@@ -585,23 +578,18 @@ const DROP_DOWNGRADE_ACK_SQL: &str = "DROP TABLE IF EXISTS __vw_allow_custom_rol
 /// Whether this backend commits a migration's schema statements one at a time, so an interrupted
 /// upgrade can leave the migration half-applied.
 ///
-/// MySQL and MariaDB do: every `ALTER TABLE` implicitly commits, so a process that dies part-way
-/// through a migration leaves it half-applied. SQLite and PostgreSQL run the whole migration inside
-/// one transaction, so a half-applied schema on those is not something an interrupted upgrade can
-/// produce -- it means something else changed the database, and nothing may be resumed on the
-/// assumption that this migration was the only writer. Each backend module below sets it.
+/// MySQL and MariaDB do: every `ALTER TABLE` implicitly commits. SQLite and PostgreSQL run the whole
+/// migration in one transaction, so a half-applied schema there was not produced by an interruption
+/// and nothing may be resumed on the assumption this migration was the only writer.
 type InterruptibleSchemaChanges = bool;
 
 /// The migration's Manager -> Custom conversion, replayed when an interrupted upgrade is resumed.
 ///
 /// Character for character the `UPDATE` in
-/// `migrations/mysql/2026-06-30-120000_add_custom_role_permissions/up.sql`. It is idempotent for the
-/// same reason it is safe there: it matches only `atype = 3` and leaves none behind, so a second run
-/// selects nothing. That is what lets one recovery path cover *both* MySQL interruption points
-/// without having to tell them apart -- if the interrupted run got as far as the conversion there is
-/// nothing left to convert, and if it did not, this is exactly the conversion it missed.
-///
-/// It reads `access_all`, so it has to run before that column is dropped.
+/// `migrations/mysql/2026-06-30-120000_add_custom_role_permissions/up.sql`. Idempotent for the same
+/// reason it is safe there -- it matches only `atype = 3` and leaves none behind -- which is what
+/// lets one recovery path cover *both* interruption points without telling them apart. It reads
+/// `access_all`, so it must run before that column is dropped.
 #[cfg(mysql)]
 const CUSTOM_ROLE_MANAGER_CONVERSION_SQL: &str = "\
 UPDATE users_organizations \
@@ -631,11 +619,9 @@ WHERE atype = 3";
 #[cfg(mysql)]
 const DROP_ACCESS_ALL_SQL: &str = "ALTER TABLE users_organizations DROP COLUMN access_all";
 
-/// Everything an interrupted upgrade still owes, in the order it has to run: convert the legacy
-/// Managers, drop the legacy column, then drop any downgrade acknowledgement -- exactly what the
-/// migration file does from its `UPDATE` onwards. The caller records the ledger entry afterwards.
-///
-/// MySQL is the only backend an interrupted upgrade can be resumed on, so these are gated with it.
+/// What an interrupted upgrade still owes, in order -- exactly what the migration file does from its
+/// `UPDATE` onwards. The caller records the ledger entry afterwards. Gated on MySQL, the only backend
+/// a resume is reachable on.
 #[cfg(mysql)]
 const CUSTOM_ROLE_RESUME_STATEMENTS: [&str; 3] =
     [CUSTOM_ROLE_MANAGER_CONVERSION_SQL, DROP_ACCESS_ALL_SQL, DROP_DOWNGRADE_ACK_SQL];
@@ -663,10 +649,9 @@ WHERE EXISTS ( \
 
 /// Write the reach out as explicit assignments.
 ///
-/// Confirmed memberships only. A `users_collections` row is not bound to the membership status the
-/// way `access_all` was, so materialising the reach of an invited, accepted or revoked membership
-/// would hand it durable assignments it does not have today and would keep them across a later
-/// restore. Those memberships only lose the bit.
+/// Confirmed memberships only: a `users_collections` row is not bound to the membership status the
+/// way `access_all` was, so materialising an invited, accepted or revoked membership would hand it
+/// durable assignments it does not have today. Those only lose the bit.
 const LEGACY_USER_ACCESS_ALL_MATERIALIZE_SQL: &str = "\
 INSERT INTO users_collections (user_uuid, collection_uuid, read_only, hide_passwords, manage) \
 SELECT uo.user_uuid, c.uuid, FALSE, FALSE, FALSE \
@@ -806,15 +791,12 @@ struct CustomRoleMigrationFacts {
 /// Whether the facts prove that the Custom-role migration ran to completion and only its ledger
 /// entry is missing.
 ///
-/// Deliberately a conjunction of everything that must be true rather than "the legacy column is
-/// gone". Dropping `access_all` is the migration's *last* schema statement, so its absence alone is
-/// also what a hand-edited or half-rolled-back database looks like; recording the migration there
-/// would start the server against a schema the code does not match. Each condition rules out a
-/// different way of arriving here with the column already gone:
+/// A conjunction rather than "the legacy column is gone": dropping `access_all` is the migration's
+/// *last* schema statement, so its absence alone is also what a hand-edited or half-rolled-back
+/// database looks like, and recording the migration there would start the server against a schema
+/// the code does not match. Each condition rules out one way of arriving here with the column gone:
 ///
-/// * the two earlier MySQL/MariaDB interruption points still have `access_all`, so they never reach
-///   this function at all and keep failing closed;
-/// * a database where the column was dropped by hand fails the permission-column checks;
+/// * a column dropped by hand fails the permission-column checks;
 /// * a partially applied later schema change fails the exact-column-count check;
 /// * a half-finished conversion still has `atype = 3` rows;
 /// * a tampered ledger fails the newer-migration check.
@@ -856,16 +838,13 @@ enum CustomRolePreflightDecision {
 /// Whether the facts prove the migration was interrupted after it added its columns, leaving a
 /// schema that can be finished rather than restored from a backup.
 ///
-/// Deliberately an exact fingerprint of the one state an interrupted run produces, not "some of the
-/// columns are there": the table must carry precisely the finished set plus the legacy column that
-/// still has to go, all nine permission columns must exist and be `NOT NULL`, and the ledger must
-/// exist and record nothing newer. Any other shape means something changed this table that was not
-/// this migration, and resuming would run the conversion against a schema this build does not know.
+/// An exact fingerprint of the one state an interrupted run produces, not "some of the columns are
+/// there": any other shape means something other than this migration changed the table, and resuming
+/// would run the conversion against a schema this build does not know.
 ///
-/// `legacy_manager_rows` is deliberately *not* constrained. It is non-zero at the earlier
-/// interruption point and zero at the later one, and the conversion statement is idempotent, so one
-/// resume covers both without having to distinguish them. `legacy_user_access_all_count` must be
-/// zero, which the caller establishes by resolving that question first.
+/// `legacy_manager_rows` is deliberately *not* constrained — it is non-zero at the earlier
+/// interruption point and zero at the later one, and the conversion is idempotent, so one resume
+/// covers both. `legacy_user_access_all_count` must be zero, which the caller establishes first.
 fn custom_role_migration_is_resumable(facts: CustomRoleMigrationFacts) -> bool {
     let counted = |count: i64, expected: usize| usize::try_from(count).is_ok_and(|found| found == expected);
 
@@ -884,9 +863,8 @@ fn custom_role_migration_is_resumable(facts: CustomRoleMigrationFacts) -> bool {
 
 /// The decision to act on once any legacy `User + access_all` rows have been resolved.
 ///
-/// Resolving them changes one fact, so the answer has to be recomputed: a database that is *both* a
-/// half-applied upgrade and carries such a row must still be resumed after the row is dealt with,
-/// rather than handed to Diesel — which would re-run `ALTER TABLE ... ADD COLUMN` and fail.
+/// Resolving them changes one fact, so the answer is recomputed: a database that is *both*
+/// half-applied and carries such a row must still be resumed, not handed to Diesel.
 fn custom_role_decision_after_legacy_resolution(
     facts: CustomRoleMigrationFacts,
     legacy_user_access_all: LegacyUserAccessAllPolicy,
@@ -927,17 +905,11 @@ fn custom_role_preflight_decision(
         return CustomRolePreflightDecision::RefuseMissingAccessAll;
     }
 
-    // A plain User carrying membership `access_all` has no representation in the new model: the bit
-    // gave unlimited *reach* over every collection, present and future, without any management
-    // authority, and the role that replaces it cannot express that. Converting the reach into direct
-    // per-collection assignments would silently turn a dynamic guarantee into a point-in-time
-    // snapshot, and -- because a `users_collections` row is not bound to the membership status the
-    // way `access_all` was -- would hand a revoked or never-confirmed member durable assignments that
-    // outlive this schema. Refuse and let an owner decide.
-    //
-    // Unless they already have: the state is one official Vaultwarden wrote (see
-    // `LegacyUserAccessAllPolicy`), and an owner can take the same decision once for the whole
-    // instance instead of writing SQL per membership.
+    // A plain User carrying membership `access_all` has no representation in the new model: unlimited
+    // reach over every collection, present and future, with no management authority. Materialising it as
+    // direct assignments turns a dynamic guarantee into a snapshot and -- since a `users_collections` row
+    // is not bound to the membership status -- would hand a revoked or never-confirmed member durable
+    // assignments. Refuse, unless the owner has already decided once (`LegacyUserAccessAllPolicy`).
     if facts.legacy_user_access_all_count != 0 {
         return match legacy_user_access_all {
             LegacyUserAccessAllPolicy::Refuse => CustomRolePreflightDecision::RefuseLegacyUserAccessAll,
@@ -946,12 +918,10 @@ fn custom_role_preflight_decision(
         };
     }
 
-    // Nothing is left to resolve, and the legacy column is still there. If the migration's own
-    // columns are *also* already there, a previous run got part-way through and stopped: on MySQL and
-    // MariaDB every `ALTER TABLE` commits on its own, so a process killed between the migration's
-    // first `ALTER TABLE ... ADD COLUMN` and its final `DROP COLUMN` leaves exactly that. Handing the
-    // file back to Diesel would re-run the `ADD COLUMN` and abort with nothing but a driver-level
-    // duplicate-column error, which is what this branch exists to replace.
+    // Nothing left to resolve and the legacy column still there. If the migration's own columns are
+    // *also* present, a previous run stopped part-way: on MySQL/MariaDB each `ALTER TABLE` commits on
+    // its own. Handing the file back to Diesel would re-run the `ADD COLUMN` and abort with a bare
+    // duplicate-column error, which is what this branch replaces.
     if facts.permission_columns_present != 0 {
         if interruptible_schema_changes && custom_role_migration_is_resumable(facts) {
             return CustomRolePreflightDecision::ResumeInterruptedMigration;
@@ -959,11 +929,9 @@ fn custom_role_preflight_decision(
         return CustomRolePreflightDecision::RefuseAmbiguousPartialMigration;
     }
 
-    // A legacy Manager whose organization-wide collection management comes from an organization-local
-    // `access_all` group is deliberately *not* a question. That is a valid, ordinary current-main
-    // state, and the migration maps the capability the owner configured into `edit_any_collection` /
-    // `delete_any_collection`. Refusing it would block a normal upgrade; see the migration file for
-    // why membership-bound permissions are the accepted trade-off.
+    // A legacy Manager whose organization-wide management comes from an org-local `access_all` group is
+    // deliberately not a question: an ordinary state that the migration maps onto `edit_any_collection` /
+    // `delete_any_collection`. Refusing it would block a normal upgrade; see the migration file.
     CustomRolePreflightDecision::Proceed
 }
 
@@ -1013,12 +981,10 @@ fn sql_name_list(names: &[&str]) -> String {
 
 /// Report a refusal and produce the error that stops startup.
 ///
-/// The report is printed here, through `Display`, and only here. The startup path logs a failed
-/// pool with `{e:?}`, and `Error`'s `Debug` formatting escapes the newlines -- so the SQL an
-/// operator is meant to read and copy used to arrive as one unbroken line of `\n` sequences. Pool
-/// creation is also retried, so the whole multi-kilobyte block was emitted once per attempt, each
-/// time introduced by "Can't connect to database", which is not what happened. Log it once,
-/// readable; flag the refusal so the retry loop stops; and let a one-line error travel back.
+/// Printed here through `Display`, and only here: the startup path logs a failed pool with `{e:?}`,
+/// whose `Debug` formatting escapes the newlines the recovery SQL depends on, and pool creation is
+/// retried. Log it once readably, flag the refusal so the retry loop stops, and let a one-line error
+/// travel back.
 fn custom_role_preflight_error(decision: CustomRolePreflightDecision, facts: CustomRoleMigrationFacts) -> Error {
     error!("{}", custom_role_preflight_report(decision, facts));
 
@@ -1147,8 +1113,8 @@ mod sqlite_migrations {
     /// Read-only, with exactly one exception: the idempotent ledger insert that records a migration
     /// which provably already ran (see `custom_role_migration_is_complete`).
     ///
-    /// `pragma_table_xinfo` rather than `table_info`: the latter omits generated columns entirely,
-    /// so one would pass the exact-column-count fingerprint unseen.
+    /// `pragma_table_xinfo` rather than `table_info`: the latter omits generated columns, so one would
+    /// pass the exact-column-count fingerprint unseen.
     fn preflight(connection: &mut diesel::sqlite::SqliteConnection) -> Result<(), super::Error> {
         let memberships_table_exists = table_exists(connection, "users_organizations")?;
         if !memberships_table_exists {
@@ -1340,11 +1306,9 @@ mod mysql_migrations {
         .map(|value| value != 0)
     }
 
-    /// Read-only, with exactly one exception: the idempotent ledger insert that records a migration
-    /// which provably already ran (see `custom_role_migration_is_complete`). This is the backend
-    /// that produces that state in the first place -- MySQL and MariaDB commit every ALTER TABLE on
-    /// their own, so a process killed after the migration's final `DROP COLUMN access_all` and
-    /// before Diesel's ledger insert leaves a fully converted database that still looks pending.
+    /// Read-only apart from the idempotent ledger insert and the resume below. This is the backend that
+    /// produces both states: MySQL and MariaDB commit every ALTER TABLE on their own, so a process killed
+    /// part-way through leaves a database that looks pending but is not.
     fn preflight(connection: &mut diesel::mysql::MysqlConnection) -> Result<(), super::Error> {
         let memberships_table_exists = table_exists(connection, "users_organizations")?;
         if !memberships_table_exists {
@@ -1491,11 +1455,10 @@ mod mysql_migrations {
 
     /// Finish a migration that stopped between its first `ALTER TABLE` and its last.
     ///
-    /// Only reached once `custom_role_migration_is_resumable` has confirmed the schema is exactly
-    /// what an interrupted run leaves behind, so the statements below are the ones that run has not
-    /// executed yet -- or, for the conversion, the one it may already have executed, which matches
-    /// nothing the second time. Diesel then finds the migration recorded and never opens the file, so
-    /// the `ADD COLUMN` that would otherwise abort startup is never reached.
+    /// Only reached once `custom_role_migration_is_resumable` has confirmed the schema, so these are the
+    /// statements that run has not executed -- or, for the conversion, one it may already have executed,
+    /// which matches nothing the second time. Diesel then finds the migration recorded and never opens
+    /// the file, so the `ADD COLUMN` that would abort startup is never reached.
     fn resume_migration(connection: &mut diesel::mysql::MysqlConnection) -> Result<(), super::Error> {
         let mut converted = 0;
         for statement in super::CUSTOM_ROLE_RESUME_STATEMENTS {
@@ -1552,15 +1515,12 @@ mod postgresql_migrations {
     /// Resolved through `to_regclass`, i.e. exactly the way an unqualified name in a migration is
     /// resolved -- and deliberately *not* through `table_schema = current_schema()`.
     ///
-    /// `current_schema()` is the first *existing* schema on the `search_path`, which is where new
-    /// objects are created. It is not necessarily the schema an existing table is found in: with
-    /// `search_path = decoy, real` and the tables in `real`, `current_schema()` answers `decoy`, the
-    /// lookup finds nothing, and `preflight` returns early on `!memberships_table_exists` -- silently
-    /// skipping both checks while Diesel then runs the migration against `real`. `to_regclass` walks
-    /// the same path the migration does, so the preflight and the statements it is guarding can no
-    /// longer disagree about which table they mean. (The migration itself resolves the
-    /// acknowledgement the same way, and `tools/custom_role_rollback/postgresql.sql` binds the
-    /// namespace once for the same reason.)
+    /// `current_schema()` is where new objects are created, not necessarily where an existing table is
+    /// found: with `search_path = decoy, real` and the tables in `real` it answers `decoy`, the lookup
+    /// finds nothing, `preflight` returns early on `!memberships_table_exists`, and Diesel then runs the
+    /// migration against `real` with both checks silently skipped. `to_regclass` walks the same path the
+    /// migration does, so the two cannot disagree about which table they mean. (The migration and
+    /// `tools/custom_role_rollback/postgresql.sql` resolve it the same way.)
     fn table_exists(connection: &mut diesel::pg::PgConnection, table: &str) -> Result<bool, diesel::result::Error> {
         count(connection, format!("SELECT COUNT(*) AS count FROM pg_class WHERE oid = to_regclass('{table}')"))
             .map(|value| value != 0)
@@ -1728,10 +1688,9 @@ mod postgresql_migrations {
 
 /// Executes the real migration file against a throwaway SQLite database.
 ///
-/// Everything else in this file tests the *decision* the preflight makes; nothing else tests the SQL
-/// that decision is protecting. The rules the migration encodes -- legacy authority is materialized
-/// from what a membership held at that moment, and only from its own organization -- are invisible to
-/// a Rust test unless the statements actually run.
+/// Everything else here tests the *decision* the preflight makes; this tests the SQL it protects.
+/// The rules the migration encodes -- authority materialized from what a membership held then, and
+/// only from its own organization -- are invisible to a Rust test unless the statements run.
 #[cfg(all(test, sqlite))]
 mod custom_role_migration_sql_tests {
     use diesel::connection::SimpleConnection;
@@ -1786,10 +1745,9 @@ mod custom_role_migration_sql_tests {
 
     /// One membership per legacy shape the conversion treats differently, in two organizations.
     ///
-    /// `m_mgr_foreign` is the tenancy probe: a *first* organization's Manager carrying a
-    /// `groups_users` row that points at the *second* organization's `accessAll` group. Nothing in
-    /// the HTTP API creates that row, which is exactly why the organization predicate in the
-    /// migration has to be tested rather than assumed.
+    /// `m_mgr_foreign` is the tenancy probe: an org-1 Manager carrying a `groups_users` row pointing at
+    /// org 2's `accessAll` group. No HTTP path creates that row, which is why the migration's
+    /// organization predicate has to be tested rather than assumed.
     const LEGACY_MEMBERSHIPS: &str = "
         INSERT INTO groups (uuid, organizations_uuid, access_all) VALUES
             ('g_all',    'org1', TRUE),
@@ -1820,12 +1778,10 @@ mod custom_role_migration_sql_tests {
 
     /// The one state the upgrade refuses by default: a plain User still carrying `access_all`.
     ///
-    /// `u20` is confirmed and already assigned to two of its organization's three collections, one
-    /// read-only, one carrying an explicit `manage` grant -- `access_all` overrode `read_only` and
-    /// `hide_passwords` but never conferred `manage`, so a faithful materialisation has to relax the
-    /// first two and leave the third alone. The row on `c3` belongs to a *different* organization
-    /// and no membership backs it: nothing may touch it. `u21` and `u22` are revoked and invited,
-    /// which is why they must come out with no assignments at all.
+    /// `access_all` overrode `read_only` and `hide_passwords` but never conferred `manage`, so `u20`'s
+    /// two existing assignments must be relaxed and its `manage` grant left alone. The row on `c3` is a
+    /// different organization's and unbacked by any membership: nothing may touch it. `u21` and `u22` are
+    /// revoked and invited, so they must come out with no assignments at all.
     const LEGACY_USER_ACCESS_ALL: &str = "
         INSERT INTO collections (uuid, org_uuid) VALUES
             ('c1', 'org1'), ('c2', 'org1'), ('c4', 'org1'), ('c3', 'org2');
@@ -1890,15 +1846,10 @@ mod custom_role_migration_sql_tests {
         )
     }
 
-    /// Audit M-2: resuming an interrupted MySQL upgrade replays the migration's own conversion, so
-    /// it has to land on exactly what the migration produces -- and produce it again unchanged if the
-    /// interrupted run had already got that far. That idempotence is what lets one recovery path
-    /// cover both interruption points without having to tell them apart.
-    ///
-    /// Executed here on SQLite because that is the backend with an in-process harness; only the
-    /// statement is under test, not the backend it is replayed on. Its `DROP COLUMN` companion is
-    /// deliberately left out: SQLite before 3.35 cannot run it, which is why the migration itself
-    /// rebuilds the table instead.
+    /// Resuming replays the migration's own conversion, so it has to land on exactly what the migration
+    /// produces and stay there when replayed -- that idempotence is what covers both interruption points.
+    /// Run on SQLite because that is the backend with an in-process harness; the `DROP COLUMN` companion
+    /// is left out because SQLite before 3.35 cannot run it.
     #[cfg(mysql)]
     #[test]
     fn the_resume_conversion_matches_the_migration_and_is_idempotent() {
@@ -2290,9 +2241,8 @@ mod custom_role_migration_sql_tests {
 /// Runs the real migration, then `tools/custom_role_rollback/sqlite.sql`, then the migration again --
 /// against a throwaway SQLite database, with the real files on both legs.
 ///
-/// The round trip is the claim the rollback tooling rests on: an operator who downgrades and later
-/// upgrades again has to arrive at the same permissions, or the escape hatch quietly rewrites
-/// authorization.
+/// The claim the rollback tooling rests on: downgrade then upgrade again has to arrive at the same
+/// permissions, or the escape hatch quietly rewrites authorization.
 #[cfg(all(test, sqlite))]
 mod custom_role_rollback_sql_tests {
     use diesel::connection::SimpleConnection;

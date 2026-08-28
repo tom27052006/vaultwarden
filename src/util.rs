@@ -760,10 +760,9 @@ where
 /// Retry `func` while the database is unavailable.
 ///
 /// `should_retry` classifies a failure. Waiting only helps for a database that is not reachable
-/// *yet*; a failure that is already decided -- a migration preflight that refuses this schema, say
-/// -- returns the same answer every time, and retrying it just repeats its output under a
-/// "Can't connect to database" heading that misdescribes the problem. Returning `false` there stops
-/// immediately and leaves the reporting to the caller.
+/// *yet*; an already-decided failure -- a migration preflight refusing this schema -- returns the
+/// same answer every time, so retrying repeats its output under a misleading "Can't connect to
+/// database" heading. Returning `false` stops immediately and leaves reporting to the caller.
 pub async fn retry_db<F, T, E, R>(mut func: F, max_tries: u32, should_retry: R) -> Result<T, E>
 where
     F: FnMut() -> Result<T, E>,
