@@ -25,7 +25,8 @@ use crate::{
         ACTIVE_DB_TYPE, DbConn, DbConnType, backup_sqlite, get_sql_server_version,
         models::{
             Attachment, Cipher, Collection, Device, Event, EventType, Group, Invitation, Membership, MembershipId,
-            MembershipType, OrgPolicy, Organization, OrganizationId, SsoUser, TwoFactor, User, UserId,
+            MembershipType, OrgPolicy, Organization, OrganizationId, OrganizationScimKey, SsoUser, TwoFactor, User,
+            UserId,
         },
     },
     error::{Error, MapResult},
@@ -67,6 +68,8 @@ pub fn routes() -> Vec<Route> {
         users_overview,
         organizations_overview,
         delete_organization,
+        rotate_scim_token,
+        delete_scim_token,
         diagnostics,
         get_diagnostics_config,
         resend_user_invite,
@@ -602,10 +605,33 @@ async fn organizations_overview(_token: AdminToken, conn: DbConn) -> ApiResult<H
         org["event_count"] = json!(Event::count_by_org(&o.uuid, &conn).await);
         org["attachment_count"] = json!(Attachment::count_by_org(&o.uuid, &conn).await);
         org["attachment_size"] = json!(get_display_size(Attachment::size_by_org(&o.uuid, &conn).await));
+
+        // SCIM state. Only ever the metadata: the token secret is not stored in a recoverable
+        // form and is shown exactly once, in the response to the call that generated it.
+        org["scim_endpoint"] = json!(scim_endpoint(&o.uuid));
+        org["scim_configured"] = match OrganizationScimKey::find_by_org(&o.uuid, &conn).await {
+            Some(key) => {
+                org["scim_created_at"] = json!(format_naive_datetime_local(&key.created_at, DT_FMT));
+                org["scim_last_used_at"] = match key.last_used_at {
+                    Some(dt) => json!(format_naive_datetime_local(&dt, DT_FMT)),
+                    None => json!("Never"),
+                };
+                json!(true)
+            }
+            None => json!(false),
+        };
+
         organizations_json.push(org);
     }
 
-    let text = AdminTemplateData::new("admin/organizations", json!(organizations_json)).render()?;
+    let page_data = json!({
+        "organizations": organizations_json,
+        "scim_enabled": CONFIG.scim_enabled(),
+        "org_groups_enabled": CONFIG.org_groups_enabled(),
+        "org_events_enabled": CONFIG.org_events_enabled(),
+    });
+
+    let text = AdminTemplateData::new("admin/organizations", page_data).render()?;
     Ok(Html(text))
 }
 
@@ -613,6 +639,90 @@ async fn organizations_overview(_token: AdminToken, conn: DbConn) -> ApiResult<H
 async fn delete_organization(org_id: OrganizationId, _token: AdminToken, conn: DbConn) -> EmptyResult {
     let org = Organization::find_by_uuid(&org_id, &conn).await.map_res("Organization doesn't exist")?;
     org.delete(&conn).await
+}
+
+fn scim_endpoint(org_id: &OrganizationId) -> String {
+    format!("{}{}/{org_id}", CONFIG.domain(), crate::api::scim::SCIM_BASE_PATH)
+}
+
+/// Ensure SCIM is switched on before any token management is possible.
+///
+/// Token creation is unavailable while `SCIM_ENABLED` is false, so an operator cannot end up with
+/// a live credential for endpoints that are not serving.
+fn ensure_scim_enabled() -> EmptyResult {
+    if !CONFIG.scim_enabled() {
+        err_code!("SCIM is disabled. Set SCIM_ENABLED to manage SCIM tokens.", Status::BadRequest.code);
+    }
+    Ok(())
+}
+
+/// Create or rotate an organization's SCIM token.
+///
+/// The plaintext token is returned here and nowhere else: only its SHA-256 hash is stored, and
+/// rotating replaces the row so the previous token stops working immediately.
+#[post("/organizations/<org_id>/scim/token", format = "application/json")]
+async fn rotate_scim_token(org_id: OrganizationId, token: AdminToken, conn: DbConn) -> JsonResult {
+    ensure_scim_enabled()?;
+
+    let org = Organization::find_by_uuid(&org_id, &conn).await.map_res("Organization doesn't exist")?;
+    let rotated = OrganizationScimKey::find_by_org(&org.uuid, &conn).await.is_some();
+
+    let scim_token = OrganizationScimKey::rotate_for_org(&org.uuid, &conn).await?;
+
+    // Vaultwarden's EventType values mirror Bitwarden's, so rather than invent a numeric type that
+    // could collide with a future upstream one, the token lifecycle is recorded as an
+    // organization update and spelled out in the server log.
+    info!(
+        "SCIM token {} for organization {}",
+        if rotated {
+            "rotated"
+        } else {
+            "created"
+        },
+        org.uuid
+    );
+    log_event(
+        EventType::OrganizationUpdated,
+        &org.uuid,
+        &org.uuid,
+        &ACTING_ADMIN_USER.into(),
+        14, // Use UnknownBrowser type
+        &token.ip.ip,
+        &conn,
+    )
+    .await;
+
+    Ok(Json(json!({
+        "token": scim_token,
+        "endpoint": scim_endpoint(&org.uuid),
+        "rotated": rotated,
+    })))
+}
+
+/// Revoke an organization's SCIM token. The credential stops working immediately.
+#[delete("/organizations/<org_id>/scim/token", format = "application/json")]
+async fn delete_scim_token(org_id: OrganizationId, token: AdminToken, conn: DbConn) -> EmptyResult {
+    let org = Organization::find_by_uuid(&org_id, &conn).await.map_res("Organization doesn't exist")?;
+
+    if OrganizationScimKey::find_by_org(&org.uuid, &conn).await.is_none() {
+        err_code!("This organization has no SCIM token", Status::NotFound.code);
+    }
+
+    OrganizationScimKey::delete_all_by_organization(&org.uuid, &conn).await?;
+
+    info!("SCIM token revoked for organization {}", org.uuid);
+    log_event(
+        EventType::OrganizationUpdated,
+        &org.uuid,
+        &org.uuid,
+        &ACTING_ADMIN_USER.into(),
+        14, // Use UnknownBrowser type
+        &token.ip.ip,
+        &conn,
+    )
+    .await;
+
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -900,6 +1010,73 @@ impl<'r> FromRequest<'r> for AdminToken {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Render the organizations page the way `organizations_overview` does.
+    ///
+    /// The SCIM controls live in a Handlebars template, so a wrong path or an unbalanced block
+    /// would otherwise only show up when an administrator opened the page.
+    fn render_organizations(scim_enabled: bool, scim_configured: bool) -> String {
+        let page_data = json!({
+            "organizations": [{
+                "id": "8f9e7d6c-5b4a-4392-8281-706f5e4d3c2b",
+                "name": "Acme",
+                "billingEmail": "billing@example.test",
+                "user_count": 3,
+                "cipher_count": 0,
+                "collection_count": 1,
+                "group_count": 2,
+                "event_count": 0,
+                "attachment_count": 0,
+                "attachment_size": "0 bytes",
+                "scim_endpoint": "https://vault.example.test/scim/v2/8f9e7d6c-5b4a-4392-8281-706f5e4d3c2b",
+                "scim_configured": scim_configured,
+                "scim_created_at": "2026-08-30 12:00:00 UTC",
+                "scim_last_used_at": "Never",
+            }],
+            "scim_enabled": scim_enabled,
+            "org_groups_enabled": true,
+            "org_events_enabled": true,
+        });
+
+        AdminTemplateData::new("admin/organizations", page_data).render().expect("template should render")
+    }
+
+    #[test]
+    fn organizations_page_hides_scim_controls_when_disabled() {
+        let html = render_organizations(false, false);
+
+        assert!(html.contains("SCIM provisioning is disabled"));
+        assert!(html.contains("Disabled server-wide"));
+        assert!(!html.contains("vw-scim-rotate"), "no token controls while SCIM is off");
+    }
+
+    #[test]
+    fn organizations_page_offers_token_generation_when_enabled() {
+        let html = render_organizations(true, false);
+
+        assert!(html.contains("vw-scim-rotate"));
+        assert!(html.contains("Generate token"));
+        assert!(!html.contains("vw-scim-revoke"), "nothing to revoke yet");
+    }
+
+    #[test]
+    fn organizations_page_shows_rotate_and_revoke_once_configured() {
+        let html = render_organizations(true, true);
+
+        assert!(html.contains("Rotate token"));
+        assert!(html.contains("vw-scim-revoke"));
+        assert!(html.contains("vw-scim-endpoint"));
+        assert!(html.contains("Token active"));
+        assert!(html.contains("/scim/v2/8f9e7d6c-5b4a-4392-8281-706f5e4d3c2b"));
+    }
+
+    #[test]
+    fn organizations_page_never_renders_a_token_value() {
+        // The plaintext token reaches the browser only in the JSON response to the rotate call.
+        for html in [render_organizations(true, true), render_organizations(true, false)] {
+            assert!(!html.contains("scim_v1."), "a token must never be baked into the page");
+        }
+    }
 
     #[test]
     fn validate_web_vault_compare() {

@@ -657,6 +657,10 @@ make_config! {
 
         /// Events days retain |> Number of days to retain events stored in the database. If unset, events are kept indefinitely.
         events_days_retain:     i64,    false,   option;
+
+        /// Enable SCIM provisioning |> Enables the SCIM v2 provisioning endpoints at /scim/v2/<organization_id>.
+        /// Tokens are generated per organization from the admin panel. Disabled by default.
+        scim_enabled:           bool,   false,  def,    false;
     },
 
     client {
@@ -783,6 +787,11 @@ make_config! {
         unauthenticated_ratelimit_seconds:   u64, false, def, 60;
         /// Max burst size for unauthenticated requests |> Allow a burst of requests of up to this size, while maintaining the average indicated by `unauthenticated_ratelimit_seconds`. This is shared between several endpoints, so it needs to be more lenient than the login one
         unauthenticated_ratelimit_max_burst: u32, false, def, 50;
+
+        /// Seconds between SCIM requests |> Number of seconds, on average, between SCIM requests from the same IP address before rate limiting kicks in
+        scim_ratelimit_seconds:        u64, false, def, 60;
+        /// Max burst size for SCIM requests |> Allow a burst of requests of up to this size, while maintaining the average indicated by `scim_ratelimit_seconds`. Identity providers sync in bursts, so this needs to be more lenient than the login one
+        scim_ratelimit_max_burst:      u32, false, def, 100;
 
         /// Seconds between admin login requests |> Number of seconds, on average, between admin requests from the same IP address before rate limiting kicks in
         admin_ratelimit_seconds:       u64, false, def, 300;
@@ -974,6 +983,16 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
 
     if cfg.password_iterations < 100_000 {
         err!("PASSWORD_ITERATIONS should be at least 100000 or higher. The default is 600000!");
+    }
+
+    // SCIM makes unattended membership changes on behalf of an identity provider. Without the
+    // organization event log there is no record of what it did. Warn, but do not enable anything
+    // the operator did not ask for.
+    if cfg.scim_enabled && !cfg.org_events_enabled {
+        println!(
+            "[WARNING] `SCIM_ENABLED` is set but `ORG_EVENTS_ENABLED` is not.\n\
+             [WARNING] SCIM provisioning changes will not be recorded in the organization event log."
+        );
     }
 
     let limit = 256;

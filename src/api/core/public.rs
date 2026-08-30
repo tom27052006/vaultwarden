@@ -9,16 +9,15 @@ use rocket::{
 
 use crate::{
     CONFIG,
-    api::EmptyResult,
+    api::{
+        EmptyResult,
+        core::organizations::{provision_org_member, try_restore_member, try_revoke_member},
+    },
     auth,
     db::{
         DbConn,
-        models::{
-            Group, GroupUser, Invitation, Membership, MembershipStatus, MembershipType, OrgPolicy, Organization,
-            OrganizationApiKey, OrganizationId, User,
-        },
+        models::{Group, GroupUser, Membership, MembershipStatus, MembershipType, OrganizationApiKey, OrganizationId},
     },
-    mail,
 };
 
 pub fn routes() -> Vec<Route> {
@@ -59,22 +58,16 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
     let data = data.into_inner();
 
     for user_data in &data.members {
-        let mut user_created: bool = false;
         if user_data.deleted {
             // If user is marked for deletion and it exists, revoke it
             if let Some(mut member) = Membership::find_by_email_and_org(&user_data.email, &org_id, &conn).await {
                 // Only revoke a user if it is not the last confirmed owner
-                let revoked = if member.atype == MembershipType::Owner
-                    && member.status == MembershipStatus::Confirmed as i32
-                {
-                    if Membership::count_confirmed_by_org_and_type(&org_id, MembershipType::Owner, &conn).await <= 1 {
-                        warn!("Can't revoke the last owner");
+                let revoked = match try_revoke_member(&mut member, &conn).await {
+                    Ok(revoked) => revoked,
+                    Err(e) => {
+                        warn!("{e:?}");
                         false
-                    } else {
-                        member.revoke()
                     }
-                } else {
-                    member.revoke()
                 };
 
                 let ext_modified = member.set_external_id(Some(user_data.external_id.clone()));
@@ -84,66 +77,26 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
             }
         // If user is part of the organization, restore it
         } else if let Some(mut member) = Membership::find_by_email_and_org(&user_data.email, &org_id, &conn).await {
-            let mut restored = member.restore();
-            let ext_modified = member.set_external_id(Some(user_data.external_id.clone()));
             // Enforce org policies as every other restore path does.
-            // If the user is not allowed, we revoke again and continue so the external_id is still updated.
-            if restored && let Err(e) = OrgPolicy::check_user_allowed(&member, "restore", &conn).await {
-                warn!("Not restoring {}: {e:?}", user_data.email);
-                member.revoke();
-                restored = false;
-            }
+            // If the user is not allowed, try_restore_member revokes again and we continue so the
+            // external_id is still updated.
+            let restored = match try_restore_member(&mut member, &conn).await {
+                Ok(restored) => restored,
+                Err(e) => {
+                    warn!("Not restoring {}: {e:?}", user_data.email);
+                    false
+                }
+            };
+
+            let ext_modified = member.set_external_id(Some(user_data.external_id.clone()));
             if restored || ext_modified {
                 member.save(&conn).await?;
             }
         } else {
-            // If user is not part of the organization
-            let user = if let Some(user) = User::find_by_mail(&user_data.email, &conn).await {
-                user
-            } else {
-                // User does not exist yet
-                let mut new_user = User::new(&user_data.email, None);
-                new_user.save(&conn).await?;
-
-                if !CONFIG.mail_enabled() {
-                    Invitation::new(&new_user.email).save(&conn).await?;
-                }
-                user_created = true;
-                new_user
-            };
-            let member_status = if CONFIG.mail_enabled() || user.password_hash.is_empty() {
-                MembershipStatus::Invited as i32
-            } else {
-                MembershipStatus::Accepted as i32 // Automatically mark user as accepted if no email invites
-            };
-
-            let (org_name, org_email) = if let Some(org) = Organization::find_by_uuid(&org_id, &conn).await {
-                (org.name, org.billing_email)
-            } else {
-                err!("Error looking up organization")
-            };
-
-            let mut new_member = Membership::new(user.uuid.clone(), org_id.clone(), Some(org_email.clone()));
-            new_member.set_external_id(Some(user_data.external_id.clone()));
-            new_member.access_all = false;
-            new_member.atype = MembershipType::User as i32;
-            new_member.status = member_status;
-
-            new_member.save(&conn).await?;
-
-            if CONFIG.mail_enabled()
-                && let Err(e) =
-                    mail::send_invite(&user, org_id.clone(), new_member.uuid.clone(), &org_name, Some(org_email)).await
-            {
-                // Upon error delete the user, invite and org member records when needed
-                if user_created {
-                    user.delete(&conn).await?;
-                } else {
-                    new_member.delete(&conn).await?;
-                }
-
-                err!(format!("Error sending invite: {e:?} "));
-            }
+            // If user is not part of the organization, create the account and membership
+            // The Directory Connector import carries no display name, so accounts it creates keep
+            // getting their email as their name, exactly as before.
+            provision_org_member(&org_id, &user_data.email, None, Some(user_data.external_id.clone()), &conn).await?;
         }
     }
 

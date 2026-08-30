@@ -25,7 +25,7 @@ use macros::UuidFromParam;
 
 use super::{
     Cipher, CipherId, Collection, CollectionGroup, CollectionId, CollectionUser, Group, GroupId, GroupUser, OrgPolicy,
-    OrgPolicyType, TwoFactor, User, UserId,
+    OrgPolicyType, OrganizationScimKey, TwoFactor, User, UserId,
 };
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
@@ -390,6 +390,7 @@ impl Organization {
         OrgPolicy::delete_all_by_organization(&self.uuid, conn).await?;
         Group::delete_all_by_organization(&self.uuid, conn).await?;
         OrganizationApiKey::delete_all_by_organization(&self.uuid, conn).await?;
+        OrganizationScimKey::delete_all_by_organization(&self.uuid, conn).await?;
 
         conn.run(move |conn| {
             diesel::delete(organizations::table.filter(organizations::uuid.eq(self.uuid)))
@@ -1165,6 +1166,44 @@ impl Membership {
             users_organizations::table
                 .filter(users_organizations::external_id.eq(ext_id).and(users_organizations::org_uuid.eq(org_uuid)))
                 .first::<Self>(conn)
+                .ok()
+        })
+        .await
+    }
+
+    /// Load every membership of an organization together with its user account.
+    ///
+    /// SCIM needs the account (for the email that backs `userName`) for every membership it
+    /// renders; fetching them in one join avoids an N+1 query per listed resource.
+    pub async fn find_by_org_with_user(org_uuid: &OrganizationId, conn: &DbConn) -> Vec<(Self, User)> {
+        conn.run(move |conn| {
+            users_organizations::table
+                .inner_join(users::table.on(users::uuid.eq(users_organizations::user_uuid)))
+                .filter(users_organizations::org_uuid.eq(org_uuid))
+                .select((users_organizations::all_columns, users::all_columns))
+                .load::<(Self, User)>(conn)
+                .expect("Error loading organization members with users")
+        })
+        .await
+    }
+
+    /// Organization-scoped single-resource lookup, joined with the user account.
+    ///
+    /// The membership id and the organization id are bound in the same query on purpose: a
+    /// membership belonging to another organization must be indistinguishable from one that does
+    /// not exist at all.
+    pub async fn find_by_uuid_and_org_with_user(
+        uuid: &MembershipId,
+        org_uuid: &OrganizationId,
+        conn: &DbConn,
+    ) -> Option<(Self, User)> {
+        conn.run(move |conn| {
+            users_organizations::table
+                .inner_join(users::table.on(users::uuid.eq(users_organizations::user_uuid)))
+                .filter(users_organizations::uuid.eq(uuid))
+                .filter(users_organizations::org_uuid.eq(org_uuid))
+                .select((users_organizations::all_columns, users::all_columns))
+                .first::<(Self, User)>(conn)
                 .ok()
         })
         .await

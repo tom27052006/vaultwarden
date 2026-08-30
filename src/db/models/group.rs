@@ -558,6 +558,56 @@ impl GroupUser {
         .await
     }
 
+    /// Atomically replace a group's entire member list.
+    ///
+    /// The delete and the inserts run inside a single database transaction, so a failure part way
+    /// through can never leave the group with a half-applied membership list. This is the one
+    /// group operation destructive enough to be worth a real transaction; everything else in the
+    /// SCIM path is made safe by validating the whole request before writing anything.
+    ///
+    /// Callers **must** have already verified that every `member_uuids` entry belongs to
+    /// `org_uuid`; this function does not re-check tenancy.
+    pub async fn replace_all_for_group(
+        group_uuid: &GroupId,
+        org_uuid: &OrganizationId,
+        member_uuids: Vec<MembershipId>,
+        conn: &DbConn,
+    ) -> EmptyResult {
+        // Bump revisions for everyone leaving and everyone joining, before and after the write.
+        for group_user in Self::find_by_group(group_uuid, org_uuid, conn).await {
+            group_user.update_user_revision(conn).await;
+        }
+
+        let inserts: Vec<Self> = member_uuids.iter().map(|m| Self::new(group_uuid.clone(), m.clone())).collect();
+
+        conn.run(move |conn| {
+            conn.transaction::<_, diesel::result::Error, _>(|conn| {
+                diesel::delete(groups_users::table.filter(groups_users::groups_uuid.eq(group_uuid))).execute(conn)?;
+
+                for entry in &inserts {
+                    diesel::insert_into(groups_users::table)
+                        .values((
+                            groups_users::users_organizations_uuid.eq(&entry.users_organizations_uuid),
+                            groups_users::groups_uuid.eq(&entry.groups_uuid),
+                        ))
+                        .execute(conn)?;
+                }
+
+                Ok(())
+            })
+            .map_res("Error replacing group members")
+        })
+        .await?;
+
+        for member_uuid in &member_uuids {
+            if let Some(member) = Membership::find_by_uuid(member_uuid, conn).await {
+                User::update_uuid_revision(&member.user_uuid, conn).await;
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn find_by_member(member_uuid: &MembershipId, conn: &DbConn) -> Vec<Self> {
         conn.run(move |conn| {
             groups_users::table

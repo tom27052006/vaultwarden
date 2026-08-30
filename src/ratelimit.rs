@@ -18,6 +18,16 @@ static LIMITER_ADMIN: LazyLock<Limiter> = LazyLock::new(|| {
     RateLimiter::keyed(Quota::with_period(seconds).expect("Non-zero admin ratelimit seconds").allow_burst(burst))
 });
 
+#[cfg_attr(
+    test,
+    expect(dead_code, reason = "the SCIM test suite substitutes a limiter it can drive deterministically")
+)]
+static LIMITER_SCIM: LazyLock<Limiter> = LazyLock::new(|| {
+    let seconds = Duration::from_secs(CONFIG.scim_ratelimit_seconds());
+    let burst = NonZeroU32::new(CONFIG.scim_ratelimit_max_burst()).expect("Non-zero SCIM ratelimit burst");
+    RateLimiter::keyed(Quota::with_period(seconds).expect("Non-zero SCIM ratelimit seconds").allow_burst(burst))
+});
+
 static LIMITER_UNAUTHENTICATED: LazyLock<Limiter> = LazyLock::new(|| {
     let seconds = Duration::from_secs(CONFIG.unauthenticated_ratelimit_seconds());
     let burst = NonZeroU32::new(CONFIG.unauthenticated_ratelimit_max_burst())
@@ -43,6 +53,18 @@ pub fn check_limit_login(ip: &IpAddr) -> Result<(), Error> {
             err_code!("Too many login requests", 429);
         }
     }
+}
+
+/// Rate limit for the SCIM endpoints, applied to every request before the bearer token is even
+/// parsed. This covers authentication attempts, expensive listing/filter requests and writes with
+/// a single limiter, and is deliberately more lenient than the login limiter because identity
+/// providers sync in bursts.
+#[cfg_attr(
+    test,
+    expect(dead_code, reason = "the SCIM test suite substitutes a limiter it can drive deterministically")
+)]
+pub fn check_limit_scim(ip: &IpAddr) -> Result<(), ()> {
+    LIMITER_SCIM.check_key(ip).map_err(|_| ())
 }
 
 pub fn check_limit_admin(ip: &IpAddr) -> Result<(), Error> {

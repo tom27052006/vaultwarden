@@ -231,6 +231,40 @@ impl DbPool {
         })
     }
 
+    /// Build a pool against an explicit database URL, running that backend's migrations first.
+    ///
+    /// Tests need a database of their own rather than the one `DATABASE_URL` points at, so that
+    /// running the suite can never touch a developer's real data folder. This deliberately does
+    /// not set `ACTIVE_DB_TYPE`, which is a process-wide `OnceLock` that the real
+    /// [`DbPool::from_config`] owns.
+    #[cfg(test)]
+    pub fn from_url_for_tests(db_url: &str) -> Result<Self, Error> {
+        match DbConnType::from_url(db_url)? {
+            #[cfg(mysql)]
+            DbConnType::Mysql => mysql_migrations::run_migrations(db_url)?,
+            #[cfg(postgresql)]
+            DbConnType::Postgresql => postgresql_migrations::run_migrations(db_url)?,
+            #[cfg(sqlite)]
+            DbConnType::Sqlite => sqlite_migrations::run_migrations(db_url)?,
+        }
+
+        let conn_type = DbConnType::from_url(db_url)?;
+        let max_conns = 8;
+        let pool = Pool::builder()
+            .max_size(max_conns)
+            .connection_timeout(Duration::from_secs(30))
+            .connection_customizer(Box::new(DbConnOptions {
+                init_stmts: conn_type.default_init_stmts(),
+            }))
+            .build(DbConnManager::new(db_url))
+            .map_res("Failed to create test pool")?;
+
+        Ok(DbPool {
+            pool: Some(pool),
+            semaphore: Arc::new(Semaphore::new(max_conns as usize)),
+        })
+    }
+
     // Get a connection from the pool
     pub async fn get(&self) -> Result<DbConn, Error> {
         let duration = Duration::from_secs(CONFIG.database_timeout());

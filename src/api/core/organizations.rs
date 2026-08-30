@@ -8,7 +8,7 @@ use crate::{
     CONFIG,
     api::admin::FAKE_ADMIN_UUID,
     api::{
-        EmptyResult, JsonResult, Notify, PasswordOrOtpData, UpdateType,
+        ApiResult, EmptyResult, JsonResult, Notify, PasswordOrOtpData, UpdateType,
         core::{CipherSyncData, CipherSyncType, accept_org_invite, log_event, two_factor},
     },
     auth::{AdminHeaders, Headers, ManagerHeaders, ManagerHeadersLoose, OrgMemberHeaders, OwnerHeaders, decode_invite},
@@ -2310,6 +2310,121 @@ async fn bulk_revoke_members(
         "object": "list",
         "continuationToken": null
     })))
+}
+
+/// Provision an organization membership for `email`, creating the account if it does not exist.
+///
+/// This is the shared implementation behind directory-style integrations: the Directory Connector
+/// (`/public/organization/import`) and SCIM both call it, so the security-sensitive parts --
+/// which account is matched, what role the membership gets, when an invite is sent, and how a
+/// failed invite is rolled back -- exist once rather than twice.
+///
+/// The new membership is always an unprivileged [`MembershipType::User`] with `access_all` off.
+/// There is no parameter for anything else on purpose: an integration must not be able to mint a
+/// privileged member.
+///
+/// `display_name` is only used when this call *creates* the account. An account that already
+/// exists is never renamed, because its name is global and visible in every organization it
+/// belongs to.
+pub async fn provision_org_member(
+    org_id: &OrganizationId,
+    email: &str,
+    display_name: Option<String>,
+    external_id: Option<String>,
+    conn: &DbConn,
+) -> ApiResult<Membership> {
+    let mut user_created = false;
+    let user = if let Some(user) = User::find_by_mail(email, conn).await {
+        user
+    } else {
+        // The account does not exist yet, so create the same shell/invited account an
+        // organization import creates.
+        let mut new_user = User::new(email, display_name);
+        new_user.save(conn).await?;
+
+        if !CONFIG.mail_enabled() {
+            Invitation::new(&new_user.email).save(conn).await?;
+        }
+        user_created = true;
+        new_user
+    };
+
+    let member_status = if CONFIG.mail_enabled() || user.password_hash.is_empty() {
+        MembershipStatus::Invited as i32
+    } else {
+        MembershipStatus::Accepted as i32 // Automatically mark user as accepted if no email invites
+    };
+
+    let (org_name, org_email) = if let Some(org) = Organization::find_by_uuid(org_id, conn).await {
+        (org.name, org.billing_email)
+    } else {
+        err!("Error looking up organization")
+    };
+
+    let mut new_member = Membership::new(user.uuid.clone(), org_id.clone(), Some(org_email.clone()));
+    new_member.set_external_id(external_id);
+    new_member.access_all = false;
+    new_member.atype = MembershipType::User as i32;
+    new_member.status = member_status;
+
+    new_member.save(conn).await?;
+
+    if CONFIG.mail_enabled()
+        && let Err(e) =
+            mail::send_invite(&user, org_id.clone(), new_member.uuid.clone(), &org_name, Some(org_email)).await
+    {
+        // Upon error delete the user, invite and org member records when needed
+        if user_created {
+            user.delete(conn).await?;
+        } else {
+            new_member.delete(conn).await?;
+        }
+
+        err!(format!("Error sending invite: {e:?} "));
+    }
+
+    Ok(new_member)
+}
+
+/// Revoke a membership on behalf of a directory integration.
+///
+/// Returns whether the status actually changed, so a caller can avoid a pointless write. The last
+/// confirmed owner is refused, which is the check that keeps an integration from locking an
+/// organization out of its own administration.
+///
+/// The caller is responsible for persisting the membership.
+pub async fn try_revoke_member(member: &mut Membership, conn: &DbConn) -> ApiResult<bool> {
+    if member.atype == MembershipType::Owner
+        && member.status == MembershipStatus::Confirmed as i32
+        && Membership::count_confirmed_by_org_and_type(&member.org_uuid, MembershipType::Owner, conn).await <= 1
+    {
+        err!("Can't revoke the last owner")
+    }
+
+    Ok(member.revoke())
+}
+
+/// Restore a membership on behalf of a directory integration.
+///
+/// Returns whether the status actually changed. Organization policies are enforced exactly as the
+/// interactive restore endpoint enforces them; if the policy check fails the membership is put
+/// back into its revoked state before the error is returned, so a rejected restore never leaves a
+/// half-restored member behind.
+///
+/// The caller is responsible for persisting the membership.
+pub async fn try_restore_member(member: &mut Membership, conn: &DbConn) -> ApiResult<bool> {
+    if !member.restore() {
+        return Ok(false);
+    }
+
+    // This check is also done at accept_invite, _confirm_invite, _activate_member, edit_member,
+    // admin::update_membership_type. It has to happen after restoring so it sees the real status.
+    if let Err(e) = OrgPolicy::check_user_allowed(member, "restore", conn).await {
+        member.revoke();
+        return Err(e);
+    }
+
+    Ok(true)
 }
 
 async fn revoke_member_impl(

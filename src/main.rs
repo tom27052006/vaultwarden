@@ -589,9 +589,13 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
         .mount([basepath, "/identity"].concat(), api::identity_routes())
         .mount([basepath, "/icons"].concat(), api::icons_routes())
         .mount([basepath, "/notifications"].concat(), api::notifications_routes())
+        .mount([basepath, "/scim/v2"].concat(), api::scim_routes())
         .register([basepath, "/"].concat(), api::web_catchers())
         .register([basepath, "/api"].concat(), api::core_catchers())
         .register([basepath, "/admin"].concat(), api::admin_catchers())
+        // SCIM clients cannot parse Vaultwarden's normal error bodies, so failures inside the
+        // SCIM mount point get the `urn:ietf:params:scim:api:messages:2.0:Error` shape instead.
+        .register([basepath, "/scim/v2"].concat(), api::scim_catchers())
         .manage(pool)
         .manage(Arc::clone(&WS_USERS))
         .manage(Arc::clone(&WS_ANONYMOUS_SUBSCRIPTIONS))

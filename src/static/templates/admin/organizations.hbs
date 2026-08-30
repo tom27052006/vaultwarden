@@ -1,6 +1,30 @@
 <main class="container-xxl">
     <div id="organizations-block" class="my-3 p-3 rounded shadow">
         <h6 class="border-bottom pb-2 mb-3">Organizations</h6>
+
+        {{#unless page_data.scim_enabled}}
+        <div class="alert alert-secondary small" role="alert">
+            <strong>SCIM provisioning is disabled.</strong>
+            Set <code>SCIM_ENABLED=true</code> to let an identity provider such as Microsoft Entra ID provision members
+            and groups. Tokens can only be generated while it is enabled.
+        </div>
+        {{else}}
+        {{#unless page_data.org_groups_enabled}}
+        <div class="alert alert-warning small" role="alert">
+            <strong>Groups are disabled.</strong>
+            SCIM group provisioning needs <code>ORG_GROUPS_ENABLED=true</code>; the <code>/Groups</code> endpoints
+            return <code>501 Not Implemented</code> until it is set. User provisioning works either way.
+        </div>
+        {{/unless}}
+        {{#unless page_data.org_events_enabled}}
+        <div class="alert alert-warning small" role="alert">
+            <strong>Organization event logging is disabled.</strong>
+            SCIM changes members without anyone watching; set <code>ORG_EVENTS_ENABLED=true</code> to record what it
+            does in the organization event log.
+        </div>
+        {{/unless}}
+        {{/unless}}
+
         <div class="table-responsive-xl small">
             <table id="orgs-table" class="table table-sm table-striped table-hover">
                 <thead>
@@ -10,11 +34,12 @@
                         <th class="vw-entries">Entries</th>
                         <th class="vw-attachments">Attachments</th>
                         <th class="vw-misc">Misc</th>
+                        <th class="vw-scim">SCIM</th>
                         <th class="vw-actions">Actions</th>
                     </tr>
                 </thead>
                 <tbody>
-                    {{#each page_data}}
+                    {{#each page_data.organizations}}
                     <tr>
                         <td>
                             <svg width="48" height="48" class="float-start me-2 rounded" data-jdenticon-value="{{id}}">
@@ -43,6 +68,41 @@
                             <span class="d-block"><strong>Groups:</strong> {{group_count}}</span>
                             <span class="d-block"><strong>Events:</strong> {{event_count}}</span>
                         </td>
+                        <td>
+                            {{#unless ../page_data.scim_enabled}}
+                            <span class="d-block text-muted">Disabled server-wide</span>
+                            {{else}}
+                            {{#if scim_configured}}
+                            <span class="d-block"><span class="badge bg-success">Token active</span></span>
+                            <span class="d-block"><strong>Created:</strong> {{scim_created_at}}</span>
+                            <span class="d-block"><strong>Last used:</strong> {{scim_last_used_at}}</span>
+                            {{else}}
+                            <span class="d-block"><span class="badge bg-secondary">No token</span></span>
+                            {{/if}}
+                            <span class="d-block mt-1">
+                                <button type="button" class="btn btn-sm btn-link p-0 border-0"
+                                    vw-scim-rotate
+                                    data-vw-org-uuid="{{id}}"
+                                    data-vw-org-name="{{name}}"
+                                    data-vw-scim-configured="{{scim_configured}}">{{#if scim_configured}}Rotate token{{else}}Generate token{{/if}}</button>
+                            </span>
+                            {{#if scim_configured}}
+                            <span class="d-block">
+                                <button type="button" class="btn btn-sm btn-link p-0 border-0 text-danger"
+                                    vw-scim-revoke
+                                    data-vw-org-uuid="{{id}}"
+                                    data-vw-org-name="{{name}}">Revoke token</button>
+                            </span>
+                            <span class="d-block">
+                                <button type="button" class="btn btn-sm btn-link p-0 border-0"
+                                    vw-scim-endpoint
+                                    data-vw-org-uuid="{{id}}"
+                                    data-vw-org-name="{{name}}"
+                                    data-vw-scim-endpoint="{{scim_endpoint}}">Show endpoint</button>
+                            </span>
+                            {{/if}}
+                            {{/unless}}
+                        </td>
                         <td class="text-end px-1 small">
                             <button type="button" class="btn btn-sm btn-link p-0 border-0 float-right" vw-delete-organization data-vw-org-uuid="{{id}}" data-vw-org-name="{{name}}" data-vw-billing-email="{{billingEmail}}">Delete Organization</button><br>
                         </td>
@@ -57,6 +117,58 @@
         </div>
     </div>
 </main>
+
+<div class="modal fade" id="scimModal" tabindex="-1" aria-labelledby="scimModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="scimModalLabel">SCIM configuration</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body small">
+                <p class="mb-2">Organization <strong id="scimModalOrgName"></strong></p>
+
+                <div id="scimTokenBlock" class="d-none">
+                    <div class="alert alert-warning" role="alert">
+                        <strong>Copy this token now.</strong> It is stored only as a hash and cannot be shown again.
+                        Generating a new one immediately invalidates the previous token.
+                    </div>
+                    <label class="form-label" for="scimTokenValue">Bearer token</label>
+                    <div class="input-group mb-3">
+                        <input type="text" class="form-control font-monospace" id="scimTokenValue" readonly>
+                        <button class="btn btn-outline-secondary" type="button" data-vw-copy-target="scimTokenValue">Copy</button>
+                    </div>
+                </div>
+
+                <label class="form-label" for="scimEndpointValue">Tenant URL / SCIM endpoint</label>
+                <div class="input-group mb-3">
+                    <input type="text" class="form-control font-monospace" id="scimEndpointValue" readonly>
+                    <button class="btn btn-outline-secondary" type="button" data-vw-copy-target="scimEndpointValue">Copy</button>
+                </div>
+
+                <h6 class="border-bottom pb-2 mb-2">Microsoft Entra ID setup</h6>
+                <ol class="mb-3">
+                    <li>In the Entra admin center, open your enterprise application and go to <em>Provisioning</em>.</li>
+                    <li>Set <em>Provisioning Mode</em> to <strong>Automatic</strong>.</li>
+                    <li>Paste the endpoint above into <strong>Tenant URL</strong> and the token into <strong>Secret Token</strong>.</li>
+                    <li>Choose <em>Test Connection</em>, then save and start provisioning.</li>
+                </ol>
+
+                <h6 class="border-bottom pb-2 mb-2">What SCIM can and cannot do</h6>
+                <ul class="mb-0">
+                    <li>Provisioned members are <strong>invited</strong>, never auto-confirmed. An organization admin still confirms them.</li>
+                    <li>SCIM only manages members with the ordinary <strong>User</strong> role. Owners, Admins and Managers are read-only through SCIM.</li>
+                    <li><code>active: false</code> revokes organization access and keeps the membership; <code>DELETE</code> removes the membership but never the Vaultwarden account.</li>
+                    <li>An account's email address is never changed by SCIM. Deprovision and reprovision to move someone to a new address.</li>
+                    <li>Full documentation: <code>docs/scim/README.md</code>.</li>
+                </ul>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-primary" data-bs-dismiss="modal">Done</button>
+            </div>
+        </div>
+    </div>
+</div>
 
 <link rel="stylesheet" href="{{urlpath}}/vw_static/datatables.css" />
 <script src="{{urlpath}}/vw_static/jquery-4.0.0.slim.js"></script>
