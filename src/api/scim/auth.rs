@@ -122,7 +122,20 @@ impl<'r> FromRequest<'r> for ScimToken {
             return Outcome::Error((Status::Unauthorized, ()));
         };
 
-        let Some(credential) = request.headers().get_one("Authorization").and_then(bearer_credential) else {
+        // A request with no bearer credential, or one whose token is not even the right shape, is
+        // never something an identity provider sends. Those are charged to the strict
+        // unauthenticated budget instead of the generous provisioning one, so a flood of junk
+        // cannot eat the allowance a real directory sync needs. This is decided from the headers
+        // alone, before any database work.
+        let parsed = request.headers().get_one("Authorization").and_then(bearer_credential).map(|credential| {
+            let parsed = parse_token(credential);
+            (credential.to_owned(), parsed)
+        });
+
+        let Some((credential, parsed_token)) = parsed.filter(|(_, parsed)| parsed.is_some()) else {
+            if super::settings::check_unauthenticated_rate_limit(&ip).is_err() {
+                return Outcome::Error((Status::TooManyRequests, ()));
+            }
             return Outcome::Error((Status::Unauthorized, ()));
         };
 
@@ -135,12 +148,12 @@ impl<'r> FromRequest<'r> for ScimToken {
 
         // A malformed token still goes through a hash and a constant-time comparison so that it
         // is not measurably cheaper to reject than a well-formed one with a wrong secret.
-        let (key, secret) = match parse_token(credential) {
+        let (key, secret) = match parsed_token {
             Some(parsed) => {
                 let key = OrganizationScimKey::find_by_uuid_and_org(&parsed.key_id, &org_id, &conn).await;
                 (key, parsed.secret)
             }
-            None => (None, credential.to_owned()),
+            None => (None, credential),
         };
 
         let authenticated = if let Some(key) = &key {

@@ -1175,16 +1175,53 @@ impl Membership {
     ///
     /// SCIM needs the account (for the email that backs `userName`) for every membership it
     /// renders; fetching them in one join avoids an N+1 query per listed resource.
+    /// Ordered by membership id so that paging over an unchanged collection is stable: without an
+    /// explicit order the database is free to return rows differently between two queries, which
+    /// would let a paginating client skip or repeat resources.
     pub async fn find_by_org_with_user(org_uuid: &OrganizationId, conn: &DbConn) -> Vec<(Self, User)> {
         conn.run(move |conn| {
             users_organizations::table
                 .inner_join(users::table.on(users::uuid.eq(users_organizations::user_uuid)))
                 .filter(users_organizations::org_uuid.eq(org_uuid))
                 .select((users_organizations::all_columns, users::all_columns))
+                .order(users_organizations::uuid.asc())
                 .load::<(Self, User)>(conn)
                 .expect("Error loading organization members with users")
         })
         .await
+    }
+
+    /// Which of `uuids` are memberships of this organization.
+    ///
+    /// One query instead of one per id, which is what keeps synchronising a large group from
+    /// generating thousands of round trips. The organization is still bound into the query, so
+    /// this validates tenancy exactly as the single-resource lookup does: an id belonging to
+    /// another organization simply does not come back.
+    pub async fn find_existing_uuids_in_org(
+        uuids: &[MembershipId],
+        org_uuid: &OrganizationId,
+        conn: &DbConn,
+    ) -> Vec<MembershipId> {
+        // SQLite caps bound parameters per statement, so ask in chunks.
+        const CHUNK: usize = 100;
+        let mut found = Vec::with_capacity(uuids.len());
+
+        for chunk in uuids.chunks(CHUNK) {
+            let chunk = chunk.to_vec();
+            let mut rows: Vec<MembershipId> = conn
+                .run(move |conn| {
+                    users_organizations::table
+                        .filter(users_organizations::uuid.eq_any(&chunk))
+                        .filter(users_organizations::org_uuid.eq(org_uuid))
+                        .select(users_organizations::uuid)
+                        .load(conn)
+                        .unwrap_or_default()
+                })
+                .await;
+            found.append(&mut rows);
+        }
+
+        found
     }
 
     /// Organization-scoped single-resource lookup, joined with the user account.
@@ -1205,6 +1242,22 @@ impl Membership {
                 .select((users_organizations::all_columns, users::all_columns))
                 .first::<(Self, User)>(conn)
                 .ok()
+        })
+        .await
+    }
+
+    /// Every membership of this organization with the given external id.
+    ///
+    /// `external_id` has no unique constraint, and existing installations may already hold
+    /// duplicates from the Directory Connector, so a filter optimisation must not assume there is
+    /// at most one match -- doing so would silently drop resources from a filtered listing.
+    pub async fn find_all_by_external_id_and_org(ext_id: &str, org_uuid: &OrganizationId, conn: &DbConn) -> Vec<Self> {
+        conn.run(move |conn| {
+            users_organizations::table
+                .filter(users_organizations::external_id.eq(ext_id))
+                .filter(users_organizations::org_uuid.eq(org_uuid))
+                .load::<Self>(conn)
+                .unwrap_or_default()
         })
         .await
     }
@@ -1303,6 +1356,8 @@ pub struct OrganizationId(String);
     Hash,
     PartialEq,
     Eq,
+    PartialOrd,
+    Ord,
     Serialize,
     Deserialize,
     UuidFromParam,

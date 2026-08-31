@@ -409,7 +409,10 @@ impl ScimGroupRequest {
             ids.push(MembershipId::from(value.to_owned()));
         }
 
-        Ok(Some(ids))
+        // A client listing the same member twice is harmless input. Collapsing it here is what
+        // keeps it from reaching the database as a repeated `(group, member)` primary key and
+        // failing a perfectly reasonable request with a 500.
+        Ok(Some(super::patch::dedup_preserving_order(ids)))
     }
 }
 
@@ -580,6 +583,21 @@ mod tests {
         let ids = request.member_ids().unwrap().unwrap();
         assert_eq!(ids.len(), 2);
         assert_eq!(*ids[0], "m1");
+        assert_eq!(*ids[1], "m2");
+    }
+
+    #[test]
+    fn duplicate_member_entries_are_collapsed() {
+        // Otherwise the same `(group, member)` primary key would be inserted twice and a
+        // reasonable request would fail with a database error.
+        let request = parse_group(json!({
+            "displayName": "Eng",
+            "members": [{"value": "m1"}, {"value": "m2"}, {"value": "m1"}, {"value": "m1"}],
+        }));
+
+        let ids = request.member_ids().unwrap().unwrap();
+        assert_eq!(ids.len(), 2, "duplicates collapse");
+        assert_eq!(*ids[0], "m1", "first occurrence order is preserved");
         assert_eq!(*ids[1], "m2");
     }
 

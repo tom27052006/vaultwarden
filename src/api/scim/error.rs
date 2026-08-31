@@ -112,8 +112,21 @@ impl ScimError {
         Self::new(Status::Unauthorized, None, "Authorization failed.")
     }
 
-    /// The operation is understood but refused on this resource, e.g. a privileged membership.
+    /// A plain authorization refusal: the request was understood, and the server will not do it.
+    ///
+    /// Deliberately carries **no** `scimType`. RFC 7644 section 3.12 defines `scimType` values for
+    /// specific protocol faults, and none of them describes "an operator switched this off" or
+    /// "an organization policy says no". Labelling those `mutability` would tell a client the
+    /// request was structurally wrong when it was perfectly well formed.
     pub fn forbidden(detail: impl Into<String>) -> Self {
+        Self::new(Status::Forbidden, None, detail)
+    }
+
+    /// The client tried to modify a resource this server treats as read-only.
+    ///
+    /// This is a genuine `mutability` fault: the request asked to change something the schema and
+    /// this implementation do not allow to be changed.
+    pub fn read_only(detail: impl Into<String>) -> Self {
         Self::new(Status::Forbidden, Some(ScimType::Mutability), detail)
     }
 
@@ -230,6 +243,34 @@ mod tests {
 
         assert_eq!(a, b);
         assert!(!a.contains("organization"), "the 401 body must not hint at what was wrong: {a}");
+    }
+
+    #[test]
+    fn an_authorization_refusal_carries_no_scim_type() {
+        // RFC 7644 section 3.12's `scimType` values describe protocol faults. "An operator turned
+        // this off" and "an organization policy says no" are neither, and labelling them
+        // `mutability` would tell a client its perfectly well-formed request was malformed.
+        let body = ScimError::forbidden("Invitations are disabled on this server.").to_json();
+
+        assert_eq!(body["status"], json!("403"));
+        assert!(body.get("scimType").is_none(), "a plain refusal must not be labelled: {body}");
+    }
+
+    #[test]
+    fn writing_a_read_only_resource_is_a_mutability_fault() {
+        let body = ScimError::read_only("That member is read-only through SCIM.").to_json();
+
+        assert_eq!(body["status"], json!("403"));
+        assert_eq!(body["scimType"], json!("mutability"));
+    }
+
+    #[test]
+    fn writing_an_immutable_attribute_is_a_client_error() {
+        // RFC 7644 pairs `mutability` with 400 for an attempt to change an immutable attribute.
+        let body = ScimError::immutable("'userName' cannot be changed.").to_json();
+
+        assert_eq!(body["status"], json!("400"));
+        assert_eq!(body["scimType"], json!("mutability"));
     }
 
     #[test]

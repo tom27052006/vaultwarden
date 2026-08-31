@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use chrono::{NaiveDateTime, Utc};
 use derive_more::{AsRef, Deref, Display, From};
 use diesel::prelude::*;
@@ -7,7 +9,7 @@ use crate::{
     api::EmptyResult,
     db::{
         DbConn,
-        schema::{collections, collections_groups, groups, groups_users, users_organizations},
+        schema::{collections, collections_groups, groups, groups_users, users, users_organizations},
     },
     error::MapResult,
 };
@@ -15,7 +17,7 @@ use macros::UuidFromParam;
 
 use super::{CollectionId, Membership, MembershipId, OrganizationId, User, UserId};
 
-#[derive(Identifiable, Queryable, Insertable, AsChangeset)]
+#[derive(Clone, Identifiable, Queryable, Insertable, AsChangeset)]
 #[diesel(table_name = groups)]
 #[diesel(treat_none_as_null = true)]
 #[diesel(primary_key(uuid))]
@@ -160,8 +162,162 @@ impl GroupUser {
     }
 }
 
+/// What a transactional group mutation actually changed.
+///
+/// The caller uses this to log accurate events *after* the transaction has committed: only the
+/// memberships that genuinely moved are reported, so an update from `{A, B}` to `{A, C}` records
+/// B leaving and C joining and says nothing about A.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct GroupSaveOutcome {
+    /// Memberships added to the group, in request order.
+    pub added: Vec<MembershipId>,
+    /// Memberships removed from the group, in stored order.
+    pub removed: Vec<MembershipId>,
+    /// Whether anything at all was written, including the revision timestamp.
+    pub changed: bool,
+}
+
+impl GroupSaveOutcome {
+    pub fn members_changed(&self) -> bool {
+        !self.added.is_empty() || !self.removed.is_empty()
+    }
+}
+
+/// How many rows to bind per statement.
+///
+/// SQLite caps the number of bound parameters per statement (999 on older builds), so member
+/// inserts and `IN (...)` lookups are chunked rather than sent as one enormous statement.
+const SQL_CHUNK: usize = 100;
+
 /// Database methods
 impl Group {
+    /// Insert or update a group **and** its membership in a single transaction.
+    ///
+    /// This is the only way the SCIM endpoints write a group. Doing the row and the membership in
+    /// one transaction is what makes `POST` and `PATCH` atomic: a failure while persisting members
+    /// rolls the group row back too, so a create cannot leave an empty group behind and an update
+    /// cannot leave `displayName` changed with the old membership still in place.
+    ///
+    /// * `is_new` selects insert versus update.
+    /// * `metadata_changed` says whether the caller altered a column; it only matters for an
+    ///   update, where an unchanged group with unchanged membership must not be written at all.
+    /// * `members` of `None` leaves membership untouched; `Some(list)` makes the membership
+    ///   exactly `list`. The caller must have de-duplicated it and verified that every entry
+    ///   belongs to `self.organizations_uuid` -- this function does not re-check tenancy.
+    ///
+    /// `revision_date` moves whenever the group row or its membership changes, because either one
+    /// changes the SCIM representation and therefore `meta.lastModified`. A request that changes
+    /// nothing writes nothing and leaves the timestamp alone.
+    pub async fn save_with_members(
+        &mut self,
+        is_new: bool,
+        metadata_changed: bool,
+        members: Option<Vec<MembershipId>>,
+        conn: &DbConn,
+    ) -> Result<GroupSaveOutcome, crate::Error> {
+        let now = Utc::now().naive_utc();
+        let group_uuid = self.uuid.clone();
+        let org_uuid = self.organizations_uuid.clone();
+
+        // The closure cannot borrow `self`, so hand it an owned copy with the prospective
+        // revision date already applied.
+        let mut row = self.clone();
+        row.revision_date = now;
+
+        let outcome = conn
+            .run(move |conn| {
+                conn.transaction::<GroupSaveOutcome, diesel::result::Error, _>(|conn| {
+                    let mut outcome = GroupSaveOutcome::default();
+
+                    // The group row goes in first: `groups_users` has a foreign key to it, so
+                    // inserting members before the group they belong to is rejected.
+                    if is_new {
+                        diesel::insert_into(groups::table).values(&row).execute(conn)?;
+                    }
+
+                    if let Some(desired) = members {
+                        // Membership currently stored for this group, restricted to the
+                        // organization so a stray row can never widen the delta.
+                        let current: Vec<MembershipId> = groups_users::table
+                            .inner_join(
+                                users_organizations::table
+                                    .on(users_organizations::uuid.eq(groups_users::users_organizations_uuid)),
+                            )
+                            .filter(groups_users::groups_uuid.eq(&group_uuid))
+                            .filter(users_organizations::org_uuid.eq(&org_uuid))
+                            .select(groups_users::users_organizations_uuid)
+                            .load(conn)?;
+
+                        // Set-based, so a large group costs O(n) rather than O(n^2), while the
+                        // returned vectors keep a deterministic order.
+                        let current_set: HashSet<&MembershipId> = current.iter().collect();
+                        let desired_set: HashSet<&MembershipId> = desired.iter().collect();
+
+                        outcome.added = desired.iter().filter(|m| !current_set.contains(*m)).cloned().collect();
+                        outcome.removed = current.iter().filter(|m| !desired_set.contains(*m)).cloned().collect();
+
+                        for chunk in outcome.removed.chunks(SQL_CHUNK) {
+                            diesel::delete(
+                                groups_users::table
+                                    .filter(groups_users::groups_uuid.eq(&group_uuid))
+                                    .filter(groups_users::users_organizations_uuid.eq_any(chunk)),
+                            )
+                            .execute(conn)?;
+                        }
+
+                        // One statement per row: diesel's `MultiConnection` backend does not
+                        // support batched `VALUES` clauses. They are still one transaction, and
+                        // only the *added* members are written rather than the whole membership.
+                        for member in &outcome.added {
+                            diesel::insert_into(groups_users::table)
+                                .values((
+                                    groups_users::groups_uuid.eq(&group_uuid),
+                                    groups_users::users_organizations_uuid.eq(member),
+                                ))
+                                .execute(conn)?;
+                        }
+                    }
+
+                    outcome.changed = is_new || metadata_changed || outcome.members_changed();
+
+                    if !is_new && outcome.changed {
+                        // A membership-only change still moves `revision_date`, because it changes
+                        // the SCIM resource that `meta.lastModified` describes.
+                        diesel::update(groups::table.filter(groups::uuid.eq(&group_uuid))).set(&row).execute(conn)?;
+                    }
+
+                    // Only accounts whose group membership actually moved need a new revision, so
+                    // unchanged members are not forced to re-sync.
+                    if outcome.members_changed() {
+                        let touched: Vec<MembershipId> =
+                            outcome.added.iter().chain(outcome.removed.iter()).cloned().collect();
+
+                        for chunk in touched.chunks(SQL_CHUNK) {
+                            let user_uuids: Vec<UserId> = users_organizations::table
+                                .filter(users_organizations::uuid.eq_any(chunk))
+                                .filter(users_organizations::org_uuid.eq(&org_uuid))
+                                .select(users_organizations::user_uuid)
+                                .load(conn)?;
+
+                            diesel::update(users::table.filter(users::uuid.eq_any(&user_uuids)))
+                                .set(users::updated_at.eq(now))
+                                .execute(conn)?;
+                        }
+                    }
+
+                    Ok(outcome)
+                })
+                .map_res("Error saving group")
+            })
+            .await?;
+
+        if outcome.changed {
+            self.revision_date = now;
+        }
+
+        Ok(outcome)
+    }
+
     pub async fn save(&mut self, conn: &DbConn) -> EmptyResult {
         self.revision_date = Utc::now().naive_utc();
 
@@ -244,6 +400,26 @@ impl Group {
         })
         .await
     }
+    /// Every group of this organization with the given external id.
+    ///
+    /// As with memberships, `external_id` carries no unique constraint and existing installations
+    /// may hold duplicates, so a filter fast path has to return all of them or it would change
+    /// the result set it is supposed to be optimising.
+    pub async fn find_all_by_external_id_and_org(
+        external_id: &str,
+        org_uuid: &OrganizationId,
+        conn: &DbConn,
+    ) -> Vec<Self> {
+        conn.run(move |conn| {
+            groups::table
+                .filter(groups::external_id.eq(external_id))
+                .filter(groups::organizations_uuid.eq(org_uuid))
+                .load::<Self>(conn)
+                .unwrap_or_default()
+        })
+        .await
+    }
+
     //Returns all organizations the user has full access to
     pub async fn get_orgs_by_user_with_full_access(user_uuid: &UserId, conn: &DbConn) -> Vec<OrganizationId> {
         conn.run(move |conn| {
@@ -558,56 +734,6 @@ impl GroupUser {
         .await
     }
 
-    /// Atomically replace a group's entire member list.
-    ///
-    /// The delete and the inserts run inside a single database transaction, so a failure part way
-    /// through can never leave the group with a half-applied membership list. This is the one
-    /// group operation destructive enough to be worth a real transaction; everything else in the
-    /// SCIM path is made safe by validating the whole request before writing anything.
-    ///
-    /// Callers **must** have already verified that every `member_uuids` entry belongs to
-    /// `org_uuid`; this function does not re-check tenancy.
-    pub async fn replace_all_for_group(
-        group_uuid: &GroupId,
-        org_uuid: &OrganizationId,
-        member_uuids: Vec<MembershipId>,
-        conn: &DbConn,
-    ) -> EmptyResult {
-        // Bump revisions for everyone leaving and everyone joining, before and after the write.
-        for group_user in Self::find_by_group(group_uuid, org_uuid, conn).await {
-            group_user.update_user_revision(conn).await;
-        }
-
-        let inserts: Vec<Self> = member_uuids.iter().map(|m| Self::new(group_uuid.clone(), m.clone())).collect();
-
-        conn.run(move |conn| {
-            conn.transaction::<_, diesel::result::Error, _>(|conn| {
-                diesel::delete(groups_users::table.filter(groups_users::groups_uuid.eq(group_uuid))).execute(conn)?;
-
-                for entry in &inserts {
-                    diesel::insert_into(groups_users::table)
-                        .values((
-                            groups_users::users_organizations_uuid.eq(&entry.users_organizations_uuid),
-                            groups_users::groups_uuid.eq(&entry.groups_uuid),
-                        ))
-                        .execute(conn)?;
-                }
-
-                Ok(())
-            })
-            .map_res("Error replacing group members")
-        })
-        .await?;
-
-        for member_uuid in &member_uuids {
-            if let Some(member) = Membership::find_by_uuid(member_uuid, conn).await {
-                User::update_uuid_revision(&member.user_uuid, conn).await;
-            }
-        }
-
-        Ok(())
-    }
-
     pub async fn find_by_member(member_uuid: &MembershipId, conn: &DbConn) -> Vec<Self> {
         conn.run(move |conn| {
             groups_users::table
@@ -678,12 +804,25 @@ impl GroupUser {
             None => warn!("Member could not be found!"),
         }
 
+        let now = Utc::now().naive_utc();
         conn.run(move |conn| {
-            diesel::delete(groups_users::table)
-                .filter(groups_users::groups_uuid.eq(group_uuid))
-                .filter(groups_users::users_organizations_uuid.eq(member_uuid))
-                .execute(conn)
-                .map_res("Error deleting group users")
+            conn.transaction::<_, diesel::result::Error, _>(|conn| {
+                let removed = diesel::delete(groups_users::table)
+                    .filter(groups_users::groups_uuid.eq(group_uuid))
+                    .filter(groups_users::users_organizations_uuid.eq(member_uuid))
+                    .execute(conn)?;
+
+                // Losing a member changes the group's `members`, and therefore the SCIM
+                // resource, so its `meta.lastModified` has to move with it.
+                if removed > 0 {
+                    diesel::update(groups::table.filter(groups::uuid.eq(group_uuid)))
+                        .set(groups::revision_date.eq(now))
+                        .execute(conn)?;
+                }
+
+                Ok(())
+            })
+            .map_res("Error deleting group users")
         })
         .await
     }
@@ -709,11 +848,31 @@ impl GroupUser {
             None => warn!("Member could not be found!"),
         }
 
+        let now = Utc::now().naive_utc();
         conn.run(move |conn| {
-            diesel::delete(groups_users::table)
-                .filter(groups_users::users_organizations_uuid.eq(member_uuid))
-                .execute(conn)
-                .map_res("Error deleting user groups")
+            conn.transaction::<_, diesel::result::Error, _>(|conn| {
+                // Every group this membership belonged to loses a member, so each of their SCIM
+                // representations changes and each `meta.lastModified` has to move. This is the
+                // indirect path: removing an organization member also edits every group they
+                // were in.
+                let affected: Vec<GroupId> = groups_users::table
+                    .filter(groups_users::users_organizations_uuid.eq(member_uuid))
+                    .select(groups_users::groups_uuid)
+                    .load(conn)?;
+
+                diesel::delete(groups_users::table)
+                    .filter(groups_users::users_organizations_uuid.eq(member_uuid))
+                    .execute(conn)?;
+
+                for chunk in affected.chunks(SQL_CHUNK) {
+                    diesel::update(groups::table.filter(groups::uuid.eq_any(chunk)))
+                        .set(groups::revision_date.eq(now))
+                        .execute(conn)?;
+                }
+
+                Ok(())
+            })
+            .map_res("Error deleting user groups")
         })
         .await
     }
@@ -731,6 +890,8 @@ impl GroupUser {
     Hash,
     PartialEq,
     Eq,
+    PartialOrd,
+    Ord,
     Serialize,
     Deserialize,
     UuidFromParam,

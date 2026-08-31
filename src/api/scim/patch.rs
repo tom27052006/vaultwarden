@@ -10,14 +10,17 @@
 //! strings -- and strict about everything else. An unsupported path is an error, never a silent
 //! no-op, because silently ignoring an operation makes a broken mapping look like a working one.
 
+use std::collections::HashSet;
+
 use serde_json::Value;
 
 use crate::db::models::MembershipId;
 
 use super::{
-    PATCH_OP_SCHEMA,
+    GROUP_SCHEMA, PATCH_OP_SCHEMA, QualifiedAttr, USER_SCHEMA,
     error::{ScimError, ScimResult, ScimType},
     filter::{CompValue, CompareOp, Filter, GROUP_ATTRS},
+    is_schema_urn, qualify,
     resource::{MAX_MEMBERS_PER_REQUEST, normalize_display_name, normalize_external_id, normalize_user_name},
 };
 
@@ -77,15 +80,22 @@ pub struct PatchPath {
     pub sub: Option<String>,
     /// Raw filter text from `attr[...]`, if present.
     pub filter: Option<String>,
+    /// True when the path named an attribute outside this resource type's core schema.
+    ///
+    /// Extension attributes are recognised rather than stripped, so an extension attribute that
+    /// happens to be called `active` or `members` can never be mistaken for the core one.
+    pub extension: bool,
 }
 
 impl PatchPath {
-    pub fn parse(raw: &str) -> ScimResult<Self> {
+    pub fn parse(raw: &str, core_schema: &str) -> ScimResult<Self> {
         let raw = raw.trim();
         if raw.is_empty() {
             return Err(ScimError::invalid_path("PATCH 'path' must not be empty."));
         }
 
+        // The bracketed part is split off first, so a colon inside a filter literal --
+        // `members[value eq "urn:x"]` -- can never be read as a namespace separator.
         let (head, filter, tail) = match (raw.find('['), raw.rfind(']')) {
             (Some(open), Some(close)) if close > open => {
                 (&raw[..open], Some(raw[open + 1..close].trim().to_owned()), &raw[close + 1..])
@@ -94,8 +104,14 @@ impl PatchPath {
             _ => return Err(ScimError::invalid_path(format!("Malformed PATCH path '{raw}'."))),
         };
 
-        // Strip a schema URN prefix: `urn:...:User:userName` -> `userName`.
-        let head = head.rsplit(':').next().unwrap_or(head);
+        // Namespace-aware: only this resource type's own schema prefix yields a core attribute.
+        let (head, extension) = match qualify(head, core_schema) {
+            QualifiedAttr::Core(name) => (name, false),
+            QualifiedAttr::Extension {
+                attr,
+                ..
+            } => (attr, true),
+        };
 
         // Without a filter the path may be `attr` or `attr.sub`; with one, any sub-attribute
         // follows the bracket as `.sub`.
@@ -124,6 +140,7 @@ impl PatchPath {
             attr,
             sub,
             filter,
+            extension,
         })
     }
 }
@@ -153,6 +170,10 @@ fn as_string(value: &Value) -> Option<&str> {
 ///
 /// Accepts the three shapes seen in the wild: an array of `{"value": id}` objects, a single such
 /// object, and a bare array of id strings.
+///
+/// Duplicates are collapsed, keeping first-occurrence order. A client repeating an id is harmless
+/// input, not an error, and de-duplicating here is what stops it reaching the database as a
+/// repeated `(group, member)` primary key.
 fn member_ids_from_value(value: &Value) -> ScimResult<Vec<MembershipId>> {
     fn one(entry: &Value) -> ScimResult<MembershipId> {
         let raw = match entry {
@@ -171,7 +192,7 @@ fn member_ids_from_value(value: &Value) -> ScimResult<Vec<MembershipId>> {
         Ok(MembershipId::from(trimmed.to_owned()))
     }
 
-    match value {
+    let ids = match value {
         Value::Array(entries) => {
             if entries.len() > MAX_MEMBERS_PER_REQUEST {
                 return Err(ScimError::bad_request(
@@ -179,10 +200,28 @@ fn member_ids_from_value(value: &Value) -> ScimResult<Vec<MembershipId>> {
                     format!("At most {MAX_MEMBERS_PER_REQUEST} members may be sent in one request."),
                 ));
             }
-            entries.iter().map(one).collect()
+            entries.iter().map(one).collect::<ScimResult<Vec<_>>>()?
         }
-        other => Ok(vec![one(other)?]),
+        other => vec![one(other)?],
+    };
+
+    Ok(dedup_preserving_order(ids))
+}
+
+/// Collapse repeated ids, keeping the first occurrence of each.
+///
+/// Set-based rather than `Vec::contains`, so a large member list stays linear.
+pub fn dedup_preserving_order(ids: Vec<MembershipId>) -> Vec<MembershipId> {
+    let mut seen: HashSet<MembershipId> = HashSet::with_capacity(ids.len());
+    let mut out = Vec::with_capacity(ids.len());
+
+    for id in ids {
+        if seen.insert(id.clone()) {
+            out.push(id);
+        }
     }
+
+    out
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -243,6 +282,7 @@ pub struct UserChanges {
 /// They are accepted and dropped rather than rejected: they are cosmetic, and failing the whole
 /// operation over them would break provisioning. See `docs/scim/design.md` section 7.
 const USER_IGNORED_ATTRS: &[&str] = &[
+    // Core User attributes Vaultwarden has nowhere to put.
     "displayname",
     "name",
     "nickname",
@@ -261,6 +301,15 @@ const USER_IGNORED_ATTRS: &[&str] = &[
     "profileurl",
     "password",
     "groups",
+    // EnterpriseUser attributes, which Entra ID maps by default. A fully qualified path is
+    // already recognised as an extension and ignored; these cover the unqualified spellings a
+    // client may use in a pathless operation.
+    "employeenumber",
+    "costcenter",
+    "organization",
+    "division",
+    "department",
+    "manager",
 ];
 
 pub fn plan_user_patch(request: &PatchRequest) -> ScimResult<UserChanges> {
@@ -288,13 +337,28 @@ fn apply_user_operation(changes: &mut UserChanges, op: PatchOp, operation: &Patc
         };
 
         for (key, value) in map {
-            let path = PatchPath::parse(key)?;
+            // A pathless value may nest a whole schema object under its URN, which is how Entra
+            // ID sends the enterprise extension. The core schema's own object is unwrapped; any
+            // other schema's is an extension and is ignored wholesale.
+            if is_schema_urn(key, USER_SCHEMA) {
+                if key.eq_ignore_ascii_case(USER_SCHEMA)
+                    && let Value::Object(inner) = value
+                {
+                    for (inner_key, inner_value) in inner {
+                        let path = PatchPath::parse(inner_key, USER_SCHEMA)?;
+                        apply_user_attribute(changes, op, &path, Some(inner_value))?;
+                    }
+                }
+                continue;
+            }
+
+            let path = PatchPath::parse(key, USER_SCHEMA)?;
             apply_user_attribute(changes, op, &path, Some(value))?;
         }
         return Ok(());
     };
 
-    let path = PatchPath::parse(raw_path)?;
+    let path = PatchPath::parse(raw_path, USER_SCHEMA)?;
     apply_user_attribute(changes, op, &path, operation.value.as_ref())
 }
 
@@ -304,6 +368,16 @@ fn apply_user_attribute(
     path: &PatchPath,
     value: Option<&Value>,
 ) -> ScimResult<()> {
+    // Anything outside the core User schema is an extension Vaultwarden does not store. Entra ID
+    // maps `urn:...:extension:enterprise:2.0:User:department` and friends by default, so failing
+    // here would break provisioning over attributes that are none of this server's business.
+    //
+    // This runs before the core dispatch on purpose: an extension attribute called `active` must
+    // be ignored, never treated as the core `active`.
+    if path.extension {
+        return Ok(());
+    }
+
     if path.filter.is_some() && path.attr != "emails" {
         return Err(ScimError::invalid_path(format!(
             "Value filters are not supported on '{}' for User resources.",
@@ -400,8 +474,8 @@ impl GroupChanges {
         !self.member_ops.is_empty()
     }
 
-    /// Every membership id this change set references, so the caller can validate them all
-    /// against the organization before writing anything.
+    /// Every distinct membership id this change set references, so the caller can validate them
+    /// all against the organization in one lookup before writing anything.
     pub fn referenced_members(&self) -> Vec<MembershipId> {
         let mut ids = Vec::new();
         for op in &self.member_ops {
@@ -410,7 +484,7 @@ impl GroupChanges {
                 MemberOp::RemoveAll => {}
             }
         }
-        ids
+        dedup_preserving_order(ids)
     }
 }
 
@@ -421,6 +495,16 @@ pub fn plan_group_patch(request: &PatchRequest) -> ScimResult<GroupChanges> {
     for operation in &request.operations {
         let op = PatchOp::parse(&operation.op)?;
         apply_group_operation(&mut changes, op, operation)?;
+    }
+
+    // The per-array cap only bounds one operation. A client can spread ids across many operations,
+    // so the whole change set is bounded too -- otherwise the limit is trivially side-stepped.
+    let referenced = changes.referenced_members().len();
+    if referenced > MAX_MEMBERS_PER_REQUEST {
+        return Err(ScimError::bad_request(
+            ScimType::TooMany,
+            format!("A PATCH request may reference at most {MAX_MEMBERS_PER_REQUEST} distinct members."),
+        ));
     }
 
     Ok(changes)
@@ -437,13 +521,25 @@ fn apply_group_operation(changes: &mut GroupChanges, op: PatchOp, operation: &Pa
         };
 
         for (key, value) in map {
-            let path = PatchPath::parse(key)?;
+            if is_schema_urn(key, GROUP_SCHEMA) {
+                if key.eq_ignore_ascii_case(GROUP_SCHEMA)
+                    && let Value::Object(inner) = value
+                {
+                    for (inner_key, inner_value) in inner {
+                        let path = PatchPath::parse(inner_key, GROUP_SCHEMA)?;
+                        apply_group_attribute(changes, op, &path, Some(inner_value))?;
+                    }
+                }
+                continue;
+            }
+
+            let path = PatchPath::parse(key, GROUP_SCHEMA)?;
             apply_group_attribute(changes, op, &path, Some(value))?;
         }
         return Ok(());
     };
 
-    let path = PatchPath::parse(raw_path)?;
+    let path = PatchPath::parse(raw_path, GROUP_SCHEMA)?;
     apply_group_attribute(changes, op, &path, operation.value.as_ref())
 }
 
@@ -453,6 +549,12 @@ fn apply_group_attribute(
     path: &PatchPath,
     value: Option<&Value>,
 ) -> ScimResult<()> {
+    // An extension attribute is never a core one, however it is spelled. In particular an
+    // extension attribute called `members` must not rewrite the group's membership.
+    if path.extension {
+        return Ok(());
+    }
+
     match path.attr.as_str() {
         "displayname" => {
             if path.filter.is_some() {
@@ -552,7 +654,7 @@ fn apply_member_operation(
 /// The filter text is untrusted, so it goes through the same validated parser the query filters
 /// use rather than any ad-hoc string handling.
 fn member_id_from_value_filter(attr: &str, filter_text: &str) -> ScimResult<MembershipId> {
-    let parsed = Filter::parse(&format!("{attr}[{filter_text}]"), GROUP_ATTRS)
+    let parsed = Filter::parse(&format!("{attr}[{filter_text}]"), GROUP_ATTRS, GROUP_SCHEMA)
         .map_err(|e| ScimError::invalid_path(format!("Unsupported member selection: {}", e.detail)))?;
 
     match parsed {
@@ -582,32 +684,42 @@ fn member_id_from_value_filter(attr: &str, filter_text: &str) -> ScimResult<Memb
 /// Apply a planned sequence of member operations to the current membership.
 ///
 /// Order is preserved and duplicates are collapsed, so re-adding an existing member is a no-op
-/// rather than a second row.
+/// rather than a second row -- which is also what keeps a repeated id from reaching the database
+/// as a duplicate primary key.
+///
+/// Membership is tracked in a set alongside the ordered vector, so a group with thousands of
+/// members costs O(n) rather than the O(n^2) a `Vec::contains` scan would.
+///
+/// Removing a member that is not in the group is a no-op, not an error: RFC 7644 section 3.5.2.2
+/// requires `remove` to succeed when the target is already absent.
 pub fn apply_member_ops(current: &[MembershipId], ops: &[MemberOp]) -> Vec<MembershipId> {
     let mut result: Vec<MembershipId> = current.to_vec();
+    let mut present: HashSet<MembershipId> = current.iter().cloned().collect();
 
     for op in ops {
         match op {
             MemberOp::Add(ids) => {
                 for id in ids {
-                    if !result.contains(id) {
+                    if present.insert(id.clone()) {
                         result.push(id.clone());
                     }
                 }
             }
             MemberOp::Remove(ids) => {
-                result.retain(|existing| !ids.contains(existing));
+                let dropped: HashSet<&MembershipId> = ids.iter().collect();
+                result.retain(|existing| !dropped.contains(existing));
+                for id in ids {
+                    present.remove(id);
+                }
             }
             MemberOp::Replace(ids) => {
-                let mut replacement: Vec<MembershipId> = Vec::with_capacity(ids.len());
-                for id in ids {
-                    if !replacement.contains(id) {
-                        replacement.push(id.clone());
-                    }
-                }
-                result = replacement;
+                result = dedup_preserving_order(ids.clone());
+                present = result.iter().cloned().collect();
             }
-            MemberOp::RemoveAll => result.clear(),
+            MemberOp::RemoveAll => {
+                result.clear();
+                present.clear();
+            }
         }
     }
 
@@ -678,7 +790,7 @@ mod tests {
 
     #[test]
     fn parses_simple_paths() {
-        let path = PatchPath::parse("active").unwrap();
+        let path = PatchPath::parse("active", USER_SCHEMA).unwrap();
         assert_eq!(path.attr, "active");
         assert_eq!(path.sub, None);
         assert_eq!(path.filter, None);
@@ -686,14 +798,14 @@ mod tests {
 
     #[test]
     fn parses_sub_attribute_paths() {
-        let path = PatchPath::parse("name.givenName").unwrap();
+        let path = PatchPath::parse("name.givenName", USER_SCHEMA).unwrap();
         assert_eq!(path.attr, "name");
         assert_eq!(path.sub.as_deref(), Some("givenname"));
     }
 
     #[test]
     fn parses_value_filter_paths() {
-        let path = PatchPath::parse(r#"members[value eq "abc"]"#).unwrap();
+        let path = PatchPath::parse(r#"members[value eq "abc"]"#, USER_SCHEMA).unwrap();
         assert_eq!(path.attr, "members");
         assert_eq!(path.filter.as_deref(), Some(r#"value eq "abc""#));
         assert_eq!(path.sub, None);
@@ -701,7 +813,7 @@ mod tests {
 
     #[test]
     fn parses_value_filter_paths_with_a_sub_attribute() {
-        let path = PatchPath::parse(r#"emails[type eq "work"].value"#).unwrap();
+        let path = PatchPath::parse(r#"emails[type eq "work"].value"#, USER_SCHEMA).unwrap();
         assert_eq!(path.attr, "emails");
         assert_eq!(path.filter.as_deref(), Some(r#"type eq "work""#));
         assert_eq!(path.sub.as_deref(), Some("value"));
@@ -709,18 +821,18 @@ mod tests {
 
     #[test]
     fn strips_a_schema_urn_from_a_path() {
-        let path = PatchPath::parse("urn:ietf:params:scim:schemas:core:2.0:User:active").unwrap();
+        let path = PatchPath::parse("urn:ietf:params:scim:schemas:core:2.0:User:active", USER_SCHEMA).unwrap();
         assert_eq!(path.attr, "active");
     }
 
     #[test]
     fn rejects_malformed_paths() {
-        assert!(PatchPath::parse("").is_err());
-        assert!(PatchPath::parse("   ").is_err());
-        assert!(PatchPath::parse("members[value eq \"a\"").is_err(), "unbalanced bracket");
-        assert!(PatchPath::parse("members]value[").is_err(), "reversed brackets");
-        assert!(PatchPath::parse("a.b.c").is_err(), "two levels of sub-attribute");
-        assert!(PatchPath::parse(r#"members[value eq "a"]x"#).is_err(), "junk after the bracket");
+        assert!(PatchPath::parse("", USER_SCHEMA).is_err());
+        assert!(PatchPath::parse("   ", USER_SCHEMA).is_err());
+        assert!(PatchPath::parse("members[value eq \"a\"", USER_SCHEMA).is_err(), "unbalanced bracket");
+        assert!(PatchPath::parse("members]value[", USER_SCHEMA).is_err(), "reversed brackets");
+        assert!(PatchPath::parse("a.b.c", USER_SCHEMA).is_err(), "two levels of sub-attribute");
+        assert!(PatchPath::parse(r#"members[value eq "a"]x"#, USER_SCHEMA).is_err(), "junk after the bracket");
     }
 
     // -- user patches --------------------------------------------------------------------------
@@ -1047,5 +1159,186 @@ mod tests {
     fn applying_no_operations_leaves_the_membership_alone() {
         let current = ids(&["a", "b"]);
         assert_eq!(apply_member_ops(&current, &[]), current);
+    }
+
+    // -- de-duplication -------------------------------------------------------------------------
+
+    #[test]
+    fn duplicate_member_ids_are_collapsed_in_first_occurrence_order() {
+        let deduped = dedup_preserving_order(ids(&["b", "a", "b", "c", "a"]));
+        assert_eq!(deduped, ids(&["b", "a", "c"]), "first occurrence wins, order is preserved");
+    }
+
+    #[test]
+    fn a_value_with_repeated_ids_yields_each_once() {
+        let request =
+            patch(json!({"Operations": [{"op": "Add", "path": "members", "value": [{"value": "a"}, {"value": "a"}]}]}));
+
+        assert_eq!(plan_group_patch(&request).unwrap().member_ops, vec![MemberOp::Add(ids(&["a"]))]);
+    }
+
+    #[test]
+    fn referenced_members_reports_distinct_ids() {
+        let request = patch(json!({
+            "Operations": [
+                {"op": "Add", "path": "members", "value": [{"value": "a"}, {"value": "b"}]},
+                {"op": "Remove", "path": "members", "value": [{"value": "a"}]},
+                {"op": "Add", "path": "members", "value": [{"value": "b"}]},
+            ],
+        }));
+
+        // Repeats across operations collapse, so the caller validates each id once.
+        assert_eq!(plan_group_patch(&request).unwrap().referenced_members(), ids(&["a", "b"]));
+    }
+
+    #[test]
+    fn adding_an_existing_member_is_a_no_op() {
+        let current = ids(&["a", "b"]);
+        assert_eq!(apply_member_ops(&current, &[MemberOp::Add(ids(&["a"]))]), current);
+    }
+
+    // -- request-wide limits --------------------------------------------------------------------
+
+    #[test]
+    fn the_member_cap_applies_across_the_whole_document() {
+        // The per-array cap bounds one operation; without a document-wide cap a client could
+        // simply split a huge membership across several operations.
+        let per_op = 600;
+        let ops: Vec<Value> = (0..10)
+            .map(|op| {
+                let values: Vec<Value> = (0..per_op).map(|i| json!({"value": format!("m-{op}-{i}")})).collect();
+                json!({"op": "Add", "path": "members", "value": values})
+            })
+            .collect();
+
+        let err = plan_group_patch(&patch(json!({"Operations": ops}))).unwrap_err();
+        assert_eq!(err.scim_type, Some(ScimType::TooMany));
+    }
+
+    #[test]
+    fn a_document_within_the_cap_is_accepted() {
+        let ops: Vec<Value> = (0..4)
+            .map(|op| {
+                let values: Vec<Value> = (0..500).map(|i| json!({"value": format!("m-{op}-{i}")})).collect();
+                json!({"op": "Add", "path": "members", "value": values})
+            })
+            .collect();
+
+        // 2000 distinct ids, comfortably under the limit.
+        let changes = plan_group_patch(&patch(json!({"Operations": ops}))).expect("within the cap");
+        assert_eq!(changes.referenced_members().len(), 2000);
+    }
+
+    #[test]
+    fn large_membership_operations_stay_linear() {
+        // A quadratic implementation would make this take minutes; it should be instant.
+        let current: Vec<MembershipId> = (0..5000).map(|i| MembershipId::from(format!("m{i}"))).collect();
+        let extra: Vec<MembershipId> = (5000..6000).map(|i| MembershipId::from(format!("m{i}"))).collect();
+
+        let result = apply_member_ops(&current, &[MemberOp::Add(extra), MemberOp::Remove(current[..2500].to_vec())]);
+
+        assert_eq!(result.len(), 3500);
+        assert_eq!(result[0], MembershipId::from("m2500".to_owned()), "order is preserved");
+    }
+
+    // -- namespace awareness --------------------------------------------------------------------
+
+    #[test]
+    fn a_core_qualified_path_is_the_core_attribute() {
+        let path = PatchPath::parse("urn:ietf:params:scim:schemas:core:2.0:User:active", USER_SCHEMA).unwrap();
+        assert_eq!(path.attr, "active");
+        assert!(!path.extension);
+    }
+
+    #[test]
+    fn an_extension_qualified_path_is_flagged_as_an_extension() {
+        for raw in [
+            "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:department",
+            "urn:example:Custom:active",
+            "urn:example:Custom:members",
+        ] {
+            let path = PatchPath::parse(raw, USER_SCHEMA).unwrap();
+            assert!(path.extension, "{raw} must be recognised as an extension");
+        }
+    }
+
+    #[test]
+    fn extension_attributes_are_ignored_rather_than_applied_or_rejected() {
+        // Ignoring them is what keeps Entra provisioning working; *not* aliasing them onto the
+        // core attribute is what keeps that safe.
+        let request = patch(json!({
+            "Operations": [
+                {"op": "Replace", "path": "urn:example:Custom:active", "value": false},
+                {"op": "Replace", "path": "active", "value": true},
+            ],
+        }));
+
+        let changes = plan_user_patch(&request).unwrap();
+        assert_eq!(changes.active, Some(true), "only the core attribute had an effect");
+    }
+
+    #[test]
+    fn an_extension_members_path_does_not_touch_group_membership() {
+        let request = patch(json!({
+            "Operations": [{"op": "Add", "path": "urn:example:Custom:members", "value": [{"value": "a"}]}],
+        }));
+
+        let changes = plan_group_patch(&request).unwrap();
+        assert!(!changes.touches_members(), "an extension `members` must not rewrite the membership");
+    }
+
+    #[test]
+    fn a_pathless_extension_object_is_ignored_wholesale() {
+        // The shape Entra ID sends for the enterprise extension.
+        let request = patch(json!({
+            "Operations": [{
+                "op": "Replace",
+                "value": {
+                    "active": false,
+                    "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {
+                        "department": "R&D",
+                        "manager": {"value": "someone"},
+                    },
+                },
+            }],
+        }));
+
+        let changes = plan_user_patch(&request).unwrap();
+        assert_eq!(changes.active, Some(false), "the core attribute alongside it still applies");
+    }
+
+    #[test]
+    fn a_pathless_core_schema_object_is_unwrapped() {
+        let request = patch(json!({
+            "Operations": [{
+                "op": "Replace",
+                "value": {"urn:ietf:params:scim:schemas:core:2.0:User": {"active": false}},
+            }],
+        }));
+
+        assert_eq!(plan_user_patch(&request).unwrap().active, Some(false));
+    }
+
+    #[test]
+    fn a_colon_inside_a_member_filter_is_not_a_namespace_separator() {
+        // The bracketed part is split off before the namespace is resolved, so a URN-looking
+        // member id cannot be mistaken for a schema prefix.
+        let path = PatchPath::parse(r#"members[value eq "urn:x:y"]"#, GROUP_SCHEMA).unwrap();
+        assert_eq!(path.attr, "members");
+        assert!(!path.extension);
+        assert_eq!(path.filter.as_deref(), Some(r#"value eq "urn:x:y""#));
+    }
+
+    // -- idempotent remove ----------------------------------------------------------------------
+
+    #[test]
+    fn removing_a_member_who_is_absent_is_not_an_error() {
+        // RFC 7644 section 3.5.2.2 requires `remove` to succeed when the target is already gone.
+        let current = ids(&["a"]);
+        assert_eq!(apply_member_ops(&current, &[MemberOp::Remove(ids(&["zzz"]))]), current);
+
+        let request = patch(json!({"Operations": [{"op": "Remove", "path": r#"members[value eq "zzz"]"#}]}));
+        let changes = plan_group_patch(&request).expect("planning a remove of a non-member must succeed");
+        assert_eq!(changes.member_ops, vec![MemberOp::Remove(ids(&["zzz"]))]);
     }
 }

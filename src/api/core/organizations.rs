@@ -2326,13 +2326,30 @@ async fn bulk_revoke_members(
 /// `display_name` is only used when this call *creates* the account. An account that already
 /// exists is never renamed, because its name is global and visible in every organization it
 /// belongs to.
+/// The state a directory integration wants a newly provisioned membership to start in.
+///
+/// This has to be known *before* provisioning runs, not applied afterwards: the invitation email
+/// and the `Invitation` record are side effects that cannot be taken back once they have happened.
+/// Provisioning somebody the identity provider marked inactive and then revoking them would still
+/// have told them they were invited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvisionState {
+    /// The usual case: invite the member and let them join.
+    Active,
+    /// Create the membership already revoked, and skip every invitation side effect.
+    Inactive,
+}
+
 pub async fn provision_org_member(
     org_id: &OrganizationId,
     email: &str,
     display_name: Option<String>,
     external_id: Option<String>,
+    state: ProvisionState,
     conn: &DbConn,
 ) -> ApiResult<Membership> {
+    let invite = state == ProvisionState::Active;
+
     let mut user_created = false;
     let user = if let Some(user) = User::find_by_mail(email, conn).await {
         user
@@ -2341,11 +2358,20 @@ pub async fn provision_org_member(
         // organization import creates.
         let mut new_user = User::new(email, display_name);
         new_user.save(conn).await?;
-
-        if !CONFIG.mail_enabled() {
-            Invitation::new(&new_user.email).save(conn).await?;
-        }
         user_created = true;
+
+        // The `Invitation` row is the credential that lets an unregistered account complete
+        // registration when mail is disabled. Creating one for a member the directory says is
+        // inactive would hand out a usable way in that the inactive state is supposed to deny.
+        // A later reactivation creates it then, when it is actually wanted.
+        if invite
+            && !CONFIG.mail_enabled()
+            && let Err(e) = Invitation::new(&new_user.email).save(conn).await
+        {
+            new_user.delete(conn).await?;
+            return Err(e);
+        }
+
         new_user
     };
 
@@ -2366,10 +2392,21 @@ pub async fn provision_org_member(
     new_member.access_all = false;
     new_member.atype = MembershipType::User as i32;
     new_member.status = member_status;
+    if !invite {
+        // Revoked from the outset, rather than created active and taken away afterwards.
+        new_member.revoke();
+    }
 
-    new_member.save(conn).await?;
+    if let Err(e) = new_member.save(conn).await {
+        // Do not leave behind an account that only exists to carry a membership that failed.
+        if user_created {
+            user.delete(conn).await?;
+        }
+        return Err(e);
+    }
 
-    if CONFIG.mail_enabled()
+    if invite
+        && CONFIG.mail_enabled()
         && let Err(e) =
             mail::send_invite(&user, org_id.clone(), new_member.uuid.clone(), &org_name, Some(org_email)).await
     {
@@ -2384,6 +2421,32 @@ pub async fn provision_org_member(
     }
 
     Ok(new_member)
+}
+
+/// Make sure an unregistered account has a usable way to accept an organization invitation.
+///
+/// Reactivating somebody who was provisioned inactive is the point at which the invitation they
+/// never received becomes wanted. Registered accounts need nothing: they can already sign in.
+pub async fn ensure_invitation_for(member: &Membership, conn: &DbConn) -> EmptyResult {
+    let Some(user) = User::find_by_uuid(&member.user_uuid, conn).await else {
+        err!("Membership has no account")
+    };
+
+    if !user.password_hash.is_empty() {
+        return Ok(());
+    }
+
+    let Some(org) = Organization::find_by_uuid(&member.org_uuid, conn).await else {
+        err!("Error looking up organization")
+    };
+
+    if CONFIG.mail_enabled() {
+        mail::send_invite(&user, member.org_uuid.clone(), member.uuid.clone(), &org.name, Some(org.billing_email)).await
+    } else if Invitation::find_by_mail(&user.email, conn).await.is_none() {
+        Invitation::new(&user.email).save(conn).await
+    } else {
+        Ok(())
+    }
 }
 
 /// Revoke a membership on behalf of a directory integration.

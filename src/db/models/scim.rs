@@ -153,14 +153,32 @@ impl OrganizationScimKey {
 
     /// Replace any existing key for this organization with a freshly generated one.
     ///
-    /// Deleting first (rather than updating in place) means the previous key id stops resolving
-    /// as well as the previous secret.
+    /// The delete and the insert run in one transaction, so the outcome is all or nothing: either
+    /// the old token is invalid and the new one works, or the old token keeps working and no
+    /// half-rotated state exists. Rotating in two steps would mean a failed insert destroyed a
+    /// working credential and left the organization with no way in.
+    ///
+    /// Deleting rather than updating in place means the previous key id stops resolving as well as
+    /// the previous secret.
     pub async fn rotate_for_org(org_uuid: &OrganizationId, conn: &DbConn) -> Result<String, crate::Error> {
-        Self::delete_all_by_organization(org_uuid, conn).await?;
+        let generated = Self::generate(org_uuid.clone());
+        let token = generated.token;
+        let key = generated.key;
 
-        let new_key = Self::generate(org_uuid.clone());
-        new_key.key.save(conn).await?;
-        Ok(new_key.token)
+        conn.run(move |conn| {
+            conn.transaction::<_, diesel::result::Error, _>(|conn| {
+                diesel::delete(organization_scim_key::table.filter(organization_scim_key::org_uuid.eq(&key.org_uuid)))
+                    .execute(conn)?;
+
+                diesel::insert_into(organization_scim_key::table).values(&key).execute(conn)?;
+
+                Ok(())
+            })
+            .map_res("Error rotating SCIM key")
+        })
+        .await?;
+
+        Ok(token)
     }
 
     pub async fn delete_all_by_organization(org_uuid: &OrganizationId, conn: &DbConn) -> EmptyResult {

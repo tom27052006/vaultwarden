@@ -788,10 +788,11 @@ make_config! {
         /// Max burst size for unauthenticated requests |> Allow a burst of requests of up to this size, while maintaining the average indicated by `unauthenticated_ratelimit_seconds`. This is shared between several endpoints, so it needs to be more lenient than the login one
         unauthenticated_ratelimit_max_burst: u32, false, def, 50;
 
-        /// Seconds between SCIM requests |> Number of seconds, on average, between SCIM requests from the same IP address before rate limiting kicks in
-        scim_ratelimit_seconds:        u64, false, def, 60;
-        /// Max burst size for SCIM requests |> Allow a burst of requests of up to this size, while maintaining the average indicated by `scim_ratelimit_seconds`. Identity providers sync in bursts, so this needs to be more lenient than the login one
-        scim_ratelimit_max_burst:      u32, false, def, 100;
+        /// Sustained SCIM requests per second |> Requests per second, per IP address, that SCIM provisioning may sustain.
+        /// A directory sync is high-volume by nature: a first full sync of a few thousand members is several thousand requests.
+        scim_ratelimit_per_second:     u32, false, def, 20;
+        /// Max burst size for SCIM requests |> Allow a burst of requests of up to this size, while maintaining the average indicated by `scim_ratelimit_per_second`
+        scim_ratelimit_max_burst:      u32, false, def, 1000;
 
         /// Seconds between admin login requests |> Number of seconds, on average, between admin requests from the same IP address before rate limiting kicks in
         admin_ratelimit_seconds:       u64, false, def, 300;

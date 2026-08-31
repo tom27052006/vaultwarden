@@ -42,8 +42,8 @@ Two related settings matter:
 Two optional settings tune the rate limiter:
 
 ```
-SCIM_RATELIMIT_SECONDS=60      # average seconds between requests from one IP
-SCIM_RATELIMIT_MAX_BURST=100   # burst allowance
+SCIM_RATELIMIT_PER_SECOND=20     # sustained requests per second, per IP
+SCIM_RATELIMIT_MAX_BURST=1000    # burst allowance on top of that
 ```
 
 The defaults suit a normal Entra ID sync cycle. Raise the burst if you provision a large directory
@@ -156,6 +156,16 @@ vault, exactly as for a manual invite. Until then the member has no access to or
 Members are also created with no collection assignments. Grant access through groups or through the
 web vault.
 
+### Provisioning somebody who is already inactive
+
+`POST /Users` with `"active": false` creates the membership **already revoked** and skips the
+invitation entirely — no invitation email, and no invitation record. Sending an invitation to
+somebody the identity provider marked as out of scope would contradict the state it asked for, and
+neither an email nor an invitation record can be taken back once created.
+
+A later `active: true` is the point at which the invitation becomes wanted, so reactivating an
+account that has never registered issues it then.
+
 ### Deactivation
 
 `active: false` **revokes** the membership. Organization access stops immediately, and the
@@ -189,9 +199,16 @@ your identity provider to deprovision with `active: false`.
 
 ### Privileged members
 
-SCIM **cannot modify a member whose role is Owner, Admin or Manager**. Such memberships are visible
-on `GET` (so the identity provider does not create a duplicate) but every `PUT`, `PATCH` and
-`DELETE` against them is refused with `403`.
+SCIM **cannot modify the `User` resource of a member whose role is Owner, Admin or Manager**. Such
+memberships are visible on `GET` (so the identity provider does not create a duplicate) but every
+`PUT`, `PATCH` and `DELETE` against `/Users/<id>` is refused with `403`.
+
+This protection covers the membership itself — its role, its active state and its existence. It
+does **not** cover group association: SCIM may add a privileged member to a group and remove them
+from one, exactly as it does for anyone else. That is a deliberate choice. Blocking it would fail
+an entire group synchronisation because one member happens to be an Owner, and an identity
+provider has no way to recover from that. The consequence is that group synchronisation can change
+a privileged member's group-derived collection access; see the security notes above.
 
 This is deliberate and is what makes the following true by construction:
 
@@ -223,8 +240,14 @@ to.
 
 Groups require `ORG_GROUPS_ENABLED=true`.
 
-* **Create** adds a Vaultwarden group with no collection access. Collections are assigned in the
-  web vault; SCIM never grants collection access.
+* **Create** adds a Vaultwarden group with no collection access of its own. Collection-to-group
+  assignments are made in the web vault and SCIM never creates or edits them.
+
+  That is **not** the same as "SCIM cannot grant access to secrets". Once a group has collection
+  assignments, adding a member to that group grants them the group's access, and removing them
+  revokes it. Since SCIM manages membership of every group in the organization — including groups
+  that existed before provisioning was switched on — group synchronisation genuinely changes who
+  can read organization secrets.
 * **Rename** and **externalId** updates work through `PUT` and `PATCH`.
 * **Membership** changes work through `PATCH` with `add`, `remove` and `replace` on `members`,
   including the `members[value eq "..."]` form older Azure AD connectors use.
@@ -252,6 +275,17 @@ Each organization has at most one SCIM token.
 
 * **Serve SCIM over HTTPS only.** The token is a bearer credential; anyone who observes it can
   provision and deprovision members of that organization until it is rotated.
+* **A SCIM token can change who has access to organization secrets.** SCIM never creates or edits
+  collection assignments, but adding somebody to a group that *already* has collection
+  assignments — or full access — grants them that access, and removing them takes it away. Group
+  synchronisation is therefore an access-control operation, not just directory bookkeeping. Treat
+  the token as an organization-level provisioning credential accordingly.
+* **SCIM can operate on groups it did not create.** It manages every group in the organization,
+  matched by `displayName` or `externalId`, not only ones a previous SCIM sync made. That is
+  deliberate — an operator usually wants the identity provider to take over the groups that
+  already exist — but it does mean an existing, highly privileged group can come under identity
+  provider control. Check which groups hold collection assignments before enabling provisioning.
+* **The token does not expire.** See [Known deviations](#known-deviations).
 * **The token is organization-scoped.** It cannot read or change anything outside its own
   organization, and it cannot touch privileged members even inside it.
 * **Only a hash is stored.** A database compromise does not yield usable tokens. The secret is 256
@@ -310,6 +344,23 @@ These are deliberate. Each is explained in [`design.md`](design.md).
    upstream value. The server log records which action it was.
 7. **Discovery endpoints require the bearer token**, although RFC 7644 permits them to be
    anonymous.
+8. **The SCIM token does not expire.** RFC 7644's security considerations say a bearer token
+   should have a lifetime the service provider can determine. Vaultwarden's is valid until an
+   administrator rotates or revokes it.
+
+   This is a deliberate deviation, not an oversight. A short-lived token would have to be replaced
+   by hand in the identity provider every time it expired — Microsoft Entra ID cannot fetch a new
+   one on its own — so a short expiry would either be switched off immediately or leave
+   provisioning silently broken at 3am. The mitigations actually in place are that the token is
+   organization-scoped, cannot touch a privileged member's role or existence, is stored only as a
+   hash, is rate limited, shows a `Last used` timestamp in `/admin` so a forgotten token is
+   visible, and can be revoked instantly.
+
+   Rotate it on whatever schedule you use for other long-lived integration credentials, and revoke
+   it as soon as an organization stops using SCIM.
+9. **`PATCH` is atomic per request, not serialisable against concurrent requests.** Two
+   simultaneous group updates each apply completely or not at all, but a client sending both at
+   once is not guaranteed a particular order.
 
 ## Troubleshooting
 
@@ -345,8 +396,9 @@ not already have one. Set `INVITATIONS_ALLOWED=true`.
 `SIGNUPS_DOMAINS_WHITELIST` excludes the directory's domain. Add it, or clear the whitelist.
 
 **Requests fail with 429**
-Raise `SCIM_RATELIMIT_MAX_BURST`, or lower `SCIM_RATELIMIT_SECONDS`, to suit the size of your
-directory.
+Raise `SCIM_RATELIMIT_MAX_BURST`, or `SCIM_RATELIMIT_PER_SECOND`, to suit the size of your
+directory. Requests carrying no bearer token, or a malformed one, are charged to
+`UNAUTHENTICATED_RATELIMIT_*` instead, so junk traffic cannot exhaust a real sync's allowance.
 
 **Nothing appears in the organization's event log**
 Set `ORG_EVENTS_ENABLED=true`.

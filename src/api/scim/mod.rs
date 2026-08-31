@@ -21,7 +21,7 @@ mod resource;
 mod settings;
 mod users;
 
-use std::{collections::HashSet, sync::LazyLock};
+use std::sync::LazyLock;
 
 use rocket::{Catcher, Request, Route, form::FromForm, http::ContentType};
 use serde_json::Value;
@@ -41,6 +41,62 @@ pub const PATCH_OP_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:PatchOp
 pub const SERVICE_PROVIDER_CONFIG_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig";
 pub const RESOURCE_TYPE_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:ResourceType";
 pub const SCHEMA_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:Schema";
+
+/// The enterprise extension Microsoft Entra ID maps attributes from by default.
+///
+/// Vaultwarden stores none of it. It is named here so those attributes can be *recognised* as
+/// extension attributes and ignored deliberately, rather than falling through to an error.
+pub const ENTERPRISE_USER_SCHEMA: &str = "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User";
+
+/// An attribute name that may carry a schema URN prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualifiedAttr<'a> {
+    /// An attribute of the resource type's own core schema.
+    Core(&'a str),
+    /// An attribute belonging to some other schema namespace.
+    Extension {
+        urn: &'a str,
+        attr: &'a str,
+    },
+}
+
+/// Split a possibly schema-qualified attribute name into its namespace and its name.
+///
+/// This exists because discarding everything before the last `:` -- the obvious shortcut -- lets
+/// an arbitrary extension attribute impersonate a core one. A client sending
+/// `urn:example:Whatever:active` must not end up toggling the core `active` attribute, and
+/// `urn:example:Whatever:members` must not rewrite a group's membership.
+///
+/// A name with no `:` is a core attribute. A name with one is core only when its prefix is
+/// exactly this resource type's core schema; anything else is an extension.
+///
+/// Callers that deal with value paths (`members[value eq "urn:x"]`) must strip the bracketed part
+/// before calling this, so a colon inside a filter literal cannot be mistaken for a namespace
+/// separator.
+pub fn qualify<'a>(raw: &'a str, core_schema: &str) -> QualifiedAttr<'a> {
+    let Some(idx) = raw.rfind(':') else {
+        return QualifiedAttr::Core(raw);
+    };
+
+    let (urn, attr) = (&raw[..idx], &raw[idx + 1..]);
+
+    if urn.eq_ignore_ascii_case(core_schema) {
+        QualifiedAttr::Core(attr)
+    } else {
+        QualifiedAttr::Extension {
+            urn,
+            attr,
+        }
+    }
+}
+
+/// Is this name itself a schema URN rather than an attribute within one?
+///
+/// A pathless `PATCH` may carry a whole extension object keyed by its URN, as Entra ID does with
+/// `{"urn:...:extension:enterprise:2.0:User": {"department": "..."}}`.
+pub fn is_schema_urn(raw: &str, core_schema: &str) -> bool {
+    raw.eq_ignore_ascii_case(core_schema) || raw.eq_ignore_ascii_case(ENTERPRISE_USER_SCHEMA)
+}
 
 /// Where the SCIM routes are mounted, relative to the configured domain path.
 pub const SCIM_BASE_PATH: &str = "/scim/v2";
@@ -247,79 +303,204 @@ impl Pagination {
     }
 }
 
-/// `attributes` / `excludedAttributes` handling (RFC 7644 section 3.9).
-///
-/// Only top-level attributes are supported, which is what identity providers actually use --
-/// Entra ID asks for groups with `excludedAttributes=members` so it does not have to receive a
-/// membership list it is about to overwrite.
-pub struct AttributeProjection {
-    include: Option<HashSet<String>>,
-    exclude: HashSet<String>,
+/// One entry of an `attributes` / `excludedAttributes` list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttrRef {
+    /// Lower-case top-level attribute.
+    attr: String,
+    /// Lower-case sub-attribute, when the client named one (`emails.value`).
+    sub: Option<String>,
 }
 
-/// Attributes that are always returned, whatever the client asks for. RFC 7644 section 3.9 makes
-/// `id`, `schemas` and `meta` non-excludable.
-const ALWAYS_RETURNED: [&str; 3] = ["id", "schemas", "meta"];
+/// `attributes` / `excludedAttributes` handling (RFC 7644 section 3.9).
+///
+/// The two are mutually exclusive; supplying both is a client error rather than something to
+/// silently reconcile.
+///
+/// `id` and `schemas` are the minimum response set and always survive. `meta` does **not**: RFC
+/// 7643 gives it `returned: default`, so `attributes=userName` legitimately omits it.
+#[derive(Debug)]
+pub struct AttributeProjection {
+    include: Option<Vec<AttrRef>>,
+    exclude: Vec<AttrRef>,
+}
+
+/// The minimum response set. RFC 7644 section 3.9 keeps `id` and the `schemas` declaration in
+/// every representation regardless of what the client asked for.
+const MINIMUM_RETURNED: [&str; 2] = ["id", "schemas"];
 
 impl AttributeProjection {
-    pub fn parse(attributes: Option<&str>, excluded: Option<&str>) -> Self {
-        fn split(raw: Option<&str>) -> Option<HashSet<String>> {
-            let set: HashSet<String> = raw?
+    pub fn parse(attributes: Option<&str>, excluded: Option<&str>) -> ScimResult<Self> {
+        /// Parse one comma-separated list.
+        ///
+        /// Returns `None` only when the parameter was absent or blank. A list that names nothing
+        /// this server renders -- only extension attributes, say -- yields `Some(vec![])`, so
+        /// `attributes=urn:example:Custom:foo` correctly narrows the response to the minimum set
+        /// instead of being mistaken for "no projection requested".
+        fn split(raw: Option<&str>, core_schema: &str) -> Option<Vec<AttrRef>> {
+            let raw = raw?;
+            if raw.trim().is_empty() {
+                return None;
+            }
+
+            let refs: Vec<AttrRef> = raw
                 .split(',')
-                .map(|a| {
-                    // Tolerate a fully-qualified name: `urn:...:User:userName` -> `username`.
-                    let a = a.trim();
-                    let a = a.rsplit(':').next().unwrap_or(a);
-                    // Only top-level attributes are honoured, so drop any sub-attribute.
-                    a.split('.').next().unwrap_or(a).to_lowercase()
+                .filter_map(|entry| {
+                    // Namespace-aware: an extension attribute must not be mistaken for the core
+                    // attribute that happens to share its final name.
+                    let name = match qualify(entry.trim(), core_schema) {
+                        QualifiedAttr::Core(name) => name,
+                        // Nothing in an extension namespace is ever rendered, so naming one in
+                        // either list has no effect.
+                        QualifiedAttr::Extension {
+                            ..
+                        } => return None,
+                    };
+
+                    let (attr, sub) = match name.split_once('.') {
+                        Some((attr, sub)) => (attr, Some(sub.to_lowercase())),
+                        None => (name, None),
+                    };
+
+                    let attr = attr.trim().to_lowercase();
+                    if attr.is_empty() {
+                        return None;
+                    }
+                    Some(AttrRef {
+                        attr,
+                        sub,
+                    })
                 })
-                .filter(|a| !a.is_empty())
                 .collect();
 
-            if set.is_empty() {
-                None
-            } else {
-                Some(set)
-            }
+            Some(refs)
         }
 
-        Self {
-            include: split(attributes),
-            exclude: split(excluded).unwrap_or_default(),
+        /// A projection list may name attributes of either resource type, so both core schemas
+        /// are tried and the union is kept; anything in a third namespace is an extension and is
+        /// dropped by `split`.
+        fn split_either(raw: Option<&str>) -> Option<Vec<AttrRef>> {
+            let mut refs = split(raw, USER_SCHEMA)?;
+            for entry in split(raw, GROUP_SCHEMA).unwrap_or_default() {
+                if !refs.contains(&entry) {
+                    refs.push(entry);
+                }
+            }
+            Some(refs)
         }
+
+        let has_attributes = attributes.is_some_and(|a| !a.trim().is_empty());
+        let has_excluded = excluded.is_some_and(|a| !a.trim().is_empty());
+        if has_attributes && has_excluded {
+            return Err(ScimError::invalid_value(
+                "'attributes' and 'excludedAttributes' are mutually exclusive; send at most one.",
+            ));
+        }
+
+        Ok(Self {
+            include: split_either(attributes),
+            exclude: split_either(excluded).unwrap_or_default(),
+        })
     }
 
     pub fn none() -> Self {
         Self {
             include: None,
-            exclude: HashSet::new(),
+            exclude: Vec::new(),
         }
     }
 
-    /// Does the caller want this attribute rendered at all?
+    /// Could this attribute appear in the response at all?
     ///
-    /// Used to skip work as well as output: when `members` is excluded there is no reason to load
-    /// a group's membership from the database.
+    /// Used to skip work as well as output: when `members` is excluded outright there is no reason
+    /// to load a group's membership from the database. An exclusion that only names a
+    /// *sub*-attribute still needs the attribute loaded, so it does not suppress the work.
     pub fn wants(&self, attribute: &str) -> bool {
         let attribute = attribute.to_lowercase();
-        if ALWAYS_RETURNED.contains(&attribute.as_str()) {
+        if MINIMUM_RETURNED.contains(&attribute.as_str()) {
             return true;
         }
-        if self.exclude.contains(&attribute) {
+        if self.exclude.iter().any(|e| e.attr == attribute && e.sub.is_none()) {
             return false;
         }
         match &self.include {
-            Some(include) => include.contains(&attribute),
+            Some(include) => include.iter().any(|i| i.attr == attribute),
             None => true,
         }
     }
 
+    /// Apply a sub-attribute projection to a complex value, in place.
+    ///
+    /// Handles both a single object and an array of objects, which is what SCIM's multi-valued
+    /// complex attributes look like on the wire.
+    fn project_complex(value: &mut Value, keep: Option<&[String]>, drop: &[String]) {
+        fn project_object(object: &mut Value, keep: Option<&[String]>, drop: &[String]) {
+            let Value::Object(map) = object else {
+                return;
+            };
+            map.retain(|key, _| {
+                let key = key.to_lowercase();
+                if drop.contains(&key) {
+                    return false;
+                }
+                match keep {
+                    Some(keep) => keep.contains(&key),
+                    None => true,
+                }
+            });
+        }
+
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    project_object(item, keep, drop);
+                }
+            }
+            other => project_object(other, keep, drop),
+        }
+    }
+
     pub fn apply(&self, resource: Value) -> Value {
-        let Value::Object(map) = resource else {
+        let Value::Object(mut map) = resource else {
             return resource;
         };
 
-        Value::Object(map.into_iter().filter(|(key, _)| self.wants(key)).collect())
+        map.retain(|key, _| self.wants(key));
+
+        // Now narrow the complex attributes that survived. Excluding one sub-attribute removes
+        // only that sub-attribute; it must not take the whole parent with it.
+        let keys: Vec<String> = map.keys().cloned().collect();
+        for key in keys {
+            let lower = key.to_lowercase();
+            if MINIMUM_RETURNED.contains(&lower.as_str()) {
+                continue;
+            }
+
+            let drop: Vec<String> =
+                self.exclude.iter().filter(|e| e.attr == lower).filter_map(|e| e.sub.clone()).collect();
+
+            let keep: Option<Vec<String>> = self.include.as_ref().and_then(|include| {
+                let subs: Vec<String> =
+                    include.iter().filter(|i| i.attr == lower).filter_map(|i| i.sub.clone()).collect();
+                // `attributes=emails` asks for the whole attribute, so only narrow when every
+                // reference to it named a sub-attribute.
+                let named_whole = include.iter().any(|i| i.attr == lower && i.sub.is_none());
+                if subs.is_empty() || named_whole {
+                    None
+                } else {
+                    Some(subs)
+                }
+            });
+
+            if drop.is_empty() && keep.is_none() {
+                continue;
+            }
+            if let Some(value) = map.get_mut(&key) {
+                Self::project_complex(value, keep.as_deref(), &drop);
+            }
+        }
+
+        Value::Object(map)
     }
 }
 
@@ -464,18 +645,34 @@ mod tests {
         })
     }
 
+    fn user() -> Value {
+        json!({
+            "schemas": [USER_SCHEMA],
+            "id": "member-1",
+            "externalId": "ext-1",
+            "userName": "alice@example.test",
+            "displayName": "Alice",
+            "active": true,
+            "emails": [{"value": "alice@example.test", "type": "work", "primary": true}],
+            "meta": {"resourceType": "User", "location": "https://vault.test/x"},
+        })
+    }
+
+    fn projection(attributes: Option<&str>, excluded: Option<&str>) -> AttributeProjection {
+        AttributeProjection::parse(attributes, excluded).expect("valid projection")
+    }
+
     #[test]
     fn projection_defaults_to_returning_everything() {
-        let projection = AttributeProjection::none();
-        assert_eq!(projection.apply(group()), group());
+        assert_eq!(AttributeProjection::none().apply(group()), group());
     }
 
     #[test]
     fn excluded_attributes_are_dropped() {
         // This is the request Entra ID makes when it looks a group up by name.
-        let projection = AttributeProjection::parse(None, Some("members"));
+        let projection = projection(None, Some("members"));
 
-        assert!(!projection.wants("members"));
+        assert!(!projection.wants("members"), "excluding it outright also skips loading it");
         let projected = projection.apply(group());
         assert!(projected.get("members").is_none());
         assert_eq!(projected["displayName"], json!("Engineering"));
@@ -483,42 +680,170 @@ mod tests {
 
     #[test]
     fn requested_attributes_are_the_only_optional_ones_returned() {
-        let projection = AttributeProjection::parse(Some("displayName"), None);
+        let projected = projection(Some("displayName"), None).apply(group());
 
-        let projected = projection.apply(group());
         assert_eq!(projected["displayName"], json!("Engineering"));
         assert!(projected.get("externalId").is_none());
         assert!(projected.get("members").is_none());
     }
 
     #[test]
-    fn id_schemas_and_meta_survive_any_projection() {
-        // RFC 7644 section 3.9 makes these non-excludable.
-        let projection = AttributeProjection::parse(Some("displayName"), Some("id,schemas,meta"));
-        let projected = projection.apply(group());
+    fn id_and_schemas_survive_any_projection() {
+        // RFC 7644 section 3.9 keeps these in the minimum response set.
+        let projected = projection(Some("displayName"), None).apply(group());
 
         assert_eq!(projected["id"], json!("group-1"));
         assert_eq!(projected["schemas"], json!([GROUP_SCHEMA]));
-        assert_eq!(projected["meta"]["resourceType"], json!("Group"));
     }
 
     #[test]
-    fn projection_accepts_qualified_and_sub_attribute_names() {
-        let projection =
-            AttributeProjection::parse(None, Some("urn:ietf:params:scim:schemas:core:2.0:Group:members.value"));
-        assert!(!projection.wants("members"), "a sub-attribute exclusion drops the whole attribute");
+    fn meta_is_returned_by_default_but_is_not_mandatory() {
+        // RFC 7643 gives `meta` `returned: default`, not `returned: always`, so asking for a
+        // specific attribute list legitimately leaves it out.
+        assert!(AttributeProjection::none().apply(user()).get("meta").is_some());
+        assert!(projection(Some("userName"), None).apply(user()).get("meta").is_none());
+        assert!(projection(None, Some("meta")).apply(user()).get("meta").is_none());
+        assert!(projection(Some("userName,meta"), None).apply(user()).get("meta").is_some());
+    }
+
+    #[test]
+    fn a_sub_attribute_can_be_selected() {
+        let projected = projection(Some("emails.value"), None).apply(user());
+
+        let email = &projected["emails"][0];
+        assert_eq!(email["value"], json!("alice@example.test"));
+        assert!(email.get("type").is_none(), "only the named sub-attribute is kept");
+        assert!(email.get("primary").is_none());
+    }
+
+    #[test]
+    fn excluding_a_sub_attribute_keeps_the_parent() {
+        let projected = projection(None, Some("emails.type")).apply(user());
+
+        let email = &projected["emails"][0];
+        assert!(email.get("type").is_none(), "the named sub-attribute is gone");
+        assert_eq!(email["value"], json!("alice@example.test"), "the rest of the parent survives");
+        assert_eq!(email["primary"], json!(true));
+    }
+
+    #[test]
+    fn naming_the_whole_attribute_wins_over_a_sub_attribute() {
+        let projected = projection(Some("emails,emails.value"), None).apply(user());
+
+        assert!(projected["emails"][0].get("type").is_some(), "asking for `emails` asks for all of it");
+    }
+
+    #[test]
+    fn attributes_and_excluded_attributes_are_mutually_exclusive() {
+        // RFC 7644 section 3.9. Reconciling them silently would guess at the client's intent.
+        let err = AttributeProjection::parse(Some("userName"), Some("emails")).unwrap_err();
+        assert_eq!(err.status, rocket::http::Status::BadRequest);
+        assert_eq!(err.scim_type, Some(error::ScimType::InvalidValue));
+    }
+
+    #[test]
+    fn a_qualified_core_attribute_is_recognised() {
+        let projection = projection(None, Some("urn:ietf:params:scim:schemas:core:2.0:Group:members"));
+        assert!(!projection.wants("members"));
+    }
+
+    #[test]
+    fn an_extension_attribute_never_projects_a_core_one() {
+        // The final segment is `members`, but the namespace is not the Group core schema, so it
+        // must not act on the core `members`.
+        let projection = projection(None, Some("urn:example:Custom:members"));
+        assert!(projection.wants("members"), "an extension attribute must not exclude the core one");
+        assert!(projection.apply(group()).get("members").is_some());
+    }
+
+    #[test]
+    fn asking_only_for_extension_attributes_returns_the_minimum_set() {
+        // The list named nothing this server renders. That is not the same as naming nothing at
+        // all, so the response narrows to `id` and `schemas` rather than returning everything.
+        let projected = projection(Some("urn:example:Custom:foo"), None).apply(group());
+
+        assert_eq!(projected["id"], json!("group-1"));
+        assert_eq!(projected["schemas"], json!([GROUP_SCHEMA]));
+        assert!(projected.get("displayName").is_none(), "an unsatisfiable list must not return everything");
+        assert!(projected.get("members").is_none());
+    }
+
+    #[test]
+    fn a_projection_may_mix_user_and_group_attribute_names() {
+        // The two lists are tried against both core schemas and unioned, so a qualified name for
+        // either resource type is honoured.
+        let projection = projection(
+            Some(
+                "urn:ietf:params:scim:schemas:core:2.0:Group:displayName,urn:ietf:params:scim:schemas:core:2.0:User:userName",
+            ),
+            None,
+        );
+
+        assert!(projection.wants("displayname"));
+        assert!(projection.wants("username"));
+        assert!(!projection.wants("members"));
     }
 
     #[test]
     fn projection_is_case_insensitive() {
-        let projection = AttributeProjection::parse(None, Some("MEMBERS"));
+        let projection = projection(None, Some("MEMBERS"));
         assert!(!projection.wants("members"));
         assert!(!projection.wants("Members"));
     }
 
     #[test]
     fn empty_projection_strings_are_ignored() {
-        let projection = AttributeProjection::parse(Some(""), Some(" , "));
+        let projection = projection(Some(""), Some(" , "));
         assert!(projection.wants("displayName"), "an empty attributes list must not hide everything");
+    }
+
+    // -- namespace awareness ---------------------------------------------------------------------
+
+    #[test]
+    fn qualify_recognises_the_core_schema() {
+        assert_eq!(qualify("active", USER_SCHEMA), QualifiedAttr::Core("active"));
+        assert_eq!(
+            qualify("urn:ietf:params:scim:schemas:core:2.0:User:active", USER_SCHEMA),
+            QualifiedAttr::Core("active")
+        );
+        // The URN comparison is case-insensitive, as URNs are.
+        assert_eq!(
+            qualify("URN:IETF:PARAMS:SCIM:SCHEMAS:CORE:2.0:USER:active", USER_SCHEMA),
+            QualifiedAttr::Core("active")
+        );
+    }
+
+    #[test]
+    fn qualify_never_aliases_an_extension_onto_a_core_attribute() {
+        // This is the whole point: an extension attribute whose final name collides with a core
+        // one must stay an extension.
+        for name in ["active", "userName", "externalId", "members", "id"] {
+            let raw = format!("urn:example:Custom:{name}");
+            assert_eq!(
+                qualify(&raw, USER_SCHEMA),
+                QualifiedAttr::Extension {
+                    urn: "urn:example:Custom",
+                    attr: name,
+                },
+                "{raw} must not be treated as core"
+            );
+        }
+    }
+
+    #[test]
+    fn the_group_schema_is_not_the_user_schema() {
+        // A Group-qualified attribute is an extension from the User resource's point of view.
+        assert!(matches!(
+            qualify("urn:ietf:params:scim:schemas:core:2.0:Group:members", USER_SCHEMA),
+            QualifiedAttr::Extension { .. }
+        ));
+    }
+
+    #[test]
+    fn enterprise_extension_objects_are_recognised_as_schema_urns() {
+        assert!(is_schema_urn(ENTERPRISE_USER_SCHEMA, USER_SCHEMA));
+        assert!(is_schema_urn(USER_SCHEMA, USER_SCHEMA));
+        assert!(!is_schema_urn("urn:example:Custom", USER_SCHEMA));
+        assert!(!is_schema_urn("active", USER_SCHEMA));
     }
 }

@@ -28,8 +28,10 @@ pub fn routes() -> Vec<Route> {
 #[expect(clippy::needless_pass_by_value, reason = "Rocket request guards are taken by value")]
 fn service_provider_config(org_id: &str, token: ScimToken) -> ScimResult<ScimResponse> {
     let ctx = ScimContext::resolve(&token, org_id)?;
+    let location = format!("{}/ServiceProviderConfig", ctx.base_url());
 
-    Ok(ScimResponse::ok(json!({
+    Ok(ScimResponse::resource(
+        json!({
         "schemas": [SERVICE_PROVIDER_CONFIG_SCHEMA],
         "documentationUri": "https://github.com/dani-garcia/vaultwarden/blob/main/docs/scim/README.md",
         "patch": { "supported": true },
@@ -49,9 +51,17 @@ fn service_provider_config(org_id: &str, token: ScimToken) -> ScimResult<ScimRes
         }],
         "meta": {
             "resourceType": "ServiceProviderConfig",
-            "location": format!("{}/ServiceProviderConfig", ctx.base_url()),
+            "location": location,
         },
-    })))
+        }),
+        location,
+    ))
+}
+
+/// Wrap a single discovery resource, mirroring its own `meta.location` into `Content-Location`.
+fn single_resource(body: Value) -> ScimResponse {
+    let location = body["meta"]["location"].as_str().unwrap_or_default().to_owned();
+    ScimResponse::resource(body, location)
 }
 
 /// Resource types this server exposes.
@@ -114,7 +124,7 @@ fn resource_type(org_id: &str, type_id: &str, token: ScimToken) -> ScimResult<Sc
     resource_type_definitions(&ctx)
         .into_iter()
         .find(|t| t["id"].as_str().is_some_and(|id| id.eq_ignore_ascii_case(type_id)))
-        .map(ScimResponse::ok)
+        .map(single_resource)
         .ok_or_else(|| ScimError::not_found(format!("Resource type '{type_id}' is not supported.")))
 }
 
@@ -146,10 +156,20 @@ fn user_schema(ctx: &ScimContext) -> Value {
         "id": USER_SCHEMA,
         "name": "User",
         "description": "Organization member",
+        // The mutability values here are what the implementation actually enforces, not what a
+        // stock Core User schema would say. Two deliberate deviations, both documented in
+        // docs/scim/design.md:
+        //
+        // * `userName` is `immutable` rather than `readWrite`. It maps to the account's global
+        //   email address -- the login identity every other organization resolves through -- so
+        //   SCIM sets it at creation and refuses any later change.
+        // * `displayName` is `immutable` rather than `readWrite`. It is used only when this
+        //   request creates a brand-new account; an existing account keeps its own name, because
+        //   that name is visible in every organization it belongs to.
         "attributes": [
             attribute("userName", "string", false, true, "immutable", "server", false),
             attribute("externalId", "string", false, false, "readWrite", "none", true),
-            attribute("displayName", "string", false, false, "readOnly", "none", false),
+            attribute("displayName", "string", false, false, "immutable", "none", false),
             attribute("active", "boolean", false, false, "readWrite", "none", false),
             json!({
                 "name": "emails",
@@ -178,8 +198,10 @@ fn group_schema(ctx: &ScimContext) -> Value {
         "id": GROUP_SCHEMA,
         "name": "Group",
         "description": "Organization group",
+        // `displayName` is advertised as server-unique because that is enforced, on create and on
+        // rename alike: identity providers treat it as a group's natural key.
         "attributes": [
-            attribute("displayName", "string", false, true, "readWrite", "none", false),
+            attribute("displayName", "string", false, true, "readWrite", "server", false),
             attribute("externalId", "string", false, false, "readWrite", "none", true),
             json!({
                 "name": "members",
@@ -231,6 +253,6 @@ fn schema(org_id: &str, schema_id: &str, token: ScimToken) -> ScimResult<ScimRes
     schema_definitions(&ctx)
         .into_iter()
         .find(|s| s["id"].as_str() == Some(schema_id))
-        .map(ScimResponse::ok)
+        .map(single_resource)
         .ok_or_else(|| ScimError::not_found(format!("Schema '{schema_id}' is not supported.")))
 }

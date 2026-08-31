@@ -11,7 +11,7 @@ use crate::{
     CONFIG,
     api::{
         EmptyResult,
-        core::organizations::{provision_org_member, try_restore_member, try_revoke_member},
+        core::organizations::{ProvisionState, provision_org_member, try_restore_member, try_revoke_member},
     },
     auth,
     db::{
@@ -95,8 +95,17 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
         } else {
             // If user is not part of the organization, create the account and membership
             // The Directory Connector import carries no display name, so accounts it creates keep
-            // getting their email as their name, exactly as before.
-            provision_org_member(&org_id, &user_data.email, None, Some(user_data.external_id.clone()), &conn).await?;
+            // getting their email as their name, and it always provisions active members, exactly
+            // as before.
+            provision_org_member(
+                &org_id,
+                &user_data.email,
+                None,
+                Some(user_data.external_id.clone()),
+                ProvisionState::Active,
+                &conn,
+            )
+            .await?;
         }
     }
 

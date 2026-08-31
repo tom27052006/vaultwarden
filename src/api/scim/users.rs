@@ -17,7 +17,9 @@ use crate::{
         Notify, UpdateType,
         core::{
             log_event,
-            organizations::{provision_org_member, try_restore_member, try_revoke_member},
+            organizations::{
+                ProvisionState, ensure_invitation_for, provision_org_member, try_restore_member, try_revoke_member,
+            },
         },
     },
     db::{
@@ -67,7 +69,9 @@ fn ensure_manageable(view: &UserView) -> ScimResult<()> {
         return Ok(());
     }
 
-    Err(ScimError::forbidden(format!(
+    // A genuine mutability fault: the client asked to change a resource this server treats as
+    // read-only, as opposed to an authorization or policy refusal.
+    Err(ScimError::read_only(format!(
         "User '{}' holds a privileged organization role and cannot be modified through SCIM. \
          Change the member's role to 'User' in the web vault first.",
         view.id
@@ -176,10 +180,18 @@ async fn narrow_by_index(ctx: &ScimContext, filter: &Filter, conn: &DbConn) -> O
                 None => None,
             }
         }
-        "externalid" => match Membership::find_by_external_id_and_org(value, &ctx.org_id, conn).await {
-            Some(member) => User::find_by_uuid(&member.user_uuid, conn).await.map(|user| (member, user)),
-            None => None,
-        },
+        "externalid" => {
+            // Every match, not just the first: `external_id` has no unique constraint and legacy
+            // Directory Connector data may already contain duplicates, so returning one row would
+            // make the optimisation silently drop resources from a filtered listing.
+            let mut rows = Vec::new();
+            for member in Membership::find_all_by_external_id_and_org(value, &ctx.org_id, conn).await {
+                if let Some(user) = User::find_by_uuid(&member.user_uuid, conn).await {
+                    rows.push((member, user));
+                }
+            }
+            return Some(rows);
+        }
         _ => return None,
     };
 
@@ -191,11 +203,11 @@ async fn get_users(org_id: &str, query: ListQuery, token: ScimToken, conn: DbCon
     let ctx = ScimContext::resolve(&token, org_id)?;
 
     let pagination = Pagination::parse(query.start_index.as_deref(), query.count.as_deref())?;
-    let projection = AttributeProjection::parse(query.attributes.as_deref(), query.excluded_attributes.as_deref());
+    let projection = AttributeProjection::parse(query.attributes.as_deref(), query.excluded_attributes.as_deref())?;
 
-    let filter = query.filter.as_deref().map(|raw| Filter::parse(raw, USER_ATTRS)).transpose()?;
+    let filter = query.filter.as_deref().map(|raw| Filter::parse(raw, USER_ATTRS, USER_SCHEMA)).transpose()?;
 
-    let views: Vec<UserView> = match &filter {
+    let mut views: Vec<UserView> = match &filter {
         Some(filter) => {
             // An equality the filter requires becomes one indexed query instead of a scan; the
             // full filter is then applied to whatever that returned, so narrowing can never
@@ -218,6 +230,10 @@ async fn get_users(org_id: &str, query: ListQuery, token: ScimToken, conn: DbCon
             .collect(),
     };
 
+    // Paging slices this list, so it needs a defined order. Without one, two requests over an
+    // unchanged collection could return the same resource twice or skip it entirely.
+    views.sort_by(|a, b| a.id.cmp(&b.id));
+
     let total = views.len();
     let page = pagination.slice_range(total);
     let resources: Vec<Value> = views[page]
@@ -228,13 +244,23 @@ async fn get_users(org_id: &str, query: ListQuery, token: ScimToken, conn: DbCon
     Ok(ScimResponse::ok(list_response(total, &pagination, resources)))
 }
 
-#[get("/<org_id>/Users/<user_id>")]
-async fn get_user(org_id: &str, user_id: &str, token: ScimToken, conn: DbConn) -> ScimResult<ScimResponse> {
+#[get("/<org_id>/Users/<user_id>?<query..>")]
+async fn get_user(
+    org_id: &str,
+    user_id: &str,
+    query: ListQuery,
+    token: ScimToken,
+    conn: DbConn,
+) -> ScimResult<ScimResponse> {
     let ctx = ScimContext::resolve(&token, org_id)?;
     let (member, user) = load_member(&ctx, user_id, &conn).await?;
     let view = UserView::from_membership(&member, &user);
 
-    Ok(ScimResponse::ok(view.to_json(&ctx.resource_location("User", &view.id))))
+    // Projection applies to every representation, not just list endpoints.
+    let projection = AttributeProjection::parse(query.attributes.as_deref(), query.excluded_attributes.as_deref())?;
+
+    let location = ctx.resource_location("User", &view.id);
+    Ok(ScimResponse::resource(projection.apply(view.to_json(&location)), location))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -273,10 +299,22 @@ async fn post_user(
         )?;
     }
 
+    // An identity provider may provision somebody who is already out of scope. The desired state
+    // has to be decided *here*, before provisioning runs: creating an active member and revoking
+    // them afterwards would already have sent them an invitation email and, with mail disabled,
+    // left behind an `Invitation` record they could use to register -- neither of which can be
+    // taken back, and both of which contradict the inactive state the client asked for.
+    let state = if request.active == Some(false) {
+        ProvisionState::Inactive
+    } else {
+        ProvisionState::Active
+    };
+
     // The membership is always created as an unprivileged `User`; `provision_org_member` has no
     // parameter for anything else. The display name is only used if this creates a new account.
-    let mut member =
-        provision_org_member(&ctx.org_id, &user_name, request.resolve_display_name(), external_id, &conn).await?;
+    let member =
+        provision_org_member(&ctx.org_id, &user_name, request.resolve_display_name(), external_id, state, &conn)
+            .await?;
 
     let Some(user) = User::find_by_uuid(&member.user_uuid, &conn).await else {
         return Err(ScimError::internal("Provisioned membership has no account", &member.user_uuid));
@@ -293,12 +331,7 @@ async fn post_user(
     )
     .await;
 
-    // An identity provider may provision someone already out of scope. Honour it rather than
-    // creating an active member it is about to disable.
-    if request.active == Some(false) {
-        try_revoke_member(&mut member, &conn).await?;
-        member.save(&conn).await?;
-
+    if state == ProvisionState::Inactive {
         log_event(
             EventType::OrganizationUserRevoked,
             &member.uuid,
@@ -344,6 +377,7 @@ async fn apply_user_changes(
     // Decide the whole outcome before writing anything.
     let mut dirty = false;
     let mut event: Option<EventType> = None;
+    let mut restored = false;
 
     if !changes.external_id.is_unchanged() {
         dirty |= member.set_external_id(changes.external_id.to_stored());
@@ -376,12 +410,22 @@ async fn apply_user_changes(
             })?;
             dirty = true;
             event = Some(EventType::OrganizationUserRestored);
+            restored = true;
         }
         _ => {}
     }
 
     if dirty {
         member.save(conn).await?;
+    }
+
+    // Somebody provisioned inactive never got an invitation, because sending one would have
+    // contradicted the state the identity provider asked for. Reactivation is the moment it
+    // becomes wanted, so an account that still cannot sign in gets one now. Mail failures are
+    // logged rather than propagated: the membership is already active and correct, and failing
+    // the request would make the identity provider retry a change that has been applied.
+    if restored && let Err(e) = ensure_invitation_for(member, conn).await {
+        warn!(target: "scim", "Reactivated {} but could not deliver an invitation: {e:?}", member.uuid);
     }
 
     if let Some(event) = event {
@@ -419,7 +463,8 @@ async fn put_user(
     apply_user_changes(&ctx, &token, &mut member, &user, &changes, &conn).await?;
 
     let view = UserView::from_membership(&member, &user);
-    Ok(ScimResponse::ok(view.to_json(&ctx.resource_location("User", &view.id))))
+    let location = ctx.resource_location("User", &view.id);
+    Ok(ScimResponse::resource(view.to_json(&location), location))
 }
 
 #[patch("/<org_id>/Users/<user_id>", data = "<body>")]
@@ -441,7 +486,8 @@ async fn patch_user(
     apply_user_changes(&ctx, &token, &mut member, &user, &changes, &conn).await?;
 
     let view = UserView::from_membership(&member, &user);
-    Ok(ScimResponse::ok(view.to_json(&ctx.resource_location("User", &view.id))))
+    let location = ctx.resource_location("User", &view.id);
+    Ok(ScimResponse::resource(view.to_json(&location), location))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -468,9 +514,22 @@ async fn delete_user(
 
     ensure_manageable(&UserView::from_membership(&member, &user))?;
 
+    // Mirrors the interactive remove-member path: a pending invitation is only useful while the
+    // account still has somewhere to accept an invitation to.
+    if !CONFIG.mail_enabled()
+        && !Membership::find_invited_by_user(&user.uuid, &conn).await.into_iter().any(|m| m.uuid != member.uuid)
+    {
+        Invitation::take(&user.email, &conn).await;
+    }
+
+    // Delete first, then record it. An event that says a member was removed must not outlive a
+    // removal that failed.
+    let member_uuid = member.uuid.clone();
+    member.delete(&conn).await?;
+
     log_event(
         EventType::OrganizationUserRemoved,
-        &member.uuid,
+        &member_uuid,
         &ctx.org_id,
         &ACTING_SCIM_USER.into(),
         SCIM_DEVICE_TYPE,
@@ -480,16 +539,6 @@ async fn delete_user(
     .await;
 
     nt.send_user_update(UpdateType::SyncOrgKeys, &user, None, &conn).await;
-
-    // Mirrors the interactive remove-member path: a pending invitation is only useful while the
-    // account still has somewhere to accept an invitation to.
-    if !CONFIG.mail_enabled()
-        && !Membership::find_invited_by_user(&user.uuid, &conn).await.into_iter().any(|m| m.uuid != member.uuid)
-    {
-        Invitation::take(&user.email, &conn).await;
-    }
-
-    member.delete(&conn).await?;
 
     Ok(ScimResponse::no_content())
 }

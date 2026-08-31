@@ -11,7 +11,11 @@
 
 use std::collections::HashMap;
 
-use super::error::{ScimError, ScimResult};
+use super::{
+    QualifiedAttr,
+    error::{ScimError, ScimResult},
+    qualify,
+};
 
 /// Longest filter string we will look at. Entra's filters are a few dozen bytes.
 pub const MAX_FILTER_LEN: usize = 2048;
@@ -121,12 +125,19 @@ pub struct AttrPath {
 }
 
 impl AttrPath {
-    fn parse(raw: &str) -> Option<Self> {
-        // Strip an optional schema URN prefix: `urn:...:User:userName` -> `userName`.
-        // URNs contain colons and attribute names never do, so the last colon is the boundary.
-        let without_urn = match raw.rfind(':') {
-            Some(idx) => &raw[idx + 1..],
-            None => raw,
+    /// Parse an attribute path, resolving any schema prefix against this resource type's own
+    /// schema.
+    ///
+    /// Returns `None` for an attribute in some other namespace. That is deliberate: stripping the
+    /// prefix and keeping the bare name would let `urn:example:Whatever:active` be filtered as if
+    /// it were the core `active`. An unrecognised namespace is simply not a filterable attribute,
+    /// and the caller turns that into `invalidFilter`.
+    fn parse(raw: &str, core_schema: &str) -> Option<Self> {
+        let without_urn = match qualify(raw, core_schema) {
+            QualifiedAttr::Core(name) => name,
+            QualifiedAttr::Extension {
+                ..
+            } => return None,
         };
 
         if without_urn.is_empty() {
@@ -303,6 +314,7 @@ struct Parser<'a> {
     pos: usize,
     nodes: usize,
     attrs: &'static [AttrSpec],
+    core_schema: &'static str,
 }
 
 impl<'a> Parser<'a> {
@@ -405,7 +417,7 @@ impl<'a> Parser<'a> {
             return Err(ScimError::invalid_filter("Expected an attribute name in filter."));
         };
 
-        let Some(path) = AttrPath::parse(raw) else {
+        let Some(path) = AttrPath::parse(raw, self.core_schema) else {
             return Err(ScimError::invalid_filter(format!("Invalid attribute path '{raw}' in filter.")));
         };
 
@@ -429,7 +441,7 @@ impl<'a> Parser<'a> {
                 self.next();
 
                 let qualified = format!("{}.{}", path.base, sub.to_lowercase());
-                let Some(sub_path) = AttrPath::parse(&qualified) else {
+                let Some(sub_path) = AttrPath::parse(&qualified, self.core_schema) else {
                     return Err(ScimError::invalid_filter(format!("Invalid attribute path '{qualified}' in filter.")));
                 };
 
@@ -558,7 +570,7 @@ impl<'a> Parser<'a> {
 
         // Inside `emails[...]`, `type` means `emails.type`.
         let qualified = format!("{}.{}", outer.base, raw.to_lowercase());
-        let Some(path) = AttrPath::parse(&qualified) else {
+        let Some(path) = AttrPath::parse(&qualified, self.core_schema) else {
             return Err(ScimError::invalid_filter(format!("Invalid attribute path '{raw}' in value filter.")));
         };
 
@@ -595,7 +607,10 @@ impl<'a> Parser<'a> {
 
 impl Filter {
     /// Parse a filter for the given resource type.
-    pub fn parse(input: &str, attrs: &'static [AttrSpec]) -> ScimResult<Self> {
+    ///
+    /// `core_schema` is the resource type's own schema URN, used to tell a schema-qualified core
+    /// attribute apart from an extension attribute that merely ends with the same name.
+    pub fn parse(input: &str, attrs: &'static [AttrSpec], core_schema: &'static str) -> ScimResult<Self> {
         if input.len() > MAX_FILTER_LEN {
             return Err(ScimError::invalid_filter(format!(
                 "Filter is too long; the maximum is {MAX_FILTER_LEN} bytes."
@@ -612,6 +627,7 @@ impl Filter {
             pos: 0,
             nodes: 0,
             attrs,
+            core_schema,
         };
         let filter = parser.parse_or(0)?;
 
@@ -826,11 +842,11 @@ mod tests {
         &["id", "externalid", "username", "displayname", "emails.value", "emails.type", "members.value"];
 
     fn user_filter(input: &str) -> ScimResult<Filter> {
-        Filter::parse(input, USER_ATTRS)
+        Filter::parse(input, USER_ATTRS, super::super::USER_SCHEMA)
     }
 
     fn group_filter(input: &str) -> ScimResult<Filter> {
-        Filter::parse(input, GROUP_ATTRS)
+        Filter::parse(input, GROUP_ATTRS, super::super::GROUP_SCHEMA)
     }
 
     /// A user resource shaped the way `resource.rs` builds them.

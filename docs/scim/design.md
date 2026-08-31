@@ -82,8 +82,8 @@ warning and carried on, it now maps the shared function's `Err` to the same warn
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `SCIM_ENABLED` | `false` | Master switch. When false the SCIM routes return `404` and the `/admin` token controls are unavailable. |
-| `SCIM_RATELIMIT_SECONDS` | `60` | Average seconds between SCIM requests from one IP before limiting. |
-| `SCIM_RATELIMIT_MAX_BURST` | `100` | Burst allowance for the above. |
+| `SCIM_RATELIMIT_PER_SECOND` | `20` | Sustained SCIM requests per second from one IP. |
+| `SCIM_RATELIMIT_MAX_BURST` | `1000` | Burst allowance on top of that. |
 
 SCIM is disabled by default because it is a network surface that grants
 organization-membership mutation rights to whoever holds a bearer token.
@@ -250,6 +250,20 @@ endpoints return `501` and the `Group` resource type and schema are omitted from
 
 This is `provision_org_member`, the function the Directory Connector now also calls.
 
+It takes the desired initial state as a parameter rather than having the caller fix it up
+afterwards. `POST /Users` with `"active": false` therefore creates the membership already revoked
+and performs **no invitation side effect at all** — no email, and no `Invitation` record. Doing it
+the other way round would have sent somebody an invitation to an organization the identity
+provider had just said they were not in, and neither an email nor an invitation record can be
+withdrawn once created. Reactivation is the point at which the invitation becomes wanted, so
+`active: true` on an account that has never registered issues one then.
+
+The Directory Connector passes `ProvisionState::Active` and is unaffected.
+
+One shared bug was fixed rather than preserved: if the `Invitation` or `Membership` insert failed,
+the freshly created account was left orphaned. Both paths now clean it up, exactly as the existing
+mail-failure path already did. The Directory Connector benefits from the same fix.
+
 Step 3 creates a **global** Vaultwarden account, so before reaching it the SCIM layer applies the
 same two server policies the interactive invite endpoint applies at exactly the same point:
 `INVITATIONS_ALLOWED` and `SIGNUPS_DOMAINS_WHITELIST`. Without that, an identity provider could
@@ -379,9 +393,34 @@ uses `PATCH` — so this costs nothing in practice.
 
 ### Atomicity
 
-Vaultwarden's database layer runs one `conn.run(...)` per query and its model methods are
-`async`, so a transaction cannot span several model calls. The strategy is therefore
-**validate everything, then apply**:
+Every group mutation -- `POST`, `PUT` and `PATCH` alike -- goes through
+`Group::save_with_members`, which writes the group row *and* its membership inside a single
+`conn.transaction(...)`. That is what makes the operations genuinely atomic rather than merely
+well validated:
+
+* a create that cannot persist its members rolls the group back too, instead of leaving an empty
+  group nobody asked for;
+* an update that fails while replacing members does not leave `displayName` or `externalId`
+  changed.
+
+The transaction also computes the membership delta, so the caller learns exactly which members
+joined and which left. Only those get an `OrganizationUserUpdatedGroups` event, and only **after**
+the transaction has committed -- an audit log that records changes which were rolled back, or
+which never happened, is worse than none.
+
+`revision_date` moves inside the same transaction whenever the group row or its membership
+changes, because either one changes the SCIM representation that `meta.lastModified` describes. A
+request that changes nothing writes nothing and leaves the timestamp alone. Removing an
+organization member takes them out of every group they belonged to, so that path bumps those
+groups' revisions too.
+
+Membership validation is a single organization-scoped batch query rather than one lookup per
+member, and only the added and removed rows are written rather than the whole membership. Tenancy
+is unchanged: the organization is still bound into the query, so an id from another organization
+simply does not come back.
+
+The user-facing planning layer still works **validate everything, then apply**, because the
+request has to be understood before the transaction opens:
 
 1. Parse the whole `PatchOp` document.
 2. Resolve it into a typed change-set (`UserChanges` / `GroupChanges`).
@@ -400,6 +439,26 @@ member set — a real transaction is used: `GroupUser::replace_all_for_group` pe
 delete and the inserts inside a single `conn.transaction(...)` on all three backends, so a
 failure mid-way cannot leave a group with a partially applied membership list.
 
+### Privileged members and group association
+
+The privileged-membership rule in section 7 is about the **`User` resource**: SCIM cannot change
+an Owner's, Admin's or Manager's role, revoke them, restore them or delete them.
+
+It deliberately does **not** extend to group association. `PATCH /Groups/<id>` may add a
+privileged member to a group and remove them from one, exactly as for anyone else. Two reasons:
+
+1. Blocking it would fail an entire group synchronisation because one member happens to be an
+   Owner, and an identity provider has no way to recover from that -- it would simply retry
+   forever.
+2. Group membership is not role assignment. It cannot promote anyone, and for Owners and Admins it
+   grants nothing they do not already have, since `Membership::has_full_access` is already true
+   for them.
+
+The honest consequence, which the operator documentation states plainly, is that group
+synchronisation *is* an access-control operation for everyone including Managers: adding somebody
+to a group that already holds collection assignments grants them that access. SCIM never creates
+or edits a collection-to-group assignment, but it does decide who is in the group.
+
 ## 9. Filtering
 
 `filter.rs` is a hand-written tokenizer plus recursive-descent parser producing an AST,
@@ -412,22 +471,46 @@ Supported: `eq ne co sw ew pr gt ge lt le`, `and`, `or`, `not`, parentheses, and
 section 3.4.2.2 and unknown attributes are rejected with `400`/`invalidFilter` rather than
 silently matching nothing.
 
+Attribute names are resolved **namespace-aware**, by `qualify()` in `mod.rs`. Discarding
+everything before the last `:` -- the obvious shortcut, and what an earlier revision of this code
+did -- lets an arbitrary extension attribute impersonate a core one:
+`urn:example:Whatever:active` would have filtered on the core `active`, and as a PATCH path it
+would have *set* it. A name is a core attribute only when it carries no prefix or when its prefix
+is exactly this resource type's own schema URN; anything else is an extension. The same rule
+applies to PATCH paths and to `attributes`/`excludedAttributes`, so an extension attribute can
+never read, write or hide the core attribute that happens to share its final name.
+
+Value paths are split off before the namespace is resolved, so a colon inside a filter literal --
+`members[value eq "urn:x:y"]` -- is never mistaken for a namespace separator.
+
 Bounds, to keep evaluation cheap and to prevent recursive blow-up:
 
 * filter string at most 2048 bytes
 * AST depth at most 16
 * AST nodes at most 128
 
-Fast paths that become an indexed single-row database lookup instead of a scan:
+Fast paths that become an indexed database lookup instead of a scan:
 
-* Users — `id eq`, `userName eq`, `externalId eq`
-* Groups — `id eq`, `displayName eq`, `externalId eq`
+* Users — `id eq`, `userName eq`, `emails.value eq`, `externalId eq`
+* Groups — `id eq`, `externalId eq`
 
-These are the only shapes Entra actually emits. Anything else falls back to loading the
-organization's members or groups and evaluating in memory, which is bounded by the size of
-one organization and by the page-size cap. The parser deliberately supports more than the
-fast paths so that adding new indexed shapes later is a change to the optimizer, not to the
-grammar.
+These are the shapes Entra actually emits. Anything else falls back to loading the organization's
+members or groups and evaluating in memory, which is bounded by the size of one organization and
+by the page-size cap. The parser deliberately supports more than the fast paths so that adding new
+indexed shapes later is a change to the optimizer, not to the grammar.
+
+Two properties keep the optimisation honest:
+
+* **It only narrows; it never decides.** `required_eq_on` returns an equality the filter *must*
+  satisfy, the caller fetches those candidates, and then the whole filter is applied to them
+  anyway. A candidate the full filter rejects costs nothing, so the fast path can be generous
+  without ever changing which resources match.
+* **`externalId` is not assumed unique.** It has no unique constraint, and existing installations
+  may already hold duplicates from the Directory Connector, so the lookup returns *every* matching
+  row. Fetching one row would have silently dropped resources from a filtered listing -- an
+  optimisation that changes the answer is a bug, not an optimisation. Adding a uniqueness
+  constraint was considered and rejected: it would fail the migration on any installation whose
+  existing data violates it.
 
 ## 10. Pagination
 
@@ -442,9 +525,33 @@ SCIM is 1-based (RFC 7644 section 3.4.2.4).
 
 The hard cap exists so a client cannot ask for an unbounded response.
 
-`attributes` and `excludedAttributes` are honoured for top-level attributes. This matters
-in practice: Entra requests groups with `excludedAttributes=members`, and honouring it lets
-Vaultwarden skip the member lookup entirely.
+Listings are sorted by resource id before they are sliced. Without a defined order the database is
+free to return rows differently between two queries, and a client walking pages could see the same
+resource twice or miss one entirely. The order is applied after filtering, on every path --
+including the ones that resolve through an indexed lookup -- so paging is repeatable regardless of
+how the result set was produced. Sorting is *not* advertised in `ServiceProviderConfig`: a stable
+default order is not the same as supporting `sortBy` and `sortOrder`, which are not implemented.
+
+### Attribute projection
+
+`attributes` and `excludedAttributes` (RFC 7644 section 3.9) are honoured on **every** response
+that carries a resource, not only on list endpoints. They are mutually exclusive; a request
+supplying both is a `400`, because reconciling them would mean guessing at the client's intent.
+
+* `id` and `schemas` are the minimum response set and always survive.
+* `meta` does **not**. RFC 7643 gives it `returned: default`, so `attributes=userName` legitimately
+  omits it. Treating it as `returned: always` would return data the client explicitly did not ask
+  for.
+* Sub-attributes work in both directions: `attributes=emails.value` narrows the complex attribute
+  to that one sub-attribute, and `excludedAttributes=emails.type` removes only that sub-attribute
+  and leaves the rest of the parent in place. Dropping the whole parent because one of its
+  sub-attributes was excluded would discard data the client did ask for.
+* Naming the whole attribute wins over naming a sub-attribute of it, so
+  `attributes=emails,emails.value` returns all of `emails`.
+
+The optimisation Entra ID depends on survives all of this: `excludedAttributes=members` still means
+a group's membership is never loaded from the database. An exclusion that names only a
+*sub*-attribute does not skip the load, because the data is still needed.
 
 ## 11. Errors and content types
 
@@ -469,12 +576,31 @@ Error bodies follow `urn:ietf:params:scim:api:messages:2.0:Error` with `status`,
 | bad value for a known attribute | 400 | `invalidValue` |
 | immutable attribute written | 400 | `mutability` |
 | bad or absent credentials | 401 | — |
-| privileged membership | 403 | `mutability` |
+| writing a privileged membership (read-only resource) | 403 | `mutability` |
+| authorization or policy refusal | 403 | — |
 | unknown resource, or resource in another organization | 404 | — |
 | duplicate user/group | 409 | `uniqueness` |
 | body over the limit | 413 | — |
+| too many members or operations in one request | 400 | `tooMany` |
 | rate limited | 429 | — |
 | groups disabled server-side | 501 | — |
+
+The two `403`s are deliberately different. `scimType` values are defined by RFC 7644 section 3.12
+for specific *protocol* faults, and `mutability` means "you tried to change something that cannot
+be changed". A refusal because `INVITATIONS_ALLOWED` is off, or because an organization policy
+declines a reactivation, is not a protocol fault at all -- the request was perfectly well formed
+and the server declined it. Labelling those `mutability` would send a client looking for a defect
+in its own document. `ScimError::read_only` produces the former and `ScimError::forbidden` the
+latter, and every call site was classified individually.
+
+Responses that carry a single resource also set `Content-Location` to the same URL as the body's
+`meta.location`. A `ListResponse` describes many resources, so it gets none: there is no one
+resource for the header to point at.
+
+A single-membership `remove` that matches nobody is a **success**, not `noTarget`. RFC 7644
+section 3.5.2.2 requires `remove` to succeed when the target is already absent, and an identity
+provider that retried a removal would otherwise get an error for work that was already done.
+`noTarget` remains correct for other situations, such as a `remove` sent with no `path` at all.
 
 ## 12. Uniqueness and races
 

@@ -9,7 +9,7 @@
 //! driven by [`TestServer`]. Tests that change a setting take an exclusive lock so they cannot
 //! disturb tests running in parallel.
 
-use std::sync::atomic::Ordering;
+use std::{collections::HashSet, sync::atomic::Ordering};
 
 use rocket::{
     http::{ContentType, Header, Status},
@@ -23,13 +23,15 @@ use crate::{
     db::{
         DbConn, DbPool,
         models::{
-            Group, GroupId, Membership, MembershipId, MembershipStatus, MembershipType, OrgPolicy, OrgPolicyType,
-            Organization, OrganizationId, OrganizationScimKey, User,
+            Group, GroupId, Invitation, Membership, MembershipId, MembershipStatus, MembershipType, OrgPolicy,
+            OrgPolicyType, Organization, OrganizationId, OrganizationScimKey, User,
         },
     },
 };
 
-use super::settings::test_overrides::{GROUPS_ENABLED, RATE_LIMIT_EXHAUSTED, SCIM_ENABLED};
+use super::settings::test_overrides::{
+    GROUPS_ENABLED, RATE_LIMIT_EXHAUSTED, SCIM_ENABLED, UNAUTH_RATE_LIMIT_EXHAUSTED,
+};
 
 /// Serialises the tests that change server settings against the ones that assume the defaults.
 static SETTINGS_LOCK: RwLock<()> = RwLock::const_new(());
@@ -100,6 +102,11 @@ impl TestServer {
     fn set_rate_limit_exhausted(&self, exhausted: bool) {
         assert!(matches!(self.guard, SettingsGuard::Exclusive(_)), "changing settings needs the exclusive lock");
         RATE_LIMIT_EXHAUSTED.store(exhausted, Ordering::Relaxed);
+    }
+
+    fn set_unauthenticated_rate_limit_exhausted(&self, exhausted: bool) {
+        assert!(matches!(self.guard, SettingsGuard::Exclusive(_)), "changing settings needs the exclusive lock");
+        UNAUTH_RATE_LIMIT_EXHAUSTED.store(exhausted, Ordering::Relaxed);
     }
 
     // -- fixtures ------------------------------------------------------------------------------
@@ -230,6 +237,7 @@ impl Drop for TestServer {
             SCIM_ENABLED.store(true, Ordering::Relaxed);
             GROUPS_ENABLED.store(true, Ordering::Relaxed);
             RATE_LIMIT_EXHAUSTED.store(false, Ordering::Relaxed);
+            UNAUTH_RATE_LIMIT_EXHAUSTED.store(false, Ordering::Relaxed);
         }
 
         // Best effort: on Windows the pool may still hold the file open.
@@ -247,6 +255,8 @@ fn scim_json() -> ContentType {
 struct ScimReply {
     status: Status,
     content_type: Option<ContentType>,
+    location: Option<String>,
+    content_location: Option<String>,
     body: String,
 }
 
@@ -254,13 +264,27 @@ impl ScimReply {
     async fn of(response: LocalResponse<'_>) -> Self {
         let status = response.status();
         let content_type = response.content_type();
+        let location = response.headers().get_one("Location").map(str::to_owned);
+        let content_location = response.headers().get_one("Content-Location").map(str::to_owned);
         let body = response.into_string().await.unwrap_or_default();
 
         Self {
             status,
             content_type,
+            location,
+            content_location,
             body,
         }
+    }
+
+    /// A single-resource response identifies the resource it carries, and says the same thing in
+    /// the header as in the body.
+    fn assert_content_location_matches_meta(&self) {
+        let body = self.json();
+        let meta_location =
+            body["meta"]["location"].as_str().unwrap_or_else(|| panic!("no meta.location in {}", self.body));
+
+        assert_eq!(self.content_location.as_deref(), Some(meta_location), "Content-Location must match meta.location");
     }
 
     fn json(&self) -> Value {
@@ -931,7 +955,9 @@ async fn a_reactivation_an_org_policy_refuses_is_reported_as_a_refusal() {
         )
         .await;
 
-    reply.assert_error(Status::Forbidden, Some("mutability"));
+    // A policy refusal is a plain 403: the request was well formed and the server declined it.
+    // Labelling it `mutability` would tell the client its document was structurally wrong.
+    reply.assert_error(Status::Forbidden, None);
     assert!(reply.json()["detail"].as_str().unwrap().contains("2FA"), "the policy reason should reach the client");
 
     let stored = server.reload_membership(&membership.uuid, &org.uuid).await.expect("membership");
@@ -1768,4 +1794,803 @@ async fn resource_ids_do_not_reveal_other_tenants() {
         pure_fiction.json()["status"],
         "the two 404s must be indistinguishable"
     );
+}
+
+// =============================================================================================
+// Hardening regressions
+//
+// Each block below pins down a specific defect found in review, grouped by the behaviour it
+// protects rather than by endpoint, because several of them span both resource types.
+// =============================================================================================
+
+// -- duplicate member ids ----------------------------------------------------------------------
+
+#[rocket::async_test]
+async fn duplicate_member_ids_are_collapsed_everywhere() {
+    // A client repeating an id is harmless input. Left alone it would reach the database as the
+    // same `(group, member)` primary key twice and fail an otherwise reasonable request.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, a) = server.member(&org, "a@example.test", MembershipType::User, true).await;
+    let (_, b) = server.member(&org, "b@example.test", MembershipType::User, true).await;
+
+    let member_count = |body: &Value| body["members"].as_array().unwrap().len();
+
+    // POST with the same member listed three times.
+    let created = server
+        .post(
+            &groups_url(&org),
+            &token,
+            json!({
+                "displayName": "Dupes",
+                "members": [{"value": a.uuid}, {"value": a.uuid}, {"value": a.uuid}],
+            }),
+        )
+        .await;
+    assert_eq!(created.status, Status::Created, "{}", created.body);
+    assert_eq!(member_count(&created.json()), 1, "duplicates collapse to one member");
+
+    let group_id = created.json()["id"].as_str().unwrap().to_owned();
+    let path = format!("{}/{}", groups_url(&org), group_id);
+
+    // PUT with duplicates.
+    let put = server
+        .put(&path, &token, json!({"displayName": "Dupes", "members": [{"value": b.uuid}, {"value": b.uuid}]}))
+        .await;
+    assert_eq!(put.status, Status::Ok, "{}", put.body);
+    assert_eq!(member_count(&put.json()), 1);
+
+    // PATCH add with duplicates.
+    let added = server
+        .patch(
+            &path,
+            &token,
+            json!({"Operations": [{"op": "Add", "path": "members", "value": [{"value": a.uuid}, {"value": a.uuid}]}]}),
+        )
+        .await;
+    assert_eq!(added.status, Status::Ok, "{}", added.body);
+    assert_eq!(member_count(&added.json()), 2);
+
+    // PATCH replace with duplicates.
+    let replaced = server
+        .patch(
+            &path,
+            &token,
+            json!({
+                "Operations": [
+                    {"op": "Replace", "path": "members", "value": [{"value": a.uuid}, {"value": a.uuid}]},
+                ],
+            }),
+        )
+        .await;
+    assert_eq!(replaced.status, Status::Ok, "{}", replaced.body);
+    assert_eq!(member_count(&replaced.json()), 1);
+
+    // The same id repeated across several operations in one document.
+    let across_ops = server
+        .patch(
+            &path,
+            &token,
+            json!({
+                "Operations": [
+                    {"op": "Add", "path": "members", "value": [{"value": b.uuid}]},
+                    {"op": "Add", "path": "members", "value": [{"value": b.uuid}]},
+                    {"op": "Add", "path": "members", "value": [{"value": b.uuid}]},
+                ],
+            }),
+        )
+        .await;
+    assert_eq!(across_ops.status, Status::Ok, "{}", across_ops.body);
+    assert_eq!(member_count(&across_ops.json()), 2);
+}
+
+// -- atomicity ---------------------------------------------------------------------------------
+
+#[rocket::async_test]
+async fn a_failed_member_write_rolls_the_new_group_back() {
+    // Driven at the model layer, because the endpoint validates member ids before writing and so
+    // cannot reach this state. The point is that the transaction is what protects the invariant,
+    // not just the validation in front of it.
+    let server = TestServer::new().await;
+    let (org, _) = server.org("acme").await;
+    let conn = server.conn().await;
+
+    let mut group = Group::new(org.uuid.clone(), "Doomed".to_owned(), false, None);
+    let group_id = group.uuid.clone();
+
+    // A membership id that does not exist violates the foreign key on `groups_users`.
+    let bogus = MembershipId::from(crate::util::get_uuid());
+    let result = group.save_with_members(true, true, Some(vec![bogus]), &conn).await;
+
+    assert!(result.is_err(), "the member insert must fail");
+    assert!(
+        Group::find_by_uuid_and_org(&group_id, &org.uuid, &conn).await.is_none(),
+        "a create that could not persist its members must not leave an empty group behind"
+    );
+}
+
+#[rocket::async_test]
+async fn a_failed_member_write_leaves_group_metadata_untouched() {
+    let server = TestServer::new().await;
+    let (org, _) = server.org("acme").await;
+    let conn = server.conn().await;
+
+    let mut group = Group::new(org.uuid.clone(), "Original".to_owned(), false, Some("ext-1".to_owned()));
+    group.save_with_members(true, true, Some(Vec::new()), &conn).await.expect("create");
+    let group_id = group.uuid.clone();
+    let before = Group::find_by_uuid_and_org(&group_id, &org.uuid, &conn).await.expect("stored");
+
+    // Rename and swap the membership in one call, with a member that cannot be written.
+    group.name = "Renamed".to_owned();
+    let bogus = MembershipId::from(crate::util::get_uuid());
+    let result = group.save_with_members(false, true, Some(vec![bogus]), &conn).await;
+
+    assert!(result.is_err());
+    let after = Group::find_by_uuid_and_org(&group_id, &org.uuid, &conn).await.expect("still there");
+    assert_eq!(after.name, before.name, "the rename must have rolled back with the member write");
+    assert_eq!(after.revision_date, before.revision_date, "and so must the revision timestamp");
+}
+
+// -- membership deltas and lastModified ---------------------------------------------------------
+
+#[rocket::async_test]
+async fn membership_changes_report_only_what_moved() {
+    // Updating {A, B} to {A, C} must report C joining and B leaving, and say nothing about A.
+    // Exactly those members get an `OrganizationUserUpdatedGroups` event.
+    let server = TestServer::new().await;
+    let (org, _) = server.org("acme").await;
+    let (_, a) = server.member(&org, "a@example.test", MembershipType::User, true).await;
+    let (_, b) = server.member(&org, "b@example.test", MembershipType::User, true).await;
+    let (_, c) = server.member(&org, "c@example.test", MembershipType::User, true).await;
+    let conn = server.conn().await;
+
+    let mut group = Group::new(org.uuid.clone(), "Eng".to_owned(), false, None);
+    let created =
+        group.save_with_members(true, true, Some(vec![a.uuid.clone(), b.uuid.clone()]), &conn).await.expect("create");
+    assert_eq!(created.added.len(), 2);
+    assert!(created.removed.is_empty());
+
+    let swapped =
+        group.save_with_members(false, false, Some(vec![a.uuid.clone(), c.uuid.clone()]), &conn).await.expect("swap");
+    assert_eq!(swapped.added, vec![c.uuid.clone()], "only the joiner");
+    assert_eq!(swapped.removed, vec![b.uuid.clone()], "only the leaver");
+    assert!(swapped.changed);
+
+    // Sending the same membership again changes nothing at all.
+    let repeat =
+        group.save_with_members(false, false, Some(vec![a.uuid.clone(), c.uuid.clone()]), &conn).await.expect("repeat");
+    assert!(repeat.added.is_empty() && repeat.removed.is_empty(), "a no-op reports no movement");
+    assert!(!repeat.changed, "and writes nothing");
+
+    // Clearing reports everyone leaving.
+    let cleared = group.save_with_members(false, false, Some(Vec::new()), &conn).await.expect("clear");
+    assert_eq!(cleared.removed.len(), 2);
+    assert!(cleared.added.is_empty());
+}
+
+#[rocket::async_test]
+async fn last_modified_tracks_every_change_to_the_scim_resource() {
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, member) = server.member(&org, "a@example.test", MembershipType::User, true).await;
+    let group = server.group(&org, "Eng", None).await;
+    let path = format!("{}/{}", groups_url(&org), group.uuid);
+
+    let last_modified = |body: &Value| body["meta"]["lastModified"].as_str().unwrap().to_owned();
+
+    let initial = last_modified(&server.get(&path, &token).await.json());
+
+    // A membership-only change still changes the resource, so the timestamp has to move.
+    let after_members = server
+        .patch(
+            &path,
+            &token,
+            json!({"Operations": [{"op": "Add", "path": "members", "value": [{"value": member.uuid}]}]}),
+        )
+        .await;
+    let after_members = last_modified(&after_members.json());
+    assert_ne!(after_members, initial, "adding a member changes the resource");
+
+    // A metadata-only change moves it too.
+    let after_rename = server
+        .patch(&path, &token, json!({"Operations": [{"op": "Replace", "path": "displayName", "value": "Platform"}]}))
+        .await;
+    let after_rename = last_modified(&after_rename.json());
+    assert_ne!(after_rename, after_members);
+
+    // A request that changes nothing must not.
+    let noop = server
+        .patch(&path, &token, json!({"Operations": [{"op": "Replace", "path": "displayName", "value": "Platform"}]}))
+        .await;
+    assert_eq!(last_modified(&noop.json()), after_rename, "a no-op must not touch lastModified");
+}
+
+#[rocket::async_test]
+async fn removing_a_member_updates_every_group_they_were_in() {
+    // Indirect membership removal: `DELETE /Users/<id>` changes the `members` of each group the
+    // person belonged to, so each of those SCIM resources has changed.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, member) = server.member(&org, "a@example.test", MembershipType::User, true).await;
+    let group = server.group(&org, "Eng", None).await;
+    let group_path = format!("{}/{}", groups_url(&org), group.uuid);
+
+    server
+        .patch(
+            &group_path,
+            &token,
+            json!({"Operations": [{"op": "Add", "path": "members", "value": [{"value": member.uuid}]}]}),
+        )
+        .await;
+
+    let before = server.get(&group_path, &token).await.json()["meta"]["lastModified"].as_str().unwrap().to_owned();
+
+    let deleted = server.delete(&format!("{}/{}", users_url(&org), member.uuid), &token).await;
+    assert_eq!(deleted.status, Status::NoContent, "{}", deleted.body);
+
+    let after = server.get(&group_path, &token).await.json();
+    assert_eq!(after["members"], json!([]), "the member is gone from the group");
+    assert_ne!(
+        after["meta"]["lastModified"].as_str().unwrap(),
+        before,
+        "the group's representation changed, so lastModified must have moved"
+    );
+}
+
+// -- idempotent remove --------------------------------------------------------------------------
+
+#[rocket::async_test]
+async fn removing_a_member_who_is_not_in_the_group_succeeds() {
+    // RFC 7644 section 3.5.2.2: `remove` targeting somebody who is not a member succeeds without
+    // changing anything. It is deliberately *not* a `noTarget` error.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, outsider) = server.member(&org, "outsider@example.test", MembershipType::User, true).await;
+    let (_, insider) = server.member(&org, "insider@example.test", MembershipType::User, true).await;
+    let group = server.group(&org, "Eng", None).await;
+    let path = format!("{}/{}", groups_url(&org), group.uuid);
+
+    server
+        .patch(
+            &path,
+            &token,
+            json!({"Operations": [{"op": "Add", "path": "members", "value": [{"value": insider.uuid}]}]}),
+        )
+        .await;
+
+    // Both spellings of remove, for somebody who is not a member.
+    let by_filter = server
+        .patch(
+            &path,
+            &token,
+            json!({"Operations": [{"op": "Remove", "path": format!("members[value eq \"{}\"]", outsider.uuid)}]}),
+        )
+        .await;
+    assert_eq!(by_filter.status, Status::Ok, "removing a non-member must succeed: {}", by_filter.body);
+
+    let by_value = server
+        .patch(
+            &path,
+            &token,
+            json!({"Operations": [{"op": "Remove", "path": "members", "value": [{"value": outsider.uuid}]}]}),
+        )
+        .await;
+    assert_eq!(by_value.status, Status::Ok, "{}", by_value.body);
+
+    // ...and the group is untouched.
+    let body = by_value.json();
+    let ids: Vec<&str> = body["members"].as_array().unwrap().iter().map(|m| m["value"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec![insider.uuid.to_string()], "the existing member is still there");
+}
+
+// -- Entra extension attributes ------------------------------------------------------------------
+
+#[rocket::async_test]
+async fn entra_enterprise_extension_attributes_do_not_break_patch() {
+    // Entra ID maps the EnterpriseUser extension by default. Vaultwarden stores none of it, so
+    // these have to be ignored rather than rejected, or user provisioning fails outright.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, membership) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
+    let path = format!("{}/{}", users_url(&org), membership.uuid);
+
+    // Fully qualified extension paths, alongside an operation that is supported.
+    let qualified = server
+        .patch(
+            &path,
+            &token,
+            json!({
+                "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+                "Operations": [
+                    {
+                        "op": "Replace",
+                        "path": "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:department",
+                        "value": "R&D",
+                    },
+                    {
+                        "op": "Replace",
+                        "path": "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:employeeNumber",
+                        "value": "12345",
+                    },
+                    {"op": "Replace", "path": "active", "value": false},
+                ],
+            }),
+        )
+        .await;
+    assert_eq!(qualified.status, Status::Ok, "{}", qualified.body);
+    assert_eq!(qualified.json()["active"], json!(false), "the supported operation still applied");
+
+    // A pathless replace carrying the whole extension object, which Entra also sends.
+    let pathless = server
+        .patch(
+            &path,
+            &token,
+            json!({
+                "Operations": [{
+                    "op": "Replace",
+                    "value": {
+                        "active": true,
+                        "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {
+                            "department": "R&D",
+                            "costCenter": "CC-1",
+                            "manager": {"value": "someone-else"},
+                        },
+                    },
+                }],
+            }),
+        )
+        .await;
+    assert_eq!(pathless.status, Status::Ok, "{}", pathless.body);
+    assert_eq!(pathless.json()["active"], json!(true));
+
+    // ...and the unqualified spellings, in case a provider sends them bare.
+    let unqualified = server
+        .patch(
+            &path,
+            &token,
+            json!({"Operations": [{"op": "Replace", "value": {"department": "R&D", "division": "Eng"}}]}),
+        )
+        .await;
+    assert_eq!(unqualified.status, Status::Ok, "{}", unqualified.body);
+}
+
+#[rocket::async_test]
+async fn an_extension_attribute_cannot_impersonate_a_core_one() {
+    // The final segment of these paths is a core attribute name, but the namespace is not the core
+    // schema. Aliasing them would let any extension toggle `active` or rewrite `members`.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, membership) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
+    let user_path = format!("{}/{}", users_url(&org), membership.uuid);
+
+    let reply = server
+        .patch(
+            &user_path,
+            &token,
+            json!({
+                "Operations": [
+                    {"op": "Replace", "path": "urn:example:Custom:active", "value": false},
+                    {"op": "Replace", "path": "urn:example:Custom:externalId", "value": "hijacked"},
+                    {"op": "Replace", "path": "urn:example:Custom:userName", "value": "attacker@evil.test"},
+                ],
+            }),
+        )
+        .await;
+    assert_eq!(reply.status, Status::Ok, "extension attributes are ignored, not errors: {}", reply.body);
+
+    let stored = server.get(&user_path, &token).await.json();
+    assert_eq!(stored["active"], json!(true), "an extension `active` must not deactivate the member");
+    assert!(stored["externalId"].is_null(), "an extension `externalId` must not be stored");
+    assert_eq!(stored["userName"], json!("alice@example.test"), "and it certainly must not rename the account");
+
+    // The same for groups: an extension `members` must not rewrite the membership.
+    let (_, member) = server.member(&org, "b@example.test", MembershipType::User, true).await;
+    let group = server.group(&org, "Eng", None).await;
+    let group_path = format!("{}/{}", groups_url(&org), group.uuid);
+
+    let group_reply = server
+        .patch(
+            &group_path,
+            &token,
+            json!({
+                "Operations": [{
+                    "op": "Add",
+                    "path": "urn:example:Custom:members",
+                    "value": [{"value": member.uuid}],
+                }],
+            }),
+        )
+        .await;
+    assert_eq!(group_reply.status, Status::Ok, "{}", group_reply.body);
+    assert_eq!(group_reply.json()["members"], json!([]), "an extension `members` must not add anyone");
+}
+
+#[rocket::async_test]
+async fn an_extension_attribute_is_not_a_filterable_core_attribute() {
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    server.member(&org, "alice@example.test", MembershipType::User, true).await;
+
+    // `urn:example:Custom:userName` ends in `userName` but is not the core attribute, so it is not
+    // filterable rather than silently matching on the core one.
+    server
+        .get(&format!("{}?filter=urn:example:Custom:userName%20eq%20%22alice@example.test%22", users_url(&org)), &token)
+        .await
+        .assert_error(Status::BadRequest, Some("invalidFilter"));
+
+    // The properly qualified core attribute still works.
+    let ok = server
+        .get(
+            &format!(
+                "{}?filter=urn:ietf:params:scim:schemas:core:2.0:User:userName%20eq%20%22alice@example.test%22",
+                users_url(&org)
+            ),
+            &token,
+        )
+        .await;
+    assert_eq!(ok.json()["totalResults"], json!(1), "{}", ok.body);
+}
+
+// -- inactive provisioning -----------------------------------------------------------------------
+
+#[rocket::async_test]
+async fn provisioning_inactive_creates_no_invitation() {
+    // Mail is disabled in tests, so the observable side effect is the `Invitation` row: the
+    // credential that lets an unregistered account complete registration. Creating one for
+    // somebody the identity provider marked inactive would hand out a way in that the inactive
+    // state is meant to deny.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+
+    let reply =
+        server.post(&users_url(&org), &token, json!({"userName": "inactive@example.test", "active": false})).await;
+    assert_eq!(reply.status, Status::Created, "{}", reply.body);
+    assert_eq!(reply.json()["active"], json!(false));
+
+    let conn = server.conn().await;
+    assert!(
+        Invitation::find_by_mail("inactive@example.test", &conn).await.is_none(),
+        "an inactive member must not be given a usable invitation"
+    );
+    drop(conn);
+
+    let member_id = MembershipId::from(reply.json()["id"].as_str().unwrap().to_owned());
+    let membership = server.reload_membership(&member_id, &org.uuid).await.expect("membership");
+    assert!(membership.status < MembershipStatus::Invited as i32, "and the membership starts revoked");
+}
+
+#[rocket::async_test]
+async fn reactivating_an_unregistered_member_creates_the_invitation_then() {
+    // The invitation is withheld while inactive, so reactivation is the point at which it becomes
+    // wanted -- otherwise the account could never complete registration.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+
+    let created =
+        server.post(&users_url(&org), &token, json!({"userName": "later@example.test", "active": false})).await;
+    let member_id = created.json()["id"].as_str().unwrap().to_owned();
+
+    let reactivated = server
+        .patch(
+            &format!("{}/{}", users_url(&org), member_id),
+            &token,
+            json!({"Operations": [{"op": "Replace", "path": "active", "value": true}]}),
+        )
+        .await;
+    assert_eq!(reactivated.status, Status::Ok, "{}", reactivated.body);
+    assert_eq!(reactivated.json()["active"], json!(true));
+
+    let conn = server.conn().await;
+    assert!(
+        Invitation::find_by_mail("later@example.test", &conn).await.is_some(),
+        "reactivation must leave the account able to register"
+    );
+}
+
+#[rocket::async_test]
+async fn provisioning_active_still_creates_an_invitation() {
+    // The ordinary path is unchanged, which is also what the Directory Connector relies on.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+
+    let reply = server.post(&users_url(&org), &token, json!({"userName": "active@example.test"})).await;
+    assert_eq!(reply.status, Status::Created, "{}", reply.body);
+
+    let conn = server.conn().await;
+    assert!(Invitation::find_by_mail("active@example.test", &conn).await.is_some());
+}
+
+// -- projection, Content-Location, pagination ------------------------------------------------------
+
+#[rocket::async_test]
+async fn single_resource_responses_carry_a_matching_content_location() {
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, membership) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
+    let user_path = format!("{}/{}", users_url(&org), membership.uuid);
+
+    server.get(&user_path, &token).await.assert_content_location_matches_meta();
+    server.put(&user_path, &token, json!({"active": true})).await.assert_content_location_matches_meta();
+    server
+        .patch(&user_path, &token, json!({"Operations": [{"op": "Replace", "path": "active", "value": true}]}))
+        .await
+        .assert_content_location_matches_meta();
+
+    // POST carries both Location and Content-Location, and they agree.
+    let created = server.post(&users_url(&org), &token, json!({"userName": "new@example.test"})).await;
+    assert_eq!(created.status, Status::Created, "{}", created.body);
+    created.assert_content_location_matches_meta();
+    assert_eq!(created.location.as_deref(), created.content_location.as_deref());
+
+    // Groups likewise.
+    let group = server.post(&groups_url(&org), &token, json!({"displayName": "Eng"})).await;
+    assert_eq!(group.status, Status::Created, "{}", group.body);
+    group.assert_content_location_matches_meta();
+
+    let group_path = format!("{}/{}", groups_url(&org), group.json()["id"].as_str().unwrap());
+    server.get(&group_path, &token).await.assert_content_location_matches_meta();
+    server.put(&group_path, &token, json!({"displayName": "Eng"})).await.assert_content_location_matches_meta();
+    server
+        .patch(&group_path, &token, json!({"Operations": [{"op": "Replace", "path": "displayName", "value": "Eng"}]}))
+        .await
+        .assert_content_location_matches_meta();
+
+    // A ListResponse describes many resources, so it gets no Content-Location.
+    let listed = server.get(&users_url(&org), &token).await;
+    assert!(listed.content_location.is_none(), "a list response must not claim one resource's location");
+}
+
+#[rocket::async_test]
+async fn projection_applies_to_every_representation() {
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, membership) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
+
+    // A single-resource GET honours `attributes`, and `meta` is not forced in.
+    let projected =
+        server.get(&format!("{}/{}?attributes=userName", users_url(&org), membership.uuid), &token).await.json();
+    assert_eq!(projected["userName"], json!("alice@example.test"));
+    assert!(projected.get("id").is_some(), "id is in the minimum response set");
+    assert!(projected.get("meta").is_none(), "meta is `returned: default`, not `always`");
+    assert!(projected.get("emails").is_none());
+
+    // Sub-attribute selection.
+    let sub =
+        server.get(&format!("{}/{}?attributes=emails.value", users_url(&org), membership.uuid), &token).await.json();
+    assert_eq!(sub["emails"][0]["value"], json!("alice@example.test"));
+    assert!(sub["emails"][0].get("type").is_none(), "only the named sub-attribute survives");
+
+    // Sub-attribute exclusion keeps the parent.
+    let excluded = server
+        .get(&format!("{}/{}?excludedAttributes=emails.type", users_url(&org), membership.uuid), &token)
+        .await
+        .json();
+    assert!(excluded["emails"][0].get("type").is_none());
+    assert_eq!(excluded["emails"][0]["value"], json!("alice@example.test"), "the parent is not dropped wholesale");
+
+    // Both at once is a client error rather than something to reconcile silently.
+    server
+        .get(&format!("{}?attributes=userName&excludedAttributes=emails", users_url(&org)), &token)
+        .await
+        .assert_error(Status::BadRequest, Some("invalidValue"));
+}
+
+#[rocket::async_test]
+async fn pagination_walks_a_stable_sequence() {
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    for i in 0..6 {
+        server.member(&org, &format!("user{i}@example.test"), MembershipType::User, true).await;
+    }
+
+    let ids_of = |body: &Value| -> Vec<String> {
+        body["Resources"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap().to_owned()).collect()
+    };
+
+    let first = ids_of(&server.get(&format!("{}?startIndex=1&count=2", users_url(&org)), &token).await.json());
+    let second = ids_of(&server.get(&format!("{}?startIndex=3&count=2", users_url(&org)), &token).await.json());
+    let third = ids_of(&server.get(&format!("{}?startIndex=5&count=2", users_url(&org)), &token).await.json());
+
+    let mut walked = Vec::new();
+    walked.extend(first.clone());
+    walked.extend(second.clone());
+    walked.extend(third);
+
+    assert_eq!(walked.len(), 6, "paging must visit every resource");
+    let unique: HashSet<&String> = walked.iter().collect();
+    assert_eq!(unique.len(), 6, "no resource may appear on two pages: {walked:?}");
+
+    // The same page twice returns the same thing.
+    let first_again = ids_of(&server.get(&format!("{}?startIndex=1&count=2", users_url(&org)), &token).await.json());
+    assert_eq!(first_again, first, "paging must be repeatable");
+
+    // ...and the whole listing is in the order the pages walked.
+    let all = ids_of(&server.get(&format!("{}?count=100", users_url(&org)), &token).await.json());
+    assert_eq!(all, walked, "pages must follow the collection's own order");
+}
+
+// -- legacy duplicate externalIds ------------------------------------------------------------------
+
+#[rocket::async_test]
+async fn a_filter_returns_every_row_sharing_an_external_id() {
+    // `external_id` has no unique constraint and Directory Connector data may already contain
+    // duplicates. A filter optimisation must not quietly drop the extra rows.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, mut first) = server.member(&org, "one@example.test", MembershipType::User, true).await;
+    let (_, mut second) = server.member(&org, "two@example.test", MembershipType::User, true).await;
+
+    let conn = server.conn().await;
+    first.set_external_id(Some("legacy-dup".to_owned()));
+    first.save(&conn).await.expect("first");
+    second.set_external_id(Some("legacy-dup".to_owned()));
+    second.save(&conn).await.expect("second");
+
+    for name in ["G1", "G2"] {
+        let mut group = Group::new(org.uuid.clone(), name.to_owned(), false, Some("g-dup".to_owned()));
+        group.save(&conn).await.expect("group");
+    }
+    drop(conn);
+
+    let listed =
+        server.get(&format!("{}?filter=externalId%20eq%20%22legacy-dup%22", users_url(&org)), &token).await.json();
+    assert_eq!(listed["totalResults"], json!(2), "both legacy user rows must be returned");
+
+    let groups = server.get(&format!("{}?filter=externalId%20eq%20%22g-dup%22", groups_url(&org)), &token).await.json();
+    assert_eq!(groups["totalResults"], json!(2), "both legacy group rows must be returned");
+}
+
+// -- group displayName uniqueness --------------------------------------------------------------------
+
+#[rocket::async_test]
+async fn group_display_name_uniqueness_holds_on_rename_too() {
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    server.group(&org, "Engineering", None).await;
+    let other = server.group(&org, "Sales", None).await;
+    let path = format!("{}/{}", groups_url(&org), other.uuid);
+
+    // An invariant only checked on create is one a rename walks straight through.
+    server
+        .put(&path, &token, json!({"displayName": "Engineering"}))
+        .await
+        .assert_error(Status::Conflict, Some("uniqueness"));
+
+    server
+        .patch(&path, &token, json!({"Operations": [{"op": "Replace", "path": "displayName", "value": "Engineering"}]}))
+        .await
+        .assert_error(Status::Conflict, Some("uniqueness"));
+
+    // Case-insensitively, the same way creation compares.
+    server
+        .patch(&path, &token, json!({"Operations": [{"op": "Replace", "path": "displayName", "value": "ENGINEERING"}]}))
+        .await
+        .assert_error(Status::Conflict, Some("uniqueness"));
+
+    // Renaming a group to the name it already has is not a collision with itself.
+    let self_rename = server.put(&path, &token, json!({"displayName": "Sales"})).await;
+    assert_eq!(self_rename.status, Status::Ok, "{}", self_rename.body);
+}
+
+// -- privileged membership policy ---------------------------------------------------------------------
+
+#[rocket::async_test]
+async fn privileged_members_may_be_managed_in_groups() {
+    // Chosen policy: privileged memberships are read-only as *User* resources -- SCIM cannot
+    // change their role, revoke them or delete them -- but their group association is ordinary
+    // directory data an identity provider is expected to manage. Blocking it would fail an entire
+    // group sync because one member happens to be an Owner.
+    //
+    // This is a real access decision, not a formality: adding anyone to a group that already has
+    // collection assignments grants them that access. Documented in docs/scim/README.md.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, owner) = server.member(&org, "owner@example.test", MembershipType::Owner, true).await;
+    let group = server.group(&org, "Eng", None).await;
+    let path = format!("{}/{}", groups_url(&org), group.uuid);
+
+    let added = server
+        .patch(
+            &path,
+            &token,
+            json!({"Operations": [{"op": "Add", "path": "members", "value": [{"value": owner.uuid}]}]}),
+        )
+        .await;
+    assert_eq!(added.status, Status::Ok, "group membership is manageable for privileged members: {}", added.body);
+    assert_eq!(added.json()["members"][0]["value"], json!(owner.uuid.to_string()));
+
+    // The User resource itself remains untouchable.
+    server
+        .patch(
+            &format!("{}/{}", users_url(&org), owner.uuid),
+            &token,
+            json!({"Operations": [{"op": "Replace", "path": "active", "value": false}]}),
+        )
+        .await
+        .assert_error(Status::Forbidden, Some("mutability"));
+}
+
+// -- forbidden vs mutability ----------------------------------------------------------------------------
+
+#[rocket::async_test]
+async fn a_read_only_resource_is_a_mutability_fault_and_a_policy_refusal_is_not() {
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, owner) = server.member(&org, "owner@example.test", MembershipType::Owner, true).await;
+
+    // Writing a resource this server treats as read-only is a genuine `mutability` fault.
+    server
+        .delete(&format!("{}/{}", users_url(&org), owner.uuid), &token)
+        .await
+        .assert_error(Status::Forbidden, Some("mutability"));
+
+    // Renaming an account is refused as immutable, with the RFC's 400 rather than a 403.
+    let (_, member) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
+    server
+        .put(&format!("{}/{}", users_url(&org), member.uuid), &token, json!({"userName": "other@example.test"}))
+        .await
+        .assert_error(Status::BadRequest, Some("mutability"));
+}
+
+// -- request-wide member limits ---------------------------------------------------------------------------
+
+#[rocket::async_test]
+async fn the_member_limit_covers_the_whole_patch_document() {
+    // The per-array cap only bounds one operation; spreading ids across operations must not get
+    // past it.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let group = server.group(&org, "Eng", None).await;
+
+    let ops: Vec<Value> = (0..10)
+        .map(|op| {
+            let values: Vec<Value> = (0..600).map(|i| json!({"value": format!("m-{op}-{i}")})).collect();
+            json!({"op": "Add", "path": "members", "value": values})
+        })
+        .collect();
+
+    server
+        .patch(&format!("{}/{}", groups_url(&org), group.uuid), &token, json!({"Operations": ops}))
+        .await
+        .assert_error(Status::BadRequest, Some("tooMany"));
+}
+
+// -- token rotation ---------------------------------------------------------------------------------------
+
+#[rocket::async_test]
+async fn rotation_replaces_the_token_atomically() {
+    let server = TestServer::new().await;
+    let (org, first) = server.org("acme").await;
+    let conn = server.conn().await;
+
+    let second = OrganizationScimKey::rotate_for_org(&org.uuid, &conn).await.expect("rotate");
+    drop(conn);
+
+    assert_ne!(first, second);
+    server.get(&users_url(&org), &first).await.assert_error(Status::Unauthorized, None);
+    assert_eq!(server.get(&users_url(&org), &second).await.status, Status::Ok);
+
+    // One key per organization survives rotation.
+    let conn = server.conn().await;
+    assert!(OrganizationScimKey::find_by_org(&org.uuid, &conn).await.is_some());
+}
+
+// -- unauthenticated traffic is charged separately ------------------------------------------------------------
+
+#[rocket::async_test]
+async fn junk_requests_do_not_consume_the_provisioning_budget() {
+    // A request with no bearer token, or one that is not even the right shape, is never something
+    // an identity provider sends. Those are charged to the strict unauthenticated limiter so a
+    // flood of them cannot eat the allowance a real sync needs.
+    let server = TestServer::with_exclusive_settings().await;
+    let (org, token) = server.org("acme").await;
+
+    server.set_unauthenticated_rate_limit_exhausted(true);
+
+    // Junk is rejected by the strict budget...
+    server.get_unauthenticated(&users_url(&org)).await.assert_error(Status::TooManyRequests, None);
+    server.get(&users_url(&org), "not-a-token").await.assert_error(Status::TooManyRequests, None);
+
+    // ...while real provisioning traffic is unaffected.
+    assert_eq!(server.get(&users_url(&org), &token).await.status, Status::Ok);
 }

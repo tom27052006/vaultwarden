@@ -93,24 +93,47 @@ impl<'r, T: DeserializeOwned> FromData<'r> for ScimBody<T> {
 pub struct ScimResponse {
     status: Status,
     body: Value,
+    /// `Location`, set only on `201 Created`.
     location: Option<String>,
+    /// `Content-Location`, set when the body is a single resource representation.
+    content_location: Option<String>,
 }
 
 impl ScimResponse {
+    /// A response whose body is not a single resource, such as a `ListResponse` or a discovery
+    /// document. No `Content-Location`: there is no one resource for it to point at.
     pub fn ok(body: Value) -> Self {
         Self {
             status: Status::Ok,
             body,
             location: None,
+            content_location: None,
         }
     }
 
-    /// `201 Created` with the `Location` header RFC 7644 section 3.3 requires.
+    /// `200 OK` carrying one resource representation.
+    ///
+    /// RFC 7644 section 3.4.1 has responses identify the resource they carry, so
+    /// `Content-Location` mirrors the `meta.location` inside the body.
+    pub fn resource(body: Value, location: impl Into<String>) -> Self {
+        let location = location.into();
+        Self {
+            status: Status::Ok,
+            body,
+            location: None,
+            content_location: Some(location),
+        }
+    }
+
+    /// `201 Created` with the `Location` header RFC 7644 section 3.3 requires, plus the matching
+    /// `Content-Location` for the representation in the body.
     pub fn created(body: Value, location: impl Into<String>) -> Self {
+        let location = location.into();
         Self {
             status: Status::Created,
             body,
-            location: Some(location.into()),
+            location: Some(location.clone()),
+            content_location: Some(location),
         }
     }
 
@@ -120,6 +143,7 @@ impl ScimResponse {
             status: Status::NoContent,
             body: Value::Null,
             location: None,
+            content_location: None,
         }
     }
 }
@@ -131,6 +155,9 @@ impl Responder<'_, 'static> for ScimResponse {
 
         if let Some(location) = self.location {
             builder.header(Header::new("Location", location));
+        }
+        if let Some(content_location) = self.content_location {
+            builder.header(Header::new("Content-Location", content_location));
         }
 
         if self.status == Status::NoContent {

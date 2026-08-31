@@ -28,8 +28,20 @@ pub fn check_rate_limit(ip: &IpAddr) -> Result<(), ()> {
     crate::ratelimit::check_limit_scim(ip)
 }
 
+/// Budget for requests that cannot possibly be legitimate provisioning traffic.
+///
+/// A request with no bearer credential, or one whose token is not even the right shape, is never
+/// something an identity provider sends. Charging those to Vaultwarden's existing strict
+/// unauthenticated limiter keeps the generous provisioning budget for provisioning, so a flood of
+/// junk cannot consume the allowance a real sync needs -- and it is decided from the request
+/// headers alone, before any database work.
+#[cfg(not(test))]
+pub fn check_unauthenticated_rate_limit(ip: &IpAddr) -> Result<(), ()> {
+    crate::ratelimit::check_limit_unauthenticated(ip).map_err(|_| ())
+}
+
 #[cfg(test)]
-pub use test_overrides::{check_rate_limit, groups_enabled, scim_enabled};
+pub use test_overrides::{check_rate_limit, check_unauthenticated_rate_limit, groups_enabled, scim_enabled};
 
 #[cfg(test)]
 pub(in crate::api::scim) mod test_overrides {
@@ -44,6 +56,7 @@ pub(in crate::api::scim) mod test_overrides {
     pub(in crate::api::scim) static SCIM_ENABLED: AtomicBool = AtomicBool::new(true);
     pub(in crate::api::scim) static GROUPS_ENABLED: AtomicBool = AtomicBool::new(true);
     pub(in crate::api::scim) static RATE_LIMIT_EXHAUSTED: AtomicBool = AtomicBool::new(false);
+    pub(in crate::api::scim) static UNAUTH_RATE_LIMIT_EXHAUSTED: AtomicBool = AtomicBool::new(false);
 
     pub fn scim_enabled() -> bool {
         SCIM_ENABLED.load(Ordering::Relaxed)
@@ -55,6 +68,14 @@ pub(in crate::api::scim) mod test_overrides {
 
     pub fn check_rate_limit(_ip: &IpAddr) -> Result<(), ()> {
         if RATE_LIMIT_EXHAUSTED.load(Ordering::Relaxed) {
+            Err(())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn check_unauthenticated_rate_limit(_ip: &IpAddr) -> Result<(), ()> {
+        if UNAUTH_RATE_LIMIT_EXHAUSTED.load(Ordering::Relaxed) {
             Err(())
         } else {
             Ok(())

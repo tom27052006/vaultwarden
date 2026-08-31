@@ -18,14 +18,19 @@ static LIMITER_ADMIN: LazyLock<Limiter> = LazyLock::new(|| {
     RateLimiter::keyed(Quota::with_period(seconds).expect("Non-zero admin ratelimit seconds").allow_burst(burst))
 });
 
+/// Provisioning traffic from an identity provider.
+///
+/// Expressed as a sustained rate rather than "one request per N seconds", because a directory
+/// sync is inherently high-volume: a first full sync of a few thousand members is several
+/// thousand requests, and a limiter that replenishes once a minute would stretch that over days.
 #[cfg_attr(
     test,
     expect(dead_code, reason = "the SCIM test suite substitutes a limiter it can drive deterministically")
 )]
 static LIMITER_SCIM: LazyLock<Limiter> = LazyLock::new(|| {
-    let seconds = Duration::from_secs(CONFIG.scim_ratelimit_seconds());
+    let per_second = NonZeroU32::new(CONFIG.scim_ratelimit_per_second()).expect("Non-zero SCIM ratelimit rate");
     let burst = NonZeroU32::new(CONFIG.scim_ratelimit_max_burst()).expect("Non-zero SCIM ratelimit burst");
-    RateLimiter::keyed(Quota::with_period(seconds).expect("Non-zero SCIM ratelimit seconds").allow_burst(burst))
+    RateLimiter::keyed(Quota::per_second(per_second).allow_burst(burst))
 });
 
 static LIMITER_UNAUTHENTICATED: LazyLock<Limiter> = LazyLock::new(|| {

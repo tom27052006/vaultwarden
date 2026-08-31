@@ -18,19 +18,22 @@ use crate::{
     api::core::log_event,
     db::{
         DbConn,
-        models::{EventType, Group, GroupId, GroupUser, Membership, MembershipId},
+        models::{EventType, Group, GroupId, GroupSaveOutcome, GroupUser, Membership, MembershipId},
     },
 };
 
 use super::{
     ACTING_SCIM_USER, AttributeProjection, GROUP_SCHEMA, ListQuery, Pagination, SCIM_DEVICE_TYPE, ScimContext,
     ScimToken,
-    error::{ScimError, ScimResult},
+    error::{ScimError, ScimResult, ScimType},
     filter::{Filter, GROUP_ATTRS},
     json::{ScimBody, ScimResponse},
     list_response,
     patch::{FieldChange, PatchRequest, apply_member_ops, plan_group_patch},
-    resource::{GroupView, ScimGroupRequest, ensure_schema, normalize_display_name, normalize_external_id},
+    resource::{
+        GroupView, MAX_MEMBERS_PER_REQUEST, ScimGroupRequest, ensure_schema, normalize_display_name,
+        normalize_external_id,
+    },
 };
 
 pub fn routes() -> Vec<Route> {
@@ -80,16 +83,26 @@ async fn current_members(ctx: &ScimContext, group_id: &GroupId, conn: &DbConn) -
 ///
 /// Called before any write, so a request naming even one foreign or unknown membership changes
 /// nothing at all. The error deliberately does not say whether the id exists elsewhere.
+///
+/// The lookup is batched: one query for the whole request rather than one per member, which is
+/// what keeps synchronising a large group from generating thousands of round trips. Tenancy is
+/// unchanged -- the organization is still bound into the query, so an id from another
+/// organization simply does not come back and the request is refused.
+///
+/// **Privileged memberships are accepted here on purpose.** Owners, Admins and Managers are
+/// read-only as *User* resources -- SCIM cannot change their role, revoke them or delete them --
+/// but their group association is ordinary directory data that an identity provider is expected
+/// to manage. See `docs/scim/design.md` for the security consequences.
 async fn resolve_members(ctx: &ScimContext, ids: &[MembershipId], conn: &DbConn) -> ScimResult<()> {
-    let mut seen: HashSet<&MembershipId> = HashSet::with_capacity(ids.len());
+    if ids.is_empty() {
+        return Ok(());
+    }
 
-    for id in ids {
-        if !seen.insert(id) {
-            continue;
-        }
-        if Membership::find_by_uuid_and_org(id, &ctx.org_id, conn).await.is_none() {
-            return Err(ScimError::invalid_value(format!("Member '{id}' is not a member of this organization.")));
-        }
+    let found: HashSet<MembershipId> =
+        Membership::find_existing_uuids_in_org(ids, &ctx.org_id, conn).await.into_iter().collect();
+
+    if let Some(missing) = ids.iter().find(|id| !found.contains(*id)) {
+        return Err(ScimError::invalid_value(format!("Member '{missing}' is not a member of this organization.")));
     }
 
     Ok(())
@@ -116,14 +129,30 @@ async fn ensure_group_external_id_available(
     Ok(())
 }
 
-/// Refuse to create a second group with a name that is already taken.
+/// Refuse to give a group a name another group in the organization already has.
 ///
-/// RFC 7643 does not require `displayName` to be unique and Vaultwarden does not enforce it, but
-/// identity providers treat it as a group's natural key: without this, every sync would create
-/// another copy of the same group. Only creation is checked, so existing duplicates keep working.
-async fn ensure_display_name_available(ctx: &ScimContext, display_name: &str, conn: &DbConn) -> ScimResult<()> {
-    let taken =
-        Group::find_by_organization(&ctx.org_id, conn).await.iter().any(|g| g.name.eq_ignore_ascii_case(display_name));
+/// RFC 7643 does not require `displayName` to be unique and Vaultwarden does not enforce it in the
+/// database, but identity providers treat it as a group's natural key: without this, every sync
+/// would create another copy of the same group.
+///
+/// Enforced on create **and** on rename -- `current` excludes the group being renamed -- because
+/// an invariant only checked on create is one a rename can walk straight through. Existing
+/// duplicates created by other means keep working; only new collisions are refused.
+///
+/// Comparison is Unicode case-insensitive, the same way everywhere, so a name is not "taken" on
+/// one code path and free on another.
+async fn ensure_display_name_available(
+    ctx: &ScimContext,
+    display_name: &str,
+    current: Option<&GroupId>,
+    conn: &DbConn,
+) -> ScimResult<()> {
+    let wanted = display_name.to_lowercase();
+
+    let taken = Group::find_by_organization(&ctx.org_id, conn)
+        .await
+        .iter()
+        .any(|g| g.name.to_lowercase() == wanted && Some(&g.uuid) != current);
 
     if taken {
         return Err(ScimError::conflict(format!(
@@ -163,19 +192,22 @@ fn apply_group_metadata(group: &mut Group, display_name: Option<String>, externa
     name_changed || external_id_changed
 }
 
-/// Persist a new membership list and record the change.
-async fn write_members(
+/// Record what a committed group mutation actually did.
+///
+/// Called **after** the transaction succeeds, so the audit log never claims a change that was
+/// rolled back. Only memberships that genuinely moved get an event: updating `{A, B}` to `{A, C}`
+/// records C joining and B leaving and says nothing about A, who did not change.
+async fn log_group_changes(
     ctx: &ScimContext,
     token: &ScimToken,
-    group_id: &GroupId,
-    members: Vec<MembershipId>,
+    group: &Group,
+    event: EventType,
+    outcome: &GroupSaveOutcome,
     conn: &DbConn,
-) -> ScimResult<()> {
-    // A single transaction, so a failure part way through cannot leave the group with a
-    // half-applied membership list.
-    GroupUser::replace_all_for_group(group_id, &ctx.org_id, members.clone(), conn).await?;
+) {
+    log_event(event, &group.uuid, &ctx.org_id, &ACTING_SCIM_USER.into(), SCIM_DEVICE_TYPE, &token.ip, conn).await;
 
-    for member_id in &members {
+    for member_id in outcome.added.iter().chain(outcome.removed.iter()) {
         log_event(
             EventType::OrganizationUserUpdatedGroups,
             member_id,
@@ -187,8 +219,6 @@ async fn write_members(
         )
         .await;
     }
-
-    Ok(())
 }
 
 /// Build the response body for a group, loading its membership only if the caller wants it.
@@ -219,18 +249,19 @@ const INDEXABLE_ATTRS: &[&str] = &["id", "externalid"];
 async fn narrow_by_index(ctx: &ScimContext, filter: &Filter, conn: &DbConn) -> Option<Vec<Group>> {
     let (attr, value) = filter.required_eq_on(INDEXABLE_ATTRS)?;
 
-    let found = match attr {
+    match attr {
         "id" => {
             let id = GroupId::from(value.to_owned());
-            Group::find_by_uuid_and_org(&id, &ctx.org_id, conn).await
+            Some(Group::find_by_uuid_and_org(&id, &ctx.org_id, conn).await.into_iter().collect())
         }
-        "externalid" => Group::find_by_external_id_and_org(value, &ctx.org_id, conn).await,
+        // Every match, not just the first: `external_id` carries no unique constraint, and
+        // existing installations may hold duplicates from the Directory Connector. Returning one
+        // row would make the optimisation quietly change the result set it is optimising.
+        "externalid" => Some(Group::find_all_by_external_id_and_org(value, &ctx.org_id, conn).await),
         // `displayName` has no unique index, so it is resolved by scanning the organization's
         // groups rather than by a single-row lookup.
-        _ => return None,
-    };
-
-    Some(found.into_iter().collect())
+        _ => None,
+    }
 }
 
 #[get("/<org_id>/Groups?<query..>")]
@@ -241,9 +272,9 @@ async fn get_groups(org_id: &str, query: ListQuery, token: ScimToken, conn: DbCo
     let pagination = Pagination::parse(query.start_index.as_deref(), query.count.as_deref())?;
     // Entra ID asks for groups with `excludedAttributes=members`; honouring that lets us skip the
     // membership lookup entirely.
-    let projection = AttributeProjection::parse(query.attributes.as_deref(), query.excluded_attributes.as_deref());
+    let projection = AttributeProjection::parse(query.attributes.as_deref(), query.excluded_attributes.as_deref())?;
 
-    let filter = query.filter.as_deref().map(|raw| Filter::parse(raw, GROUP_ATTRS)).transpose()?;
+    let filter = query.filter.as_deref().map(|raw| Filter::parse(raw, GROUP_ATTRS, GROUP_SCHEMA)).transpose()?;
 
     let groups: Vec<Group> = match &filter {
         Some(filter) => {
@@ -276,6 +307,11 @@ async fn get_groups(org_id: &str, query: ListQuery, token: ScimToken, conn: DbCo
         None => Group::find_by_organization(&ctx.org_id, &conn).await,
     };
 
+    // Paging slices this list, so it needs a defined order or two requests over an unchanged
+    // collection could skip or repeat a group.
+    let mut groups = groups;
+    groups.sort_by(|a, b| a.uuid.cmp(&b.uuid));
+
     let total = groups.len();
     let page = pagination.slice_range(total);
 
@@ -299,9 +335,10 @@ async fn get_group(
     let ctx = ScimContext::resolve(&token, org_id)?;
     let group = load_group(&ctx, group_id, &conn).await?;
 
-    let projection = AttributeProjection::parse(query.attributes.as_deref(), query.excluded_attributes.as_deref());
+    let projection = AttributeProjection::parse(query.attributes.as_deref(), query.excluded_attributes.as_deref())?;
 
-    Ok(ScimResponse::ok(render_group(&ctx, &group, &projection, &conn).await))
+    let body = render_group(&ctx, &group, &projection, &conn).await;
+    Ok(ScimResponse::resource(body, ctx.resource_location("Group", &group.uuid)))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -329,29 +366,22 @@ async fn post_group(
     let external_id = normalize_external_id(request.external_id.as_deref())?;
     let members = request.member_ids()?.unwrap_or_default();
 
-    ensure_display_name_available(&ctx, &display_name, &conn).await?;
+    ensure_display_name_available(&ctx, &display_name, None, &conn).await?;
     ensure_group_external_id_available(&ctx, external_id.as_ref(), None, &conn).await?;
     resolve_members(&ctx, &members, &conn).await?;
 
     // `access_all` is hard-coded off: SCIM must not be able to grant a group access to every
     // collection in the organization.
     let mut group = Group::new(ctx.org_id.clone(), display_name, false, external_id);
-    group.save(&conn).await?;
 
-    log_event(
-        EventType::GroupCreated,
-        &group.uuid,
-        &ctx.org_id,
-        &ACTING_SCIM_USER.into(),
-        SCIM_DEVICE_TYPE,
-        &token.ip,
-        &conn,
-    )
-    .await;
+    // The group row and its membership are written in one transaction, so a failure while
+    // persisting members rolls the group back too. Creating a group and then failing on its
+    // members would otherwise leave an empty group behind that the client never asked for.
+    let outcome = group.save_with_members(true, true, Some(members), &conn).await?;
 
-    if !members.is_empty() {
-        write_members(&ctx, &token, &group.uuid, members, &conn).await?;
-    }
+    // Events only after the write has actually committed, so the audit log never records a
+    // creation that was rolled back.
+    log_group_changes(&ctx, &token, &group, EventType::GroupCreated, &outcome, &conn).await;
 
     let projection = AttributeProjection::none();
     let body = render_group(&ctx, &group, &projection, &conn).await;
@@ -388,6 +418,11 @@ async fn put_group(
     // `Some(vec![])` means it explicitly asked for an empty group.
     let members = request.member_ids()?;
 
+    if let Some(display_name) = &display_name {
+        // Enforced on rename as well as on create, excluding this group, so a rename cannot
+        // produce the duplicate that creation refuses.
+        ensure_display_name_available(&ctx, display_name, Some(&group.uuid), &conn).await?;
+    }
     if !external_id.is_unchanged() {
         ensure_group_external_id_available(&ctx, external_id.to_stored().as_ref(), Some(&group.uuid), &conn).await?;
     }
@@ -397,28 +432,17 @@ async fn put_group(
 
     let metadata_changed = apply_group_metadata(&mut group, display_name, &external_id);
 
-    if metadata_changed {
-        group.save(&conn).await?;
-    }
-    if metadata_changed || members.is_some() {
-        log_event(
-            EventType::GroupUpdated,
-            &group.uuid,
-            &ctx.org_id,
-            &ACTING_SCIM_USER.into(),
-            SCIM_DEVICE_TYPE,
-            &token.ip,
-            &conn,
-        )
-        .await;
-    }
+    // One transaction for the row and the membership: a failure persisting members must not
+    // leave `displayName` or `externalId` changed.
+    let outcome = group.save_with_members(false, metadata_changed, members, &conn).await?;
 
-    if let Some(members) = members {
-        write_members(&ctx, &token, &group.uuid, members, &conn).await?;
+    if outcome.changed {
+        log_group_changes(&ctx, &token, &group, EventType::GroupUpdated, &outcome, &conn).await;
     }
 
     let projection = AttributeProjection::none();
-    Ok(ScimResponse::ok(render_group(&ctx, &group, &projection, &conn).await))
+    let body = render_group(&ctx, &group, &projection, &conn).await;
+    Ok(ScimResponse::resource(body, ctx.resource_location("Group", &group.uuid)))
 }
 
 #[patch("/<org_id>/Groups/<group_id>", data = "<body>")]
@@ -438,6 +462,9 @@ async fn patch_group(
     // nothing applied.
     let changes = plan_group_patch(&request)?;
 
+    if let Some(display_name) = &changes.display_name {
+        ensure_display_name_available(&ctx, display_name, Some(&group.uuid), &conn).await?;
+    }
     if !changes.external_id.is_unchanged() {
         ensure_group_external_id_available(&ctx, changes.external_id.to_stored().as_ref(), Some(&group.uuid), &conn)
             .await?;
@@ -447,35 +474,32 @@ async fn patch_group(
 
     let new_members = if changes.touches_members() {
         let current = current_members(&ctx, &group.uuid, &conn).await;
-        Some(apply_member_ops(&current, &changes.member_ops))
+        let resulting = apply_member_ops(&current, &changes.member_ops);
+
+        // The resulting membership is bounded too, not just the request that produced it, so a
+        // sequence of small `add` operations cannot grow a group past the limit.
+        if resulting.len() > MAX_MEMBERS_PER_REQUEST {
+            return Err(ScimError::bad_request(
+                ScimType::TooMany,
+                format!("A group may not exceed {MAX_MEMBERS_PER_REQUEST} members."),
+            ));
+        }
+        Some(resulting)
     } else {
         None
     };
 
     let metadata_changed = apply_group_metadata(&mut group, changes.display_name, &changes.external_id);
 
-    if metadata_changed {
-        group.save(&conn).await?;
-    }
-    if metadata_changed || new_members.is_some() {
-        log_event(
-            EventType::GroupUpdated,
-            &group.uuid,
-            &ctx.org_id,
-            &ACTING_SCIM_USER.into(),
-            SCIM_DEVICE_TYPE,
-            &token.ip,
-            &conn,
-        )
-        .await;
-    }
+    let outcome = group.save_with_members(false, metadata_changed, new_members, &conn).await?;
 
-    if let Some(members) = new_members {
-        write_members(&ctx, &token, &group.uuid, members, &conn).await?;
+    if outcome.changed {
+        log_group_changes(&ctx, &token, &group, EventType::GroupUpdated, &outcome, &conn).await;
     }
 
     let projection = AttributeProjection::none();
-    Ok(ScimResponse::ok(render_group(&ctx, &group, &projection, &conn).await))
+    let body = render_group(&ctx, &group, &projection, &conn).await;
+    Ok(ScimResponse::resource(body, ctx.resource_location("Group", &group.uuid)))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -490,9 +514,14 @@ async fn delete_group(org_id: &str, group_id: &str, token: ScimToken, conn: DbCo
     let ctx = ScimContext::resolve(&token, org_id)?;
     let group = load_group(&ctx, group_id, &conn).await?;
 
+    // Delete first, then record it: an event claiming the group was deleted must not outlive a
+    // delete that failed.
+    let group_uuid = group.uuid.clone();
+    group.delete(&ctx.org_id, &conn).await?;
+
     log_event(
         EventType::GroupDeleted,
-        &group.uuid,
+        &group_uuid,
         &ctx.org_id,
         &ACTING_SCIM_USER.into(),
         SCIM_DEVICE_TYPE,
@@ -500,8 +529,6 @@ async fn delete_group(org_id: &str, group_id: &str, token: ScimToken, conn: DbCo
         &conn,
     )
     .await;
-
-    group.delete(&ctx.org_id, &conn).await?;
 
     Ok(ScimResponse::no_content())
 }
