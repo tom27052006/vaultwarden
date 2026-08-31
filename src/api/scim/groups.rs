@@ -23,7 +23,7 @@ use crate::{
 };
 
 use super::{
-    ACTING_SCIM_USER, AttributeProjection, GROUP_SCHEMA, ListQuery, Pagination, SCIM_DEVICE_TYPE, ScimContext,
+    ACTING_SCIM_USER, AttributeProjection, GROUP_SCHEMA, ListQuery, ProjectionQuery, SCIM_DEVICE_TYPE, ScimContext,
     ScimToken,
     error::{ScimError, ScimResult, ScimType},
     filter::{Filter, GROUP_ATTRS},
@@ -269,10 +269,11 @@ async fn get_groups(org_id: &str, query: ListQuery, token: ScimToken, conn: DbCo
     ensure_groups_enabled()?;
     let ctx = ScimContext::resolve(&token, org_id)?;
 
-    let pagination = Pagination::parse(query.start_index.as_deref(), query.count.as_deref())?;
+    let pagination = query.pagination()?;
     // Entra ID asks for groups with `excludedAttributes=members`; honouring that lets us skip the
-    // membership lookup entirely.
-    let projection = AttributeProjection::parse(query.attributes.as_deref(), query.excluded_attributes.as_deref())?;
+    // membership lookup entirely. Parsed against the Group schema, so a User-qualified attribute
+    // name is foreign here and cannot alias onto a Group attribute.
+    let projection = query.projection(GROUP_SCHEMA)?;
 
     let filter = query.filter.as_deref().map(|raw| Filter::parse(raw, GROUP_ATTRS, GROUP_SCHEMA)).transpose()?;
 
@@ -327,7 +328,7 @@ async fn get_groups(org_id: &str, query: ListQuery, token: ScimToken, conn: DbCo
 async fn get_group(
     org_id: &str,
     group_id: &str,
-    query: ListQuery,
+    query: ProjectionQuery,
     token: ScimToken,
     conn: DbConn,
 ) -> ScimResult<ScimResponse> {
@@ -335,7 +336,7 @@ async fn get_group(
     let ctx = ScimContext::resolve(&token, org_id)?;
     let group = load_group(&ctx, group_id, &conn).await?;
 
-    let projection = AttributeProjection::parse(query.attributes.as_deref(), query.excluded_attributes.as_deref())?;
+    let projection = query.projection(GROUP_SCHEMA)?;
 
     let body = render_group(&ctx, &group, &projection, &conn).await;
     Ok(ScimResponse::resource(body, ctx.resource_location("Group", &group.uuid)))
@@ -345,9 +346,10 @@ async fn get_group(
 // Create
 // ---------------------------------------------------------------------------------------------
 
-#[post("/<org_id>/Groups", data = "<body>")]
+#[post("/<org_id>/Groups?<query..>", data = "<body>")]
 async fn post_group(
     org_id: &str,
+    query: ProjectionQuery,
     body: ScimBody<ScimGroupRequest>,
     token: ScimToken,
     conn: DbConn,
@@ -357,7 +359,9 @@ async fn post_group(
     let request = body.into_inner()?;
 
     // Everything is validated before the group is created, so a bad member reference does not
-    // leave an empty group behind.
+    // leave an empty group behind. That includes the projection: a request whose response cannot
+    // be rendered fails before it writes anything.
+    let projection = query.projection(GROUP_SCHEMA)?;
     ensure_schema(request.schemas.as_ref(), GROUP_SCHEMA)?;
     let Some(raw_name) = request.display_name.as_deref() else {
         return Err(ScimError::invalid_value("'displayName' is required."));
@@ -383,7 +387,6 @@ async fn post_group(
     // creation that was rolled back.
     log_group_changes(&ctx, &token, &group, EventType::GroupCreated, &outcome, &conn).await;
 
-    let projection = AttributeProjection::none();
     let body = render_group(&ctx, &group, &projection, &conn).await;
     let location = ctx.resource_location("Group", &group.uuid);
 
@@ -394,10 +397,11 @@ async fn post_group(
 // Update
 // ---------------------------------------------------------------------------------------------
 
-#[put("/<org_id>/Groups/<group_id>", data = "<body>")]
+#[put("/<org_id>/Groups/<group_id>?<query..>", data = "<body>")]
 async fn put_group(
     org_id: &str,
     group_id: &str,
+    query: ProjectionQuery,
     body: ScimBody<ScimGroupRequest>,
     token: ScimToken,
     conn: DbConn,
@@ -405,6 +409,7 @@ async fn put_group(
     ensure_groups_enabled()?;
     let ctx = ScimContext::resolve(&token, org_id)?;
     let request = body.into_inner()?;
+    let projection = query.projection(GROUP_SCHEMA)?;
     ensure_schema(request.schemas.as_ref(), GROUP_SCHEMA)?;
 
     let mut group = load_group(&ctx, group_id, &conn).await?;
@@ -440,15 +445,15 @@ async fn put_group(
         log_group_changes(&ctx, &token, &group, EventType::GroupUpdated, &outcome, &conn).await;
     }
 
-    let projection = AttributeProjection::none();
     let body = render_group(&ctx, &group, &projection, &conn).await;
     Ok(ScimResponse::resource(body, ctx.resource_location("Group", &group.uuid)))
 }
 
-#[patch("/<org_id>/Groups/<group_id>", data = "<body>")]
+#[patch("/<org_id>/Groups/<group_id>?<query..>", data = "<body>")]
 async fn patch_group(
     org_id: &str,
     group_id: &str,
+    query: ProjectionQuery,
     body: ScimBody<PatchRequest>,
     token: ScimToken,
     conn: DbConn,
@@ -456,6 +461,7 @@ async fn patch_group(
     ensure_groups_enabled()?;
     let ctx = ScimContext::resolve(&token, org_id)?;
     let request = body.into_inner()?;
+    let projection = query.projection(GROUP_SCHEMA)?;
     let mut group = load_group(&ctx, group_id, &conn).await?;
 
     // Plan the whole document first. A single unsupported operation fails the request with
@@ -497,7 +503,6 @@ async fn patch_group(
         log_group_changes(&ctx, &token, &group, EventType::GroupUpdated, &outcome, &conn).await;
     }
 
-    let projection = AttributeProjection::none();
     let body = render_group(&ctx, &group, &projection, &conn).await;
     Ok(ScimResponse::resource(body, ctx.resource_location("Group", &group.uuid)))
 }

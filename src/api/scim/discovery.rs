@@ -157,15 +157,22 @@ fn user_schema(ctx: &ScimContext) -> Value {
         "name": "User",
         "description": "Organization member",
         // The mutability values here are what the implementation actually enforces, not what a
-        // stock Core User schema would say. Two deliberate deviations, both documented in
+        // stock Core User schema would say. Three deliberate deviations, all documented in
         // docs/scim/design.md:
         //
         // * `userName` is `immutable` rather than `readWrite`. It maps to the account's global
         //   email address -- the login identity every other organization resolves through -- so
         //   SCIM sets it at creation and refuses any later change.
-        // * `displayName` is `immutable` rather than `readWrite`. It is used only when this
-        //   request creates a brand-new account; an existing account keeps its own name, because
-        //   that name is visible in every organization it belongs to.
+        // * `displayName` is `immutable` rather than `readWrite`. It names a brand-new account
+        //   this request creates; an existing account keeps its own name, because that name is
+        //   visible in every organization it belongs to. Re-sending the stored value is a no-op;
+        //   sending a different one is refused with `scimType: mutability`.
+        // * `emails` is `immutable` rather than `readOnly`, because `POST /Users` genuinely
+        //   accepts `emails[].value` as the identity when `userName` is absent. Advertising it
+        //   `readOnly` while letting it decide creation state would be describing a different
+        //   server. `emails.value` is the same global account email as `userName` and follows
+        //   exactly the same rule; `type` and `primary` really are server-derived, so those two
+        //   stay `readOnly` rather than being levelled up to match their parent.
         "attributes": [
             attribute("userName", "string", false, true, "immutable", "server", false),
             attribute("externalId", "string", false, false, "readWrite", "none", true),
@@ -176,10 +183,10 @@ fn user_schema(ctx: &ScimContext) -> Value {
                 "type": "complex",
                 "multiValued": true,
                 "required": false,
-                "mutability": "readOnly",
+                "mutability": "immutable",
                 "returned": "default",
                 "subAttributes": [
-                    attribute("value", "string", false, false, "readOnly", "none", false),
+                    attribute("value", "string", false, false, "immutable", "server", false),
                     attribute("type", "string", false, false, "readOnly", "none", false),
                     attribute("primary", "boolean", false, false, "readOnly", "none", false),
                 ],
@@ -198,10 +205,19 @@ fn group_schema(ctx: &ScimContext) -> Value {
         "id": GROUP_SCHEMA,
         "name": "Group",
         "description": "Organization group",
-        // `displayName` is advertised as server-unique because that is enforced, on create and on
-        // rename alike: identity providers treat it as a group's natural key.
+        // `displayName` is advertised `uniqueness: "none"`, even though SCIM refuses to create or
+        // rename a group into a name another group in the organization already has.
+        //
+        // The two are not the same claim. `uniqueness: "server"` says the value *is* unique across
+        // this service provider, and Vaultwarden cannot promise that: `groups.name` has no unique
+        // constraint, and an installation may already hold duplicates created by hand or by the
+        // Directory Connector. The SCIM layer only refuses to introduce *new* collisions. Saying
+        // "server" would be describing an invariant the storage does not hold, and a client that
+        // believed it could resolve a group by name and get one row.
+        //
+        // See docs/scim/design.md section 12.
         "attributes": [
-            attribute("displayName", "string", false, true, "readWrite", "server", false),
+            attribute("displayName", "string", false, true, "readWrite", "none", false),
             attribute("externalId", "string", false, false, "readWrite", "none", true),
             json!({
                 "name": "members",

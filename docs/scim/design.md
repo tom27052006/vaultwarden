@@ -160,17 +160,28 @@ from the fact that the row is fetched with the path organization id already boun
 
 ### Verification
 
-1. Rate-limit the request by client IP (fail closed on limiter error).
+1. Resolve the client IP.
 2. Reject unless `SCIM_ENABLED` (returns `404`).
 3. Read `Authorization: Bearer <token>`. Missing or non-Bearer gives `401`.
-4. Split into exactly three `.`-separated parts; part 0 must equal `scim_v1`.
+4. Split into exactly three `.`-separated parts and check their shape without touching the
+   database: part 0 must equal `scim_v1`, part 1 must be a hyphenated UUID, part 2 must be
+   43 characters of base64url (`SCIM_SECRET_ENCODED_LEN`, derived from the 32 random bytes
+   the generator produces). Anything else is `401`.
 5. Fetch the row `WHERE uuid = <part 1> AND org_uuid = <organization from the URL>`.
 6. Compare `sha256_hex(part 2)` against the stored hash with `crypto::ct_eq`.
+7. Charge the request to a rate limiter, chosen by outcome — see below.
+
+The shape checks in step 4 are a **filter, not an authorization decision**. Everything they
+reject could not have matched a stored row anyway; rejecting it from the headers alone is
+what keeps junk traffic from costing a database round trip. Nothing they accept is trusted:
+authorization still comes entirely from step 6.
 
 Every failure in steps 3-6 returns the *same* SCIM `401` body with no detail that
 distinguishes "no such organization" from "no such key" from "wrong secret". When no row is
 found, the SHA-256 and the constant-time comparison are still performed against a fixed
-dummy hash so the secret-comparison path costs the same either way.
+dummy hash so the secret-comparison path costs the same either way. The shape checks
+introduce no new oracle: they are decided from the token's own text, without reference to
+any stored key, so they reveal only what the client already knows about what it sent.
 
 The remaining measurable difference is the database lookup itself (indexed hit vs. miss).
 That is not a practical oracle against a 256-bit secret and it is additionally covered by
@@ -179,6 +190,47 @@ the IP rate limiter; it is recorded here rather than papered over.
 Handlers additionally re-assert `token.org_id == <organization from the URL>` as
 defence-in-depth, so a mistake in the guard's path-parameter extraction cannot become a
 cross-tenant bug.
+
+### Which limiter a request is charged to
+
+There are two per-IP budgets and a request draws on exactly one of them, **decided by the
+outcome of authentication rather than by the request's arrival**:
+
+| Outcome | Budget |
+| --- | --- |
+| No `Authorization` header, non-Bearer scheme, wrong token shape | `UNAUTHENTICATED_RATELIMIT_*` |
+| Well-formed token, unknown key id or wrong secret | `UNAUTHENTICATED_RATELIMIT_*` |
+| Authenticated | `SCIM_RATELIMIT_*` |
+
+The provisioning budget is generous because a directory sync is high-volume by nature, and
+that is precisely why nothing unauthenticated may draw on it. An earlier revision checked
+the SCIM limiter *first*, before parsing the token at all, which meant a flood of junk
+consumed a real sync's allowance before additionally being charged to the strict budget —
+contradicting what this document and `.env.template` claimed. The order is now:
+
+1. client IP
+2. `SCIM_ENABLED`
+3. parse and shape-check the bearer token
+4. on anything that is not a well-formed token: charge the strict budget, return `401`
+   (or `429` if that budget is exhausted)
+5. verify the secret against the stored hash
+6. on failure: charge the strict budget, return `401` (or `429`)
+7. on success: charge the provisioning budget, return `429` if it is exhausted, otherwise
+   run the handler
+
+The two budgets are therefore independent in both directions: exhausting the strict one
+does not throttle a real sync, and exhausting the provisioning one does not stop the server
+from rejecting junk with a plain `401`. A disabled server answers `404` without touching
+either, because that is not an authentication failure.
+
+Note what this does *not* claim. A structurally valid token with a wrong secret still costs
+one indexed single-row `SELECT` before it can be recognised as wrong, because recognising it
+is what the lookup is for. That cost is bounded per IP only after the fact — the strict
+budget throttles the *next* attempt, not the current one. Gating the lookup on the strict
+budget instead would mean charging successful requests to it as well, which is exactly the
+starvation this section exists to prevent. Shape-checking first removes the cheap bulk of
+junk from that path; the residual is one primary-key lookup, which is the least expensive
+thing the database does.
 
 ### Why SHA-256 and not Argon2/PBKDF2
 
@@ -322,6 +374,41 @@ IdP authority over a directory: the IdP is the source of truth for who is in sco
 operator who does not want that should remove the member instead of revoking them, or
 delete the SCIM token.
 
+#### When reactivation cannot issue an invitation
+
+Somebody provisioned with `active: false` never received an invitation, because sending one would
+have contradicted the state the IdP asked for. Reactivation is the point at which it becomes
+wanted, so `active: true` on an account that has never registered issues one then
+(`ensure_invitation_for`): an email when mail is enabled, otherwise the `Invitation` row that lets
+an unregistered account complete registration.
+
+**If that fails, the reactivation fails with it.** `active: true` on an unregistered account is a
+promise that the person can now get in; leaving the membership active while the only way in was
+never created would tell the IdP the change succeeded while the user has no usable path into the
+organization, and nothing downstream would ever notice. The membership is put back to revoked and
+the request returns `500`, which is a status IdPs retry.
+
+The rollback is deliberately honest about what it can and cannot undo:
+
+* Re-revoking the membership is a single row write on a row already loaded, and is reliable. If
+  even that write fails, the failure is logged at `error` level naming the membership — an
+  operator has something concrete to act on rather than a silent inconsistency.
+* An invitation **email** already handed to the MTA cannot be recalled. Someone may therefore
+  receive an invitation for a membership that is revoked again. That is the same harmless state as
+  any revoked invitee: the invitation link resolves to a membership with no access.
+
+This is not distributed atomicity and is not presented as such. It is "the database part is
+reversible, the mail part is not, and the reversible part is reversed".
+
+Retries stay safe. `ensure_invitation_for` is idempotent — with mail disabled it creates an
+`Invitation` only when none exists — and a membership that is *already* active never enters the
+reactivation branch at all, so the ordinary case where an IdP re-sends `active: true` on every
+sync performs no invitation side effect and cannot double-send. The only path that re-sends is a
+retry of a reactivation that genuinely failed, which is the intended behaviour.
+
+A **registered** account needs nothing issued, so this path does not apply to it at all: there is
+no side effect that could fail.
+
 ### `DELETE /Users/<id>`
 
 Removes the **membership**, via the same safe path as the admin "remove member" action.
@@ -354,17 +441,79 @@ documented remedy for a genuine rename is deprovision-and-reprovision.
 
 `User.name` (`displayName`) is not an authorization attribute, but it is equally global: it is
 shown in every organization the account belongs to. SCIM therefore does not write it on an
-account that already exists. Unlike `userName`, an inbound change is **accepted and ignored**
-rather than rejected — the response returns the stored value, which RFC 7644 section 3.5.1
-explicitly permits ("the service provider MAY return the resource with modified values") —
-because rejecting it would break provisioning outright for a purely cosmetic attribute.
+account that already exists.
+
+It is treated exactly like `userName`, and for the same reason: the User schema advertises it
+`immutable`, so that is what it has to be. An earlier revision advertised `immutable` and then
+silently ignored an inbound change, which is a different server than the one discovery described —
+the identity provider is told the rename succeeded and nothing anywhere records that it did not.
+The three outcomes RFC 7643's `immutable` implies are now all implemented:
+
+* re-sending the stored value is an accepted **no-op**, which is what an identity provider does on
+  every sync;
+* a *different* value is `400` with `scimType: "mutability"`;
+* `remove` is `400` with `scimType: "mutability"` — an immutable attribute cannot be unset any
+  more than it can be changed.
+
+This applies to `PUT`, to `PATCH` with a path, and to pathless `PATCH` objects alike, and to a
+path qualified with the User core schema. An *extension* attribute whose last segment happens to be
+`displayName` is still ignored, because it is not this attribute (section 9).
 
 There is one exception, and it is not really an exception to the rule above: when provisioning
 *creates* a brand-new shell account, `displayName` (or `name.formatted`, or `givenName` plus
 `familyName`) is used as that account's name. Nobody else has a claim on an account that did not
 exist a moment ago, and the alternative is an organization full of members displayed by email
 address. `provision_org_member` takes the name as a parameter and uses it only on the create path,
-so the Directory Connector — which passes `None` — behaves exactly as before.
+so the Directory Connector — which passes `None` — behaves exactly as before. That name is bounded
+at **50 characters** (`MAX_ACCOUNT_NAME_LEN`), the same limit registration and `POST
+/accounts/profile` enforce, so SCIM cannot write a name the account's own owner would be refused.
+`users.name` is `TEXT` on every backend, so the bound is Vaultwarden's rule rather than storage,
+and it is counted in characters — a 50-character name is 50 characters whatever alphabet it uses.
+
+`POST /Users` for an address that *already* has an account keeps the stored name and returns it,
+rather than failing. That is deliberate and consistent with `immutable`: the SCIM resource being
+created is the membership, and the account it points at is pre-existing state the request did not
+create. The known consequence is that an identity provider whose directory holds a different name
+will see the server's value in the `POST` response and may follow up with a `PUT` or `PATCH` that
+now fails with `mutability` until the mapping is corrected or `displayName` is unmapped. That is
+the honest outcome: the previous behaviour hid the same disagreement instead of surfacing it.
+
+### `emails` and why it is immutable rather than read-only
+
+`POST /Users` accepts `emails[].value` as the resource's identity when `userName` is absent, which
+is what identity providers that do not map `userName` send. Advertising `emails` as `readOnly`
+while letting it decide creation state described a server that does not exist.
+
+`emails` and `emails.value` are therefore advertised `immutable`, and behave like `userName`:
+
+* they may be supplied at creation, where they name the same global account email `userName` does;
+* a later request asserting the same address is an accepted no-op;
+* a different address is `400`/`mutability`, because one organization's identity provider must not
+  rename a global account (the account-takeover reasoning above applies unchanged);
+* `remove` is `400`/`mutability`.
+
+`PUT` resolves the asserted identity the same way `POST` does — `userName` first, then the primary
+(or first) `emails` entry — so a client that provisions by email also updates by email. Previously
+`PUT` looked only at `userName` and ignored `emails` outright, which meant the attribute decided
+creation and then silently stopped mattering.
+
+`PATCH` follows the same precedence. That matters because Entra ID maps `userName` from
+`userPrincipalName` and `emails` from `mail`, and in real tenants those differ for plenty of
+people, so a `PatchOp` document routinely carries both. The planner records the two separately and
+folds them together after the whole document has been read, with `userName` winning — otherwise
+whichever operation happened to come last decided the answer, and the same document passed or
+failed depending on the order the client serialised it in.
+
+`displayName` on the update paths is compared, never written, so it is **not** length-bounded
+there: an account whose name predates the 50-character limit has to be able to have its own name
+echoed back at it. The bound applies on `POST`, which is the only path that writes one. An explicit
+`null` or an empty string reads as a removal and gets the same `mutability` answer `remove` gets,
+rather than an `invalidValue` about the JSON.
+
+`emails.type` and `emails.primary` stay `readOnly`: they are derived by this server (`"work"`,
+`true`) and no client value is ever consulted. The parent and its sub-attributes deliberately do
+**not** all share one mutability, because they do not all behave the same way; describing them
+uniformly would be the same kind of approximation this section removes.
 
 ## 8. Groups
 
@@ -439,6 +588,47 @@ member set — a real transaction is used: `GroupUser::replace_all_for_group` pe
 delete and the inserts inside a single `conn.transaction(...)` on all three backends, so a
 failure mid-way cannot leave a group with a partially applied membership list.
 
+### `DELETE` is not transactional — a recorded limitation
+
+Group and user *mutation* is transactional, as above. **Deletion is not**, and this section says so
+rather than leaving it to be discovered.
+
+Both deletes SCIM performs call straight into Vaultwarden's existing model layer, which cleans up
+dependent rows through a sequence of separate `conn.run(...)` calls before removing the row itself:
+
+* `Membership::delete` (from `DELETE /Users/<id>`) bumps the user's revision, then
+  `CollectionUser::delete_all_by_user_and_org`, then `GroupUser::delete_all_by_member`, then
+  deletes the `users_organizations` row.
+* `Group::delete` (from `DELETE /Groups/<id>`) runs `CollectionGroup::delete_all_by_group`, then
+  `GroupUser::delete_all_by_group`, then deletes the `groups` row.
+
+Each step is its own statement and its own implicit transaction. A failure between two of them —
+a lost connection, a backend restart, a disk error — leaves the cleanup partially applied: the
+collection or group assignments are gone while the membership or group row remains. The SCIM
+request returns `500`, so the identity provider is told the delete failed, which is true; what it
+is not told is that some of it happened.
+
+The consequences are bounded, and in the direction of *less* access rather than more:
+
+* A `Membership` whose `CollectionUser` and `GroupUser` rows were removed still exists and is
+  still returned by `GET`, but has lost the collection and group access those rows granted. It is
+  a member with no shared access, not a member with extra access.
+* A `Group` whose `CollectionGroup` and `GroupUser` rows were removed still exists and is still
+  returned by `GET`, but grants nothing and contains nobody.
+* A retry of the same `DELETE` re-runs the cleanup — every step is idempotent, deleting rows that
+  are already gone is a no-op — and gets to the final row deletion. Identity providers retry a
+  `500`, so the common case self-heals.
+
+**This is not fixed here, deliberately.** Making it atomic means moving these deletes inside a
+`conn.transaction(...)`, which changes the signature and the failure behaviour of model methods
+that many unrelated code paths call — the admin panel, organization deletion, account deletion,
+the Directory Connector. That is a model-layer change with its own testing and review surface, and
+doing it inside a SCIM feature branch would hide it. It belongs in its own change.
+
+Note the asymmetry with the mutation paths: those were made transactional here because
+`Group::save_with_members` is code this feature introduced, so making it atomic cost nothing
+outside SCIM. `Membership::delete` and `Group::delete` are pre-existing shared code.
+
 ### Privileged members and group association
 
 The privileged-membership rule in section 7 is about the **`User` resource**: SCIM cannot change
@@ -482,6 +672,47 @@ never read, write or hide the core attribute that happens to share its final nam
 
 Value paths are split off before the namespace is resolved, so a colon inside a filter literal --
 `members[value eq "urn:x:y"]` -- is never mistaken for a namespace separator.
+
+### Operators are validated against the attribute's type
+
+`AttrSpec` carries each filterable attribute's SCIM data type (RFC 7643 section 2.3), not just its
+`caseExact` flag, and the parser checks the operator and the literal against it. A filter that
+cannot be satisfied by any resource is a `400`/`invalidFilter`, not an empty `ListResponse` — an
+empty list is indistinguishable from a correct filter over an empty directory, which is the worst
+possible answer to hand an operator debugging an attribute mapping.
+
+| Type | Attributes | Allowed | Rejected |
+| --- | --- | --- | --- |
+| `boolean` | `active`, `emails.primary` | `eq`, `ne`, `pr` | `co`, `sw`, `ew`, `gt`, `ge`, `lt`, `le` |
+| `string` | `id`, `externalId`, `userName`, `displayName`, `emails.value`, `emails.type`, `members.value`, `meta.resourceType` | all of them | — |
+| `complex` | `emails`, `members` | `pr`, and a value path `attr[...]` | every comparison operator |
+
+RFC 7644 section 3.4.2.2 defines `co`/`sw`/`ew` on strings and `gt`/`ge`/`lt`/`le` on strings,
+numbers and dates. None of them has a meaning for a boolean, so none of them is accepted for one.
+A complex multi-valued attribute has no scalar to compare at all; the error names the sub-attribute
+to use instead (`emails.value`).
+
+Literals are checked too, and **coerced first where the coercion is unambiguous**, so being stricter
+about nonsense does not make the parser stricter about real clients:
+
+* a string literal on a boolean attribute (`active eq "True"`) becomes a boolean — Entra ID sends
+  booleans as strings in some flows, and `PATCH` already tolerates it;
+* a bare `true`/`false`/number token on a string attribute (`externalId eq 12345`) becomes text —
+  the tokenizer types a literal by *shape*, and Microsoft's own documentation shows unquoted
+  filter values, so this used to be a silent no-match;
+* anything else that cannot apply — `active eq "yes"`, `active eq 1` — is `invalidFilter`.
+
+`null` now means what it reads like: `attr eq null` matches a resource where the attribute has no
+value and `attr ne null` matches one where it does. Previously both silently matched nothing. It is
+rejected with the operators it cannot apply to.
+
+There is no `reference` type. `members.$ref` and `meta.location` are rendered but never filtered
+against, so a variant for them would describe nothing; if a reference attribute ever becomes
+filterable, that is when the type earns its place.
+
+Error details name the attribute, the operator and the type. All three come from the client's own
+filter and from what `/Schemas` already publishes, so nothing is disclosed that the client did not
+already have.
 
 Bounds, to keep evaluation cheap and to prevent recursive blow-up:
 
@@ -534,9 +765,28 @@ default order is not the same as supporting `sortBy` and `sortOrder`, which are 
 
 ### Attribute projection
 
-`attributes` and `excludedAttributes` (RFC 7644 section 3.9) are honoured on **every** response
-that carries a resource, not only on list endpoints. They are mutually exclusive; a request
-supplying both is a `400`, because reconciling them would mean guessing at the client's intent.
+`attributes` and `excludedAttributes` (RFC 7644 section 3.9) are honoured on **every** operation
+that returns a resource representation, which is all ten of them:
+
+| | Users | Groups |
+| --- | --- | --- |
+| create | `POST /Users` | `POST /Groups` |
+| replace | `PUT /Users/<id>` | `PUT /Groups/<id>` |
+| modify | `PATCH /Users/<id>` | `PATCH /Groups/<id>` |
+| read | `GET /Users/<id>` | `GET /Groups/<id>` |
+| list | `GET /Users` | `GET /Groups` |
+
+The write verbs take a `ProjectionQuery` — just the two parameters — rather than the list
+endpoints' `ListQuery`, so a `POST` does not silently accept a `filter`, a `startIndex` or a
+`count`, none of which mean anything there.
+
+The two parameters are mutually exclusive; a request supplying both is a `400`, because reconciling
+them would mean guessing at the client's intent. On the write verbs that check runs **before** the
+mutation, so a request whose response could not be rendered does not provision anybody first.
+
+Projection changes the representation and nothing else. It never changes what a write did, and it
+never changes the headers that identify the resource: `POST` still returns `Location`, and every
+single-resource response still returns a `Content-Location` matching its own `meta.location`.
 
 * `id` and `schemas` are the minimum response set and always survive.
 * `meta` does **not**. RFC 7643 gives it `returned: default`, so `attributes=userName` legitimately
@@ -549,9 +799,44 @@ supplying both is a `400`, because reconciling them would mean guessing at the c
 * Naming the whole attribute wins over naming a sub-attribute of it, so
   `attributes=emails,emails.value` returns all of `emails`.
 
+#### Parsed against the resource type being served
+
+`AttributeProjection::parse` takes the active core schema — `USER_SCHEMA` on `/Users`,
+`GROUP_SCHEMA` on `/Groups` — and resolves every name against that one schema.
+
+An earlier revision parsed each list against **both** core schemas and kept the union, which meant
+`GET /Users?attributes=urn:ietf:params:scim:schemas:core:2.0:Group:externalId` selected the *User's*
+`externalId`, and a User-qualified name could hide a Group attribute. Namespace-awareness that
+tries every namespace is not namespace-awareness.
+
+The rule is now the same one PATCH paths and filters follow (section 9):
+
+* an unqualified name is an attribute of the active resource's core schema;
+* a name qualified with the active core schema is that same attribute;
+* anything else — the *other* resource type's core schema included — is a foreign extension
+  attribute. This server renders nothing from any extension namespace, so naming one selects
+  nothing and excludes nothing.
+
+Selecting only foreign names is not the same as selecting nothing at all:
+`attributes=urn:example:Custom:foo` narrows the response to `id` and `schemas`, because the client
+did ask for a specific list and this server has none of it.
+
+#### The membership optimisation
+
 The optimisation Entra ID depends on survives all of this: `excludedAttributes=members` still means
-a group's membership is never loaded from the database. An exclusion that names only a
-*sub*-attribute does not skip the load, because the data is still needed.
+a group's membership is never loaded from the database, on the list endpoint as well as the
+single-resource one. `attributes=displayName` skips it too, because `members` is not in the list.
+`attributes=members.value` does load it, and so does `excludedAttributes=members.$ref` — an
+exclusion naming only a *sub*-attribute still needs the data.
+
+Because the projection is now schema-scoped, that skip is driven only by the Group's own `members`.
+A `urn:...:User:members` or `urn:example:Custom:members` cannot trigger it, and a Group-qualified
+name on `/Users` cannot make the user endpoint do group work — there is no group work there to do,
+and the name simply selects nothing.
+
+When membership is not loaded the `members` key is **absent** from the response rather than an
+empty array. An empty array would assert that the group has no members, which is a different and
+possibly false statement.
 
 ## 11. Errors and content types
 
@@ -612,9 +897,22 @@ Organization-scoped uniqueness is enforced for:
 * **`externalId`** — `Membership.external_id` and `Group.external_id` are checked against
   the organization before assignment; a collision returns `409`/`uniqueness`.
 * **Group `displayName`** — not required to be unique by RFC 7643 and not unique in
-  Vaultwarden today, so it is not enforced on update. `POST /Groups` with an existing
-  `displayName` is still rejected with `409` because Entra treats `displayName` as the
-  group's natural key and would otherwise create duplicates on every sync.
+  Vaultwarden's storage, but enforced by the SCIM layer on create **and** on rename, because
+  Entra treats `displayName` as the group's natural key and would otherwise create a duplicate
+  on every sync. An invariant checked only on create is one a rename walks straight through.
+
+  **Discovery advertises `uniqueness: "none"` for it, and that is not a contradiction.**
+  `uniqueness: "server"` is a statement about the data — that the value *is* unique across this
+  service provider — and Vaultwarden cannot make it: `groups.name` has no unique constraint, and an
+  installation may already hold duplicates created by hand, by the web vault, or by the Directory
+  Connector before SCIM was ever enabled. What SCIM enforces is narrower: it refuses to *introduce*
+  a new collision. Advertising "server" would tell a client it can resolve a group by name and
+  expect one row, which a pre-existing duplicate makes false. The interoperability check stays; the
+  claim about the storage goes.
+
+  `userName` keeps `uniqueness: "server"`, which is true: at most one membership per account per
+  organization is enforced on create, and the account email it maps to is unique across the
+  installation.
 
 **Known limitation, recorded rather than hidden:** these are pre-checks, not database
 constraints. Two concurrent `POST /Users` for the same address can both pass the check and
@@ -677,8 +975,13 @@ contains the token secret.**
 
 ## 15. Abuse protection
 
-* Every SCIM request passes the dedicated IP rate limiter before any parsing or database
-  access, so authentication attempts, listing and writes are all covered.
+* Every SCIM request is charged to one of two per-IP rate limiters, chosen by whether it
+  authenticated (section 5). Failed authentication — including a request with no credential at
+  all — draws on the strict `UNAUTHENTICATED_RATELIMIT_*` budget and never on the generous
+  `SCIM_RATELIMIT_*` one, so junk traffic cannot consume a real sync's allowance and a saturated
+  sync cannot stop the server rejecting junk.
+* A bearer token is shape-checked against the format this server issues before any database
+  lookup, so malformed credentials cost nothing but the header parse.
 * SCIM request bodies are capped at **1 MiB**, independently of Rocket's 20 MB global JSON
   limit, and over-sized bodies return `413`.
 * `members` arrays are capped at **5000** entries per request.
@@ -765,15 +1068,27 @@ Two findings came out of this pass and were fixed:
 ## 19. Known deviations and limitations
 
 1. `meta.created` / `meta.lastModified` are absent on `User` resources (section 6).
-2. `userName` is never writable, and `displayName` is only ever applied to an account this
-   request creates (section 7).
+2. `userName`, `displayName` and `emails` are immutable: settable at creation, a no-op when
+   re-asserted, `400`/`mutability` when changed or removed (section 7). A `POST` for an address
+   that already has an account keeps the stored name and returns it rather than failing, so an IdP
+   whose directory disagrees will see the disagreement on its next update instead of on the create.
 3. `PUT` treats an omitted multi-valued attribute as "unchanged", not "clear" (section 8).
 4. Uniqueness is enforced by pre-check, not by a database constraint (section 12).
-5. `Group.displayName` uniqueness is enforced on create only, for Entra's benefit
-   (section 12).
+5. `Group.displayName` collisions are refused on create and on rename, but discovery advertises
+   `uniqueness: "none"` because the storage cannot guarantee it and pre-existing duplicates may
+   already exist (section 12).
 6. SCIM token lifecycle events reuse `OrganizationUpdated` (section 14).
 7. Discovery endpoints require authentication, although RFC 7644 section 4 permits them to
    be anonymous; they are tenant-scoped and Entra always sends the bearer token.
 8. `PATCH` atomicity is validate-then-apply rather than a single transaction, except for
    group member replacement which is genuinely transactional (section 8).
 9. `useScim` stays `false` (section 16).
+10. **`DELETE` is not transactional.** `Membership::delete` and `Group::delete` clean up dependent
+    rows across several statements, so a failure mid-way can leave the cleanup partially applied
+    while the request reports `500`. Bounded, retry-safe and in the direction of less access, but
+    real; fixing it is a model-layer change that does not belong in this branch (section 8).
+11. **Reactivation is not atomic with invitation delivery.** An `Invitation` row that cannot be
+    written rolls the reactivation back; an email already handed to the MTA cannot be recalled
+    (section 7).
+12. A structurally valid but wrong bearer token costs one indexed lookup before the strict rate
+    limiter is charged; the limiter throttles the next attempt, not that one (section 5).

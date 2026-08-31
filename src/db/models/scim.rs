@@ -40,6 +40,13 @@ pub const SCIM_TOKEN_PREFIX: &str = "scim_v1";
 /// plain SHA-256 (rather than a slow password KDF) is an appropriate way to store it.
 const SCIM_SECRET_BYTES: usize = 32;
 
+/// Length of the encoded secret: [`SCIM_SECRET_BYTES`] as base64url without padding.
+///
+/// Published so the request guard can reject a wrongly sized secret from the request headers
+/// alone, before it costs a database lookup. `4 * ceil(n / 3)` minus the padding that was not
+/// written: 32 bytes is 43 characters.
+pub const SCIM_SECRET_ENCODED_LEN: usize = SCIM_SECRET_BYTES.div_ceil(3) * 4 - (3 - SCIM_SECRET_BYTES % 3) % 3;
+
 /// A freshly generated key, together with the one and only copy of its plaintext token.
 pub struct NewScimKey {
     pub key: OrganizationScimKey,

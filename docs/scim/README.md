@@ -110,13 +110,21 @@ ignored, so an over-broad default mapping does not fail provisioning.
 | `userName` | account email address | required on create; **cannot be changed afterwards** |
 | `externalId` | membership external id | read/write |
 | `active` | membership revoked / not revoked | read/write |
-| `emails[primary].value` | account email address | read-only (mirrors `userName`) |
-| `displayName` | account name | used **only** when Vaultwarden creates a brand-new account |
+| `emails[primary].value` | account email address | same address as `userName`; may be supplied on create, **cannot be changed afterwards** |
+| `displayName` | account name | used **only** when Vaultwarden creates a brand-new account; **cannot be changed afterwards**, max 50 characters |
 | `name.formatted`, `name.givenName`, `name.familyName` | account name | fallback for `displayName`, same rule |
 
 For Entra, the important mappings are `userName` → `userPrincipalName` (or `mail`) and
 `active` → `Not([IsSoftDeleted])`. Remove mappings for attributes Vaultwarden does not store if you
 prefer a tidy configuration; leaving them in is harmless.
+
+**One mapping is worth checking: `displayName`.** A Vaultwarden account's name is global — it is
+shown in every organization the account belongs to — so SCIM sets it only when it *creates* the
+account and never rewrites an existing one. Re-sending the value the server already holds is fine
+and is what a sync normally does. Sending a *different* value returns
+`400` / `scimType: "mutability"`, which the identity provider will report as a failure for that
+user. If your directory holds names that differ from what people set for themselves in Vaultwarden,
+unmap `displayName` (and `name.*`); provisioning does not need it.
 
 ### Group
 
@@ -293,7 +301,12 @@ Each organization has at most one SCIM token.
 * **Failed authentication is uniform.** Wrong secret, unknown key, and unknown organization all
   produce the same `401` with the same body, so SCIM cannot be used to discover which
   organizations exist.
-* **Requests are rate limited** by client IP before any parsing or database work.
+* **Requests are rate limited** by client IP, using two separate budgets. A request that fails to
+  authenticate — no token, a malformed one, or a wrong one — is charged to
+  `UNAUTHENTICATED_RATELIMIT_*`; only a request that authenticated is charged to
+  `SCIM_RATELIMIT_*`. Junk traffic therefore cannot consume the allowance a real sync needs, and a
+  busy sync cannot stop the server rejecting junk. Malformed tokens are recognised from the request
+  headers alone, before any database work.
 * **Bodies are capped** at 1 MiB, member lists at 5000 entries per request, `PATCH` documents at
   1000 operations, and page size at 500 resources.
 * **Enable `ORG_EVENTS_ENABLED`** so that provisioning actions are recorded. SCIM events are logged
@@ -332,7 +345,10 @@ These are deliberate. Each is explained in [`design.md`](design.md).
 2. **`meta.created` and `meta.lastModified` are omitted on `User` resources.** Vaultwarden's
    membership table has no timestamps, and reporting the account's timestamps instead would be
    misleading. Both are optional in RFC 7643. Group resources do carry them.
-3. **`userName` and `displayName` are not writable** on an existing account (see above).
+3. **`userName`, `displayName` and `emails` are not writable** on an existing account (see above).
+   All three map to global account state, so SCIM may set them when it creates the account and
+   accepts them unchanged afterwards, but a genuine change returns
+   `400` / `scimType: "mutability"` rather than being quietly ignored.
 4. **An omitted multi-valued attribute in a `PUT` means "unchanged", not "clear".** A strict
    reading of RFC 7644 would empty a group whose `members` a client forgot to send; Vaultwarden
    requires an explicit `"members": []` to do that.
@@ -361,6 +377,23 @@ These are deliberate. Each is explained in [`design.md`](design.md).
 9. **`PATCH` is atomic per request, not serialisable against concurrent requests.** Two
    simultaneous group updates each apply completely or not at all, but a client sending both at
    once is not guaranteed a particular order.
+10. **Group `displayName` is advertised as not unique**, even though SCIM refuses to create or
+    rename a group into a name another group in the organization already has. The check is an
+    interoperability rule, not a storage guarantee: `groups.name` has no unique constraint, and an
+    installation may already contain duplicates created through the web vault or the Directory
+    Connector. Saying otherwise in schema discovery would be a promise the server cannot keep.
+11. **`DELETE` is not transactional.** Removing a member or a group cleans up their collection and
+    group assignments in several steps. If one of those steps fails the request returns `500` and
+    part of the cleanup may already have happened — the resource still exists but has lost the
+    access those rows granted. Retrying the `DELETE` completes it, and identity providers retry a
+    `500` automatically.
+12. **Reactivating an unregistered user depends on an invitation being issued.** `active: true` on
+    somebody who was provisioned inactive and has never registered also creates their invitation.
+    If that cannot be created the reactivation is rolled back and the request fails, so the
+    identity provider retries rather than believing a user can sign in who cannot. An invitation
+    *email* that was already sent cannot be recalled, so someone may receive a mail for a
+    membership that ended up revoked again; the link resolves to a revoked membership and grants
+    nothing.
 
 ## Troubleshooting
 
@@ -384,9 +417,21 @@ and they need collection access — through a group or directly — before they 
 Those members hold an Owner, Admin or Manager role. Change the role to User in the web vault if you
 want SCIM to manage them.
 
-**Provisioning fails with 400 and `mutability` on `userName`**
-The identity provider is trying to change an existing account's email address. Deprovision and
-reprovision instead.
+**Provisioning fails with 400 and `mutability` on `userName` or `emails`**
+The identity provider is trying to change an existing account's email address. That address is the
+account's global login identity, so SCIM will not rewrite it. Deprovision and reprovision instead.
+
+**Provisioning fails with 400 and `mutability` on `displayName`**
+The identity provider is trying to rename an existing Vaultwarden account. The account's name is
+global — visible in every organization it belongs to — so SCIM only sets it when it creates the
+account. Either unmap `displayName` in the identity provider, or change the name in the web vault
+so the two agree.
+
+**A filter returns 400 and `invalidFilter`**
+The filter is not valid for the attribute it names — `active co true` and `active gt false` are the
+common cases, because `active` is a boolean and only `eq`, `ne` and `pr` apply to one. The `detail`
+in the response says which attribute and operator are at fault. Previously such a filter returned
+an empty list, which looked like an empty directory.
 
 **Provisioning new users fails with 403 mentioning `INVITATIONS_ALLOWED`**
 The server has invitations switched off, so SCIM will not create accounts for addresses that do
@@ -396,9 +441,10 @@ not already have one. Set `INVITATIONS_ALLOWED=true`.
 `SIGNUPS_DOMAINS_WHITELIST` excludes the directory's domain. Add it, or clear the whitelist.
 
 **Requests fail with 429**
-Raise `SCIM_RATELIMIT_MAX_BURST`, or `SCIM_RATELIMIT_PER_SECOND`, to suit the size of your
-directory. Requests carrying no bearer token, or a malformed one, are charged to
-`UNAUTHENTICATED_RATELIMIT_*` instead, so junk traffic cannot exhaust a real sync's allowance.
+If the token is valid, raise `SCIM_RATELIMIT_MAX_BURST`, or `SCIM_RATELIMIT_PER_SECOND`, to suit
+the size of your directory. If the token is wrong — including missing or malformed — the `429`
+comes from `UNAUTHENTICATED_RATELIMIT_*` instead, and the fix is the credential rather than the
+limit. The two budgets are independent: exhausting one does not affect the other.
 
 **Nothing appears in the organization's event log**
 Set `ORG_EVENTS_ENABLED=true`.

@@ -28,43 +28,81 @@ pub const MAX_FILTER_NODES: usize = 128;
 // Attribute specifications
 // ---------------------------------------------------------------------------------------------
 
+/// The SCIM data type of a filterable attribute (RFC 7643 section 2.3).
+///
+/// Knowing the type is what lets the parser reject `active co true` with `invalidFilter` instead
+/// of evaluating it to "no match". A filter that cannot be true for any resource is a client bug,
+/// and returning an empty list makes it look like an empty directory.
+///
+/// Only the types this server actually publishes are listed. There is no `Reference` variant
+/// because no reference attribute is filterable here: `members.$ref` and `meta.location` are
+/// rendered but never matched against, so a variant for them would describe nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttrType {
+    String,
+    Boolean,
+    /// A multi-valued complex attribute such as `emails` or `members`. Only `pr` and a value path
+    /// (`emails[type eq "work"]`) apply to the attribute itself; a comparison has to name a
+    /// sub-attribute.
+    Complex,
+}
+
 /// One filterable attribute of a resource type.
 ///
 /// `case_exact` mirrors the `caseExact` characteristic in RFC 7643: identifiers are compared
-/// exactly, human-facing text is compared case-insensitively.
+/// exactly, human-facing text is compared case-insensitively. It is meaningless for the other
+/// types and is `false` there.
 pub struct AttrSpec {
     /// Canonical lower-case path, e.g. `username` or `emails.value`.
     pub path: &'static str,
+    pub attr_type: AttrType,
     pub case_exact: bool,
 }
 
-const fn spec(path: &'static str, case_exact: bool) -> AttrSpec {
+const fn text(path: &'static str, case_exact: bool) -> AttrSpec {
     AttrSpec {
         path,
+        attr_type: AttrType::String,
         case_exact,
     }
 }
 
+const fn boolean(path: &'static str) -> AttrSpec {
+    AttrSpec {
+        path,
+        attr_type: AttrType::Boolean,
+        case_exact: false,
+    }
+}
+
+const fn complex(path: &'static str) -> AttrSpec {
+    AttrSpec {
+        path,
+        attr_type: AttrType::Complex,
+        case_exact: false,
+    }
+}
+
 pub const USER_ATTRS: &[AttrSpec] = &[
-    spec("id", true),
-    spec("externalid", true),
-    spec("username", false),
-    spec("displayname", false),
-    spec("active", true),
-    spec("emails", false),
-    spec("emails.value", false),
-    spec("emails.type", false),
-    spec("emails.primary", true),
-    spec("meta.resourcetype", false),
+    text("id", true),
+    text("externalid", true),
+    text("username", false),
+    text("displayname", false),
+    boolean("active"),
+    complex("emails"),
+    text("emails.value", false),
+    text("emails.type", false),
+    boolean("emails.primary"),
+    text("meta.resourcetype", false),
 ];
 
 pub const GROUP_ATTRS: &[AttrSpec] = &[
-    spec("id", true),
-    spec("externalid", true),
-    spec("displayname", false),
-    spec("members", true),
-    spec("members.value", true),
-    spec("meta.resourcetype", false),
+    text("id", true),
+    text("externalid", true),
+    text("displayname", false),
+    complex("members"),
+    text("members.value", true),
+    text("meta.resourcetype", false),
 ];
 
 fn find_spec(attrs: &'static [AttrSpec], path: &str) -> Option<&'static AttrSpec> {
@@ -89,6 +127,29 @@ pub enum CompareOp {
 }
 
 impl CompareOp {
+    /// The keyword the client wrote, for error messages.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Eq => "eq",
+            Self::Ne => "ne",
+            Self::Co => "co",
+            Self::Sw => "sw",
+            Self::Ew => "ew",
+            Self::Gt => "gt",
+            Self::Ge => "ge",
+            Self::Lt => "lt",
+            Self::Le => "le",
+        }
+    }
+
+    /// Is this one of the equality operators, the only ones a boolean or a `null` supports?
+    ///
+    /// RFC 7644 section 3.4.2.2 defines `co`, `sw` and `ew` on strings, and `gt`/`ge`/`lt`/`le` on
+    /// strings, numbers and dates. None of them has a meaning for a boolean.
+    const fn is_equality(self) -> bool {
+        matches!(self, Self::Eq | Self::Ne)
+    }
+
     fn from_keyword(kw: &str) -> Option<Self> {
         match kw {
             "eq" => Some(Self::Eq),
@@ -110,8 +171,10 @@ pub enum CompValue {
     Str(String),
     Bool(bool),
     Null,
-    /// Kept as text: none of Vaultwarden's SCIM attributes are numeric, so a number can only ever
-    /// fail to match. Preserving the literal keeps error messages honest.
+    /// Kept as text, and only ever an *intermediate*: the tokenizer types a literal by shape, and
+    /// [`Parser::check_comparison`] then reconciles it with the attribute's declared type -- a
+    /// number against a string attribute becomes that text, and against any other type it is an
+    /// `invalidFilter`. No `Number` survives into a parsed [`Filter`].
     Number(String),
 }
 
@@ -448,7 +511,7 @@ impl<'a> Parser<'a> {
                 let op = self.expect_operator(&qualified)?;
                 let value = self.expect_value(op)?;
                 self.count_node()?;
-                self.require_known(&sub_path)?;
+                let value = self.check_comparison(&sub_path, op, value)?;
 
                 // An element has to satisfy both the bracket filter and the trailing comparison.
                 inner = Filter::And(
@@ -462,7 +525,7 @@ impl<'a> Parser<'a> {
             }
 
             self.count_node()?;
-            self.require_known(&path)?;
+            self.check_value_path(&path)?;
             return Ok(Filter::ValuePath {
                 path,
                 filter: Box::new(inner),
@@ -473,7 +536,7 @@ impl<'a> Parser<'a> {
         if self.peek_keyword("pr") {
             self.next();
             self.count_node()?;
-            self.require_known(&path)?;
+            self.check_presence(&path)?;
             return Ok(Filter::Present(path));
         }
 
@@ -482,7 +545,7 @@ impl<'a> Parser<'a> {
         let value = self.expect_value(op)?;
 
         self.count_node()?;
-        self.require_known(&path)?;
+        let value = self.check_comparison(&path, op, value)?;
         Ok(Filter::Compare {
             path,
             op,
@@ -577,7 +640,7 @@ impl<'a> Parser<'a> {
         if self.peek_keyword("pr") {
             self.next();
             self.count_node()?;
-            self.require_known(&path)?;
+            self.check_presence(&path)?;
             return Ok(Filter::Present(path));
         }
 
@@ -585,7 +648,7 @@ impl<'a> Parser<'a> {
         let value = self.expect_value(op)?;
 
         self.count_node()?;
-        self.require_known(&path)?;
+        let value = self.check_comparison(&path, op, value)?;
         Ok(Filter::Compare {
             path,
             op,
@@ -597,11 +660,92 @@ impl<'a> Parser<'a> {
     ///
     /// Silently treating an unknown attribute as "never matches" would make a mistyped filter look
     /// like an empty directory, which is a much worse failure mode for an operator to debug.
-    fn require_known(&self, path: &AttrPath) -> ScimResult<()> {
-        if find_spec(self.attrs, &path.path).is_some() {
+    fn require_known(&self, path: &AttrPath) -> ScimResult<&'static AttrSpec> {
+        find_spec(self.attrs, &path.path).ok_or_else(|| {
+            ScimError::invalid_filter(format!("Unknown or unsupported filter attribute '{}'.", path.path))
+        })
+    }
+
+    /// Check `attr op value` against the attribute's declared type, and normalise the literal.
+    ///
+    /// The parser knows every attribute's SCIM data type, so an operator or a literal that cannot
+    /// apply to it is a client error at parse time rather than a filter that quietly matches
+    /// nothing. `active co true` and `active gt "x"` are the motivating cases: both used to return
+    /// an empty list, which is indistinguishable from a correct filter over an empty directory.
+    ///
+    /// Two coercions are applied first, so being stricter about nonsense does not make the parser
+    /// stricter about real clients:
+    ///
+    /// * a string literal on a boolean attribute (`active eq "True"`), which Entra ID sends in
+    ///   some flows and which PATCH already tolerates;
+    /// * a bare `true`/`false`/number token on a string attribute (`externalId eq 12345`), which
+    ///   the tokenizer typed by shape rather than by the attribute it is compared against --
+    ///   Microsoft's own documentation shows unquoted filter values.
+    ///
+    /// Error details name the attribute, the operator and the type. They contain nothing but what
+    /// the client itself sent and what discovery already publishes.
+    fn check_comparison(&self, path: &AttrPath, op: CompareOp, value: CompValue) -> ScimResult<CompValue> {
+        let spec = self.require_known(path)?;
+
+        match spec.attr_type {
+            AttrType::Complex => Err(ScimError::invalid_filter(format!(
+                "'{}' is a multi-valued complex attribute and cannot be compared directly; \
+                 filter a sub-attribute such as '{}.value', or use a value path like '{}[...]'.",
+                path.path, path.path, path.path
+            ))),
+
+            AttrType::Boolean => {
+                if !op.is_equality() {
+                    return Err(ScimError::invalid_filter(format!(
+                        "Operator '{}' cannot be applied to the boolean attribute '{}'; use 'eq', 'ne' or 'pr'.",
+                        op.as_str(),
+                        path.path
+                    )));
+                }
+                match value {
+                    CompValue::Bool(b) => Ok(CompValue::Bool(b)),
+                    // Entra ID sends booleans as strings in some flows.
+                    CompValue::Str(s) if s.eq_ignore_ascii_case("true") => Ok(CompValue::Bool(true)),
+                    CompValue::Str(s) if s.eq_ignore_ascii_case("false") => Ok(CompValue::Bool(false)),
+                    CompValue::Null => Ok(CompValue::Null),
+                    CompValue::Str(_) | CompValue::Number(_) => Err(ScimError::invalid_filter(format!(
+                        "The boolean attribute '{}' can only be compared with 'true' or 'false'.",
+                        path.path
+                    ))),
+                }
+            }
+
+            AttrType::String => match value {
+                CompValue::Str(s) => Ok(CompValue::Str(s)),
+                // Typed by shape at tokenisation; against a string attribute the literal text is
+                // what the client meant.
+                CompValue::Number(n) => Ok(CompValue::Str(n)),
+                CompValue::Bool(b) => Ok(CompValue::Str(b.to_string())),
+                CompValue::Null if op.is_equality() => Ok(CompValue::Null),
+                CompValue::Null => Err(ScimError::invalid_filter(format!(
+                    "Operator '{}' cannot be applied to 'null'; use 'eq', 'ne' or 'pr' to test for a value.",
+                    op.as_str()
+                ))),
+            },
+        }
+    }
+
+    /// Check `attr pr`, which every type supports.
+    fn check_presence(&self, path: &AttrPath) -> ScimResult<()> {
+        self.require_known(path).map(|_| ())
+    }
+
+    /// Check the attribute a value path is applied to: `emails[...]` only means something for a
+    /// multi-valued complex attribute.
+    fn check_value_path(&self, path: &AttrPath) -> ScimResult<()> {
+        let spec = self.require_known(path)?;
+        if spec.attr_type == AttrType::Complex {
             return Ok(());
         }
-        Err(ScimError::invalid_filter(format!("Unknown or unsupported filter attribute '{}'.", path.path)))
+        Err(ScimError::invalid_filter(format!(
+            "'{}' is not a multi-valued complex attribute, so it cannot carry a value filter.",
+            path.path
+        )))
     }
 }
 
@@ -716,6 +860,17 @@ impl Filter {
                 value,
             } => {
                 let case_exact = find_spec(attrs, &path.path).is_some_and(|s| s.case_exact);
+                let present = resource.values_for(&path.path).is_some_and(|vs| !vs.is_empty());
+
+                // Comparing against `null` asks whether the attribute has a value at all. The
+                // parser only allows it with `eq` and `ne`, so there is no other case to handle.
+                if matches!(value, CompValue::Null) {
+                    return match op {
+                        CompareOp::Eq => !present,
+                        _ => present,
+                    };
+                }
+
                 match resource.values_for(&path.path) {
                     // `ne` against an absent attribute is true: nothing there equals the value.
                     None => *op == CompareOp::Ne,
@@ -766,8 +921,9 @@ fn compare(actual: &FilterValue, op: CompareOp, expected: &CompValue, case_exact
                 CompareOp::Le => a <= b,
             }
         }
-        // A present value is never equal to null, and mismatched types (a number compared against
-        // a string attribute, say) never match either. In both cases only `ne` can be true.
+        // The parser has already reconciled the literal with the attribute's declared type, so the
+        // only way to get here is a resource whose in-memory value does not match its own
+        // declaration. Treat it as "does not equal", the same as any other non-match.
         _ => op == CompareOp::Ne,
     }
 }
@@ -939,13 +1095,156 @@ mod tests {
         assert!(group_filter(r#"userName eq "x""#).is_err());
     }
 
+    // -- operator/type compatibility ---------------------------------------------------------------
+    //
+    // The parser knows each attribute's SCIM data type, so a comparison that cannot apply to it is
+    // a `400`/`invalidFilter` rather than a filter that quietly matches nothing. An empty list is
+    // indistinguishable from a correct filter over an empty directory, which is the worst possible
+    // thing to hand an operator debugging a mapping.
+
+    fn invalid_filter_error(input: &str) -> ScimError {
+        let Err(err) = user_filter(input) else {
+            panic!("{input} should have been rejected");
+        };
+        assert_eq!(err.status, rocket::http::Status::BadRequest);
+        assert_eq!(err.scim_type, Some(super::super::error::ScimType::InvalidFilter));
+        err
+    }
+
+    #[test]
+    fn boolean_attributes_reject_substring_and_ordering_operators() {
+        for op in ["co", "sw", "ew", "gt", "ge", "lt", "le"] {
+            let err = invalid_filter_error(&format!("active {op} true"));
+            assert!(err.detail.contains("boolean"), "{}", err.detail);
+            assert!(err.detail.contains(op), "the error should name the operator: {}", err.detail);
+        }
+    }
+
+    #[test]
+    fn boolean_attributes_accept_the_equality_operators_and_presence() {
+        assert!(user_filter("active eq true").is_ok());
+        assert!(user_filter("active ne false").is_ok());
+        assert!(user_filter("active pr").is_ok());
+        // Sub-attributes are typed too.
+        assert!(user_filter(r"emails[primary eq true]").is_ok());
+        assert!(user_filter(r"emails[primary co true]").is_err());
+    }
+
+    #[test]
+    fn boolean_attributes_reject_a_non_boolean_literal() {
+        for bad in [r#"active eq "yes""#, "active eq 1", "active ne 0", r#"active eq "active""#] {
+            let err = invalid_filter_error(bad);
+            assert!(err.detail.contains("'true' or 'false'"), "{}", err.detail);
+        }
+    }
+
+    #[test]
+    fn a_quoted_boolean_is_still_a_boolean() {
+        // Entra ID sends string booleans in some flows; PATCH already tolerates them, and
+        // rejecting them here would fail a filter that is unambiguous.
+        let active = user("a@example.test", None, true);
+        let inactive = user("a@example.test", None, false);
+
+        assert!(matches(r#"active eq "true""#, &active));
+        assert!(!matches(r#"active eq "true""#, &inactive));
+        assert!(matches(r#"active eq "False""#, &inactive), "and case-insensitively");
+    }
+
+    #[test]
+    fn an_unquoted_literal_on_a_string_attribute_is_text() {
+        // The tokenizer types a literal by shape, not by the attribute it is compared against.
+        // Microsoft's documentation shows unquoted filter values, so `externalId eq 12345` has to
+        // mean the string "12345" rather than a type mismatch that matches nothing.
+        let numeric = user("a@example.test", Some("12345"), true);
+        assert!(matches("externalId eq 12345", &numeric));
+        assert!(matches(r#"externalId eq "12345""#, &numeric));
+
+        let boolish = user("a@example.test", Some("true"), true);
+        assert!(matches("externalId eq true", &boolish));
+    }
+
+    #[test]
+    fn complex_attributes_cannot_be_compared_directly() {
+        // `emails` and `members` are multi-valued complex attributes: there is no scalar to
+        // compare. The error says what to write instead.
+        let err = invalid_filter_error(r#"emails eq "alice@example.test""#);
+        assert!(err.detail.contains("emails.value"), "{}", err.detail);
+
+        assert!(group_filter(r#"members eq "m1""#).is_err());
+        assert!(group_filter(r#"members co "m1""#).is_err());
+
+        // ...but presence and value paths still work, and so do the sub-attributes.
+        assert!(user_filter("emails pr").is_ok());
+        assert!(user_filter(r#"emails[value eq "a@example.test"]"#).is_ok());
+        assert!(user_filter(r#"emails.value eq "a@example.test""#).is_ok());
+        assert!(group_filter("members pr").is_ok());
+        assert!(group_filter(r#"members[value eq "m1"]"#).is_ok());
+    }
+
+    #[test]
+    fn a_value_path_only_applies_to_a_complex_attribute() {
+        // `emails.value` is a string sub-attribute, not a complex one, so it cannot carry a
+        // bracketed filter of its own.
+        let err = invalid_filter_error(r#"emails.value[type eq "work"]"#);
+        assert!(err.detail.contains("value filter"), "{}", err.detail);
+
+        // A scalar attribute is rejected too; here the inner `userName.value` is not an attribute
+        // at all, so the unknown-attribute check fires first. Either way it is `invalidFilter`.
+        invalid_filter_error(r#"userName[value eq "x"]"#);
+        invalid_filter_error(r#"active[value eq "x"]"#);
+    }
+
+    #[test]
+    fn null_tests_for_absence_rather_than_matching_nothing() {
+        let with = user("alice@example.test", Some("x"), true);
+        let without = user("alice@example.test", None, true);
+
+        assert!(matches("externalId eq null", &without), "`eq null` means the attribute has no value");
+        assert!(!matches("externalId eq null", &with));
+        assert!(matches("externalId ne null", &with));
+        assert!(!matches("externalId ne null", &without));
+    }
+
+    #[test]
+    fn null_is_rejected_with_the_operators_it_cannot_apply_to() {
+        for op in ["co", "sw", "ew", "gt", "ge", "lt", "le"] {
+            let err = invalid_filter_error(&format!("externalId {op} null"));
+            assert!(err.detail.contains("null"), "{}", err.detail);
+        }
+    }
+
+    #[test]
+    fn type_validation_does_not_reject_the_filters_entra_actually_sends() {
+        // Regression guard for the whole of this section: everything Microsoft documents, and
+        // everything the rest of this test module exercises, has to keep parsing.
+        for good in [
+            r#"userName eq "alice@example.test""#,
+            "externalId eq jyoung",
+            r#"emails[type eq "work"].value eq "alice@example.test""#,
+            r#"userName eq "a" and active eq true"#,
+            "active eq false",
+            "not (active eq true)",
+            r#"displayName co "Ali""#,
+            r#"displayName sw "A""#,
+            r#"userName ew ".test""#,
+            "externalId pr",
+            r#"meta.resourceType eq "User""#,
+        ] {
+            assert!(user_filter(good).is_ok(), "{good} must still parse");
+        }
+
+        for good in [r#"displayName eq "Engineering""#, r#"members[value eq "m1"]"#, r#"members.value eq "m1""#] {
+            assert!(group_filter(good).is_ok(), "{good} must still parse");
+        }
+    }
+
     #[test]
     fn rejects_malformed_filters() {
         assert!(user_filter("userName eq").is_err(), "missing value");
         assert!(user_filter(r#"userName "x""#).is_err(), "missing operator");
         assert!(user_filter(r#"userName xx "x""#).is_err(), "unknown operator");
         assert!(user_filter(r#"(userName eq "x""#).is_err(), "unbalanced parens");
-        assert!(user_filter(r#"userName eq "x")"#).is_err(), "trailing paren");
+        assert!(user_filter(r"userName eq 'x'").is_err(), "trailing paren");
         assert!(user_filter(r#"userName eq "unterminated"#).is_err(), "unterminated string");
         assert!(user_filter("").is_err(), "empty filter");
         assert!(user_filter("   ").is_err(), "whitespace-only filter");
@@ -974,7 +1273,7 @@ mod tests {
         }
         // The SQL-ish ones specifically must fail.
         assert!(user_filter("1=1").is_err());
-        assert!(user_filter(r#"userName eq 'x'"#).is_err());
+        assert!(user_filter(r"userName eq 'x'").is_err());
     }
 
     // -- limits --------------------------------------------------------------------------------
@@ -1079,7 +1378,7 @@ mod tests {
         assert!(matches(r#"emails[type eq "work"]"#, &u));
         assert!(!matches(r#"emails[type eq "home"]"#, &u));
         assert!(matches(r#"emails[value eq "alice@example.test"]"#, &u));
-        assert!(matches(r#"emails[primary eq true]"#, &u));
+        assert!(matches(r"emails[primary eq true]", &u));
     }
 
     #[test]

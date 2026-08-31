@@ -13,6 +13,21 @@
 //!
 //! Every failure produces the *same* `401`, with no detail that would let a client distinguish
 //! "no such organization" from "no such key" from "wrong secret".
+//!
+//! # Rate limiting
+//!
+//! Two budgets, charged by *outcome* rather than by arrival:
+//!
+//! 1. Anything that fails to authenticate -- no `Authorization` header, a non-Bearer scheme, a
+//!    token that is not the right shape, an unknown key id, a wrong secret -- is charged to the
+//!    strict unauthenticated limiter.
+//! 2. Only a request that actually authenticated is charged to the generous SCIM provisioning
+//!    limiter.
+//!
+//! That is what makes the two budgets independent: a flood of junk cannot consume the allowance a
+//! real directory sync needs, and a saturated provisioning budget does not stop the server from
+//! rejecting junk. The shape checks in [`parse_token`] mean most junk is rejected from the request
+//! headers alone, without a database lookup.
 
 use std::{net::IpAddr, sync::LazyLock};
 
@@ -28,7 +43,7 @@ use crate::{
     crypto,
     db::{
         DbConn,
-        models::{OrganizationId, OrganizationScimKey, SCIM_TOKEN_PREFIX, ScimKeyId},
+        models::{OrganizationId, OrganizationScimKey, SCIM_SECRET_ENCODED_LEN, SCIM_TOKEN_PREFIX, ScimKeyId},
     },
 };
 
@@ -56,10 +71,33 @@ struct ParsedToken {
     secret: String,
 }
 
+/// Is this the shape of a key id this server issues?
+///
+/// Key ids come from `util::get_uuid()`, so a hyphenated lower-case UUID. Checking the shape does
+/// not make the key id trusted -- it is a lookup handle either way -- it just means a credential
+/// that cannot possibly match a row this server wrote is rejected without a database round trip.
+fn is_key_id_shape(raw: &str) -> bool {
+    uuid::Uuid::try_parse(raw).is_ok_and(|_| raw.len() == 36)
+}
+
+/// Is this the shape of a secret this server issues?
+///
+/// [`SCIM_SECRET_ENCODED_LEN`] characters of base64url without padding. As with the key id this
+/// grants nothing: the value still has to survive the constant-time hash comparison.
+fn is_secret_shape(raw: &str) -> bool {
+    raw.len() == SCIM_SECRET_ENCODED_LEN && raw.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// Split a bearer token into its parts.
 ///
-/// Returns `None` for anything that is not exactly `scim_v1.<key-id>.<secret>` with both parts
-/// non-empty. Callers must map `None` to the same generic 401 as a wrong secret.
+/// Returns `None` for anything that is not exactly `scim_v1.<key-id>.<secret>` with a key id and a
+/// secret of the shape this server issues. Callers must map `None` to the same generic 401 as a
+/// wrong secret.
+///
+/// The shape checks are a cheap filter, not an authorization decision: everything they reject
+/// could not have matched a stored key anyway, and rejecting it here keeps junk from costing a
+/// database lookup. Nothing they accept is trusted -- authorization still comes entirely from the
+/// constant-time comparison against the stored hash.
 fn parse_token(raw: &str) -> Option<ParsedToken> {
     let mut parts = raw.split('.');
     let prefix = parts.next()?;
@@ -70,7 +108,7 @@ fn parse_token(raw: &str) -> Option<ParsedToken> {
     if parts.next().is_some() {
         return None;
     }
-    if prefix != SCIM_TOKEN_PREFIX || key_id.is_empty() || secret.is_empty() {
+    if prefix != SCIM_TOKEN_PREFIX || !is_key_id_shape(key_id) || !is_secret_shape(secret) {
         return None;
     }
 
@@ -95,6 +133,18 @@ fn bearer_credential(header: &str) -> Option<&str> {
     }
 }
 
+/// Charge a failed authentication attempt to the strict budget and reject it.
+///
+/// Every caller produces the same `401`, so the reason a request failed is never observable; the
+/// only variation is `429` once that budget is exhausted, which is a property of the client's own
+/// request rate rather than of the credential it sent.
+fn reject_unauthenticated(ip: &IpAddr) -> Outcome<ScimToken, ()> {
+    if super::settings::check_auth_rate_limit(ip).is_err() {
+        return Outcome::Error((Status::TooManyRequests, ()));
+    }
+    Outcome::Error((Status::Unauthorized, ()))
+}
+
 #[rocket::async_trait]
 impl<'r> FromRequest<'r> for ScimToken {
     type Error = ();
@@ -105,38 +155,24 @@ impl<'r> FromRequest<'r> for ScimToken {
         };
         let ip = client_ip.ip;
 
-        // Rate limit first, before any parsing or database work, so this covers authentication
-        // attempts, expensive list requests and writes alike.
-        if super::settings::check_rate_limit(&ip).is_err() {
-            return Outcome::Error((Status::TooManyRequests, ()));
-        }
-
         // When SCIM is switched off the endpoints must not operate at all. 404 rather than 401:
-        // the resource genuinely does not exist on this server.
+        // the resource genuinely does not exist on this server. Checked before anything is
+        // charged to a limiter, because a disabled server is not an authentication failure.
         if !super::settings::scim_enabled() {
             return Outcome::Error((Status::NotFound, ()));
         }
 
         // Every SCIM route has the organization id as its first dynamic segment.
         let Some(Ok(path_org_id)) = request.param::<&str>(0) else {
-            return Outcome::Error((Status::Unauthorized, ()));
+            return reject_unauthenticated(&ip);
         };
 
         // A request with no bearer credential, or one whose token is not even the right shape, is
-        // never something an identity provider sends. Those are charged to the strict
-        // unauthenticated budget instead of the generous provisioning one, so a flood of junk
-        // cannot eat the allowance a real directory sync needs. This is decided from the headers
-        // alone, before any database work.
-        let parsed = request.headers().get_one("Authorization").and_then(bearer_credential).map(|credential| {
-            let parsed = parse_token(credential);
-            (credential.to_owned(), parsed)
-        });
-
-        let Some((credential, parsed_token)) = parsed.filter(|(_, parsed)| parsed.is_some()) else {
-            if super::settings::check_unauthenticated_rate_limit(&ip).is_err() {
-                return Outcome::Error((Status::TooManyRequests, ()));
-            }
-            return Outcome::Error((Status::Unauthorized, ()));
+        // never something an identity provider sends. It is rejected from the request headers
+        // alone -- no database work at all -- and charged to the strict budget.
+        let Some(parsed) = request.headers().get_one("Authorization").and_then(bearer_credential).and_then(parse_token)
+        else {
+            return reject_unauthenticated(&ip);
         };
 
         let Outcome::Success(conn) = DbConn::from_request(request).await else {
@@ -145,34 +181,30 @@ impl<'r> FromRequest<'r> for ScimToken {
         };
 
         let org_id: OrganizationId = path_org_id.to_owned().into();
-
-        // A malformed token still goes through a hash and a constant-time comparison so that it
-        // is not measurably cheaper to reject than a well-formed one with a wrong secret.
-        let (key, secret) = match parsed_token {
-            Some(parsed) => {
-                let key = OrganizationScimKey::find_by_uuid_and_org(&parsed.key_id, &org_id, &conn).await;
-                (key, parsed.secret)
-            }
-            None => (None, credential),
-        };
+        let key = OrganizationScimKey::find_by_uuid_and_org(&parsed.key_id, &org_id, &conn).await;
 
         let authenticated = if let Some(key) = &key {
-            key.matches_secret(&secret)
+            key.matches_secret(&parsed.secret)
         } else {
             // Not a real check: the hash and the constant-time comparison run against a fixed
             // dummy value so that rejecting an unknown key id costs the same as rejecting a wrong
             // secret. `black_box` keeps the optimiser from removing work whose result is unused.
-            std::hint::black_box(crypto::ct_eq(&*DUMMY_HASH, crypto::sha256_hex(secret.as_bytes())));
+            std::hint::black_box(crypto::ct_eq(&*DUMMY_HASH, crypto::sha256_hex(parsed.secret.as_bytes())));
             false
         };
 
-        if !authenticated {
+        let Some(key) = key.filter(|_| authenticated) else {
             // Deliberately vague, and identical for every cause.
             warn!(target: "scim", "Rejected SCIM request from {ip}");
-            return Outcome::Error((Status::Unauthorized, ()));
+            return reject_unauthenticated(&ip);
+        };
+
+        // Authenticated: only now may this request draw on the provisioning budget. Checked
+        // before `touch_last_used`, so a throttled request writes nothing.
+        if super::settings::check_rate_limit(&ip).is_err() {
+            return Outcome::Error((Status::TooManyRequests, ()));
         }
 
-        let key = key.expect("authenticated implies a key was found");
         if key.last_used_at.is_none_or(|last| Utc::now().naive_utc() - last > LAST_USED_REFRESH) {
             key.touch_last_used(&conn).await;
         }
@@ -255,9 +287,58 @@ mod tests {
     #[test]
     fn rejects_garbage_without_panicking() {
         for garbage in ["", ".", "..", "...", "  ", "\u{0}", "scim_v1", "\u{1F600}.\u{1F600}.\u{1F600}"] {
-            // The only requirement is that it does not match and does not panic.
-            let parsed = parse_token(garbage);
-            assert!(parsed.is_none() || garbage.starts_with(SCIM_TOKEN_PREFIX), "unexpectedly parsed {garbage:?}");
+            assert!(parse_token(garbage).is_none(), "unexpectedly parsed {garbage:?}");
+        }
+    }
+
+    // -- shape validation ------------------------------------------------------------------------
+    //
+    // These are a cheap filter, not an authorization decision: everything they reject could not
+    // have matched a stored key anyway, and rejecting it here keeps junk from costing a database
+    // lookup. See the module docs.
+
+    #[test]
+    fn rejects_a_key_id_that_is_not_the_shape_this_server_issues() {
+        for bad in [
+            "not-a-uuid",
+            "6f0f9d1a2b3c4d5e8f901a2b3c4d5e6f",              // unhyphenated
+            "{6f0f9d1a-2b3c-4d5e-8f90-1a2b3c4d5e6f}",        // braced
+            "urn:uuid:6f0f9d1a-2b3c-4d5e-8f90-1a2b3c4d5e6f", // urn form
+            "6f0f9d1a-2b3c-4d5e-8f90-1a2b3c4d5e6",           // one short
+            "6f0f9d1a-2b3c-4d5e-8f90-1a2b3c4d5e6ff",         // one long
+            "../../../etc/passwd",
+        ] {
+            assert!(parse_token(&format!("{SCIM_TOKEN_PREFIX}.{bad}.{SECRET}")).is_none(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_a_secret_that_is_not_the_shape_this_server_issues() {
+        let right_length = "A".repeat(SCIM_SECRET_ENCODED_LEN);
+
+        assert!(parse_token(&format!("{SCIM_TOKEN_PREFIX}.{KEY_ID}.{right_length}")).is_some(), "length and alphabet");
+
+        for bad in [
+            "short".to_owned(),
+            "A".repeat(SCIM_SECRET_ENCODED_LEN - 1),
+            "A".repeat(SCIM_SECRET_ENCODED_LEN + 1),
+            // Right length, wrong alphabet: base64url has no '+', '/' or '='.
+            format!("{}+", "A".repeat(SCIM_SECRET_ENCODED_LEN - 1)),
+            format!("{}/", "A".repeat(SCIM_SECRET_ENCODED_LEN - 1)),
+            format!("{}=", "A".repeat(SCIM_SECRET_ENCODED_LEN - 1)),
+            format!("{}\u{00e9}", "A".repeat(SCIM_SECRET_ENCODED_LEN - 2)),
+        ] {
+            assert!(parse_token(&format!("{SCIM_TOKEN_PREFIX}.{KEY_ID}.{bad}")).is_none(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn base64url_secrets_this_server_issues_all_parse() {
+        // Whatever `OrganizationScimKey::generate` produces has to survive the shape checks, or
+        // valid tokens would be rejected before they ever reached the database.
+        for _ in 0..64 {
+            let generated = OrganizationScimKey::generate(OrganizationId::from(crate::util::get_uuid()));
+            assert!(parse_token(&generated.token).is_some(), "a freshly issued token must parse: {}", generated.token);
         }
     }
 
@@ -265,8 +346,9 @@ mod tests {
     fn a_parsed_key_id_is_only_a_lookup_handle() {
         // The key id is attacker-controlled: parsing it must not imply anything is authorized.
         // This test documents the invariant that authorization happens later, against the hash.
-        let parsed = parse_token(&format!("{SCIM_TOKEN_PREFIX}.not-a-uuid.{SECRET}")).expect("parses");
-        assert_eq!(*parsed.key_id, "not-a-uuid");
+        let parsed = parse_token(&token()).expect("parses");
+        assert_eq!(*parsed.key_id, KEY_ID);
+        assert_eq!(parsed.secret, SECRET, "the secret is carried through verbatim, not interpreted");
     }
 
     // -- hashing -------------------------------------------------------------------------------

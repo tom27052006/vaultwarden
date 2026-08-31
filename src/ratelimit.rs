@@ -18,7 +18,7 @@ static LIMITER_ADMIN: LazyLock<Limiter> = LazyLock::new(|| {
     RateLimiter::keyed(Quota::with_period(seconds).expect("Non-zero admin ratelimit seconds").allow_burst(burst))
 });
 
-/// Provisioning traffic from an identity provider.
+/// Provisioning traffic from an identity provider, charged only once a request has authenticated.
 ///
 /// Expressed as a sustained rate rather than "one request per N seconds", because a directory
 /// sync is inherently high-volume: a first full sync of a few thousand members is several
@@ -60,10 +60,13 @@ pub fn check_limit_login(ip: &IpAddr) -> Result<(), Error> {
     }
 }
 
-/// Rate limit for the SCIM endpoints, applied to every request before the bearer token is even
-/// parsed. This covers authentication attempts, expensive listing/filter requests and writes with
-/// a single limiter, and is deliberately more lenient than the login limiter because identity
-/// providers sync in bursts.
+/// Rate limit for SCIM provisioning traffic, applied **after** a request has authenticated.
+///
+/// It covers expensive listing/filter requests and writes, and is deliberately more lenient than
+/// the login limiter because identity providers sync in bursts. Authentication *attempts* are not
+/// charged here: a request that fails to authenticate -- no token, a malformed one, or a wrong one
+/// -- goes to [`check_limit_unauthenticated`] instead, so junk traffic cannot consume the
+/// allowance a real sync needs. See `docs/scim/design.md` section 5.
 #[cfg_attr(
     test,
     expect(dead_code, reason = "the SCIM test suite substitutes a limiter it can drive deterministically")

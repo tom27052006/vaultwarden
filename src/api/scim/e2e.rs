@@ -29,6 +29,7 @@ use crate::{
     },
 };
 
+use super::resource::MAX_ACCOUNT_NAME_LEN;
 use super::settings::test_overrides::{
     GROUPS_ENABLED, RATE_LIMIT_EXHAUSTED, SCIM_ENABLED, UNAUTH_RATE_LIMIT_EXHAUSTED,
 };
@@ -428,8 +429,14 @@ async fn every_authentication_failure_looks_identical() {
     let replies = vec![
         // Wrong secret, real key, real organization.
         server.get(&users_url(&org), &format!("scim_v1.{key_id}.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")).await,
-        // Unknown key id, real organization.
-        server.get(&users_url(&org), &format!("scim_v1.{}.whatever", crate::util::get_uuid())).await,
+        // Unknown key id, real organization. Structurally valid, so it costs a database lookup
+        // that misses -- the path the dummy-hash comparison exists to keep indistinguishable.
+        server
+            .get(
+                &users_url(&org),
+                &format!("scim_v1.{}.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", crate::util::get_uuid()),
+            )
+            .await,
         // A real token, but an organization that does not exist.
         server.get(&format!("/scim/v2/{unknown_org}/Users"), &token).await,
         // Garbage.
@@ -472,6 +479,39 @@ async fn rate_limited_requests_get_a_scim_429() {
     server.set_rate_limit_exhausted(true);
 
     server.get(&users_url(&org), &token).await.assert_error(Status::TooManyRequests, None);
+}
+
+#[rocket::async_test]
+async fn authenticated_traffic_consumes_the_provisioning_budget() {
+    // Every verb, not just GET: the guard runs before any handler, so exhausting the provisioning
+    // budget has to stop writes as well as reads.
+    let server = TestServer::with_exclusive_settings().await;
+    let (org, token) = server.org("acme").await;
+    let (_, membership) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
+    let user_path = format!("{}/{}", users_url(&org), membership.uuid);
+
+    server.set_rate_limit_exhausted(true);
+
+    server.get(&users_url(&org), &token).await.assert_error(Status::TooManyRequests, None);
+    server.get(&user_path, &token).await.assert_error(Status::TooManyRequests, None);
+    server
+        .post(&users_url(&org), &token, json!({"userName": "new@example.test"}))
+        .await
+        .assert_error(Status::TooManyRequests, None);
+    server.put(&user_path, &token, json!({"active": true})).await.assert_error(Status::TooManyRequests, None);
+    server
+        .patch(&user_path, &token, json!({"Operations": [{"op": "replace", "path": "active", "value": true}]}))
+        .await
+        .assert_error(Status::TooManyRequests, None);
+    server.delete(&user_path, &token).await.assert_error(Status::TooManyRequests, None);
+    server.get(&groups_url(&org), &token).await.assert_error(Status::TooManyRequests, None);
+
+    // Nothing was written: the guard refused before any handler ran.
+    assert!(server.reload_membership(&membership.uuid, &org.uuid).await.is_some(), "DELETE must not have run");
+    assert!(
+        Membership::find_by_email_and_org("new@example.test", &org.uuid, &server.conn().await).await.is_none(),
+        "POST must not have run"
+    );
 }
 
 // =============================================================================================
@@ -1037,11 +1077,13 @@ async fn resending_the_same_user_name_is_a_no_op() {
     let (org, token) = server.org("acme").await;
     let (_, membership) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
 
+    // The account was created without a name, so Vaultwarden stores the address as the name and
+    // that is what `displayName` reads back as. Echoing it is a no-op, as is echoing the address.
     let reply = server
         .put(
             &format!("{}/{}", users_url(&org), membership.uuid),
             &token,
-            json!({"userName": "ALICE@example.test", "active": true, "displayName": "Whatever"}),
+            json!({"userName": "ALICE@example.test", "active": true, "displayName": "alice@example.test"}),
         )
         .await;
 
@@ -1058,8 +1100,7 @@ async fn put_leaves_omitted_attributes_alone() {
     membership.save(&server.conn().await).await.expect("set external id");
 
     // A sparse payload must not clear attributes it does not mention.
-    let reply =
-        server.put(&format!("{}/{}", users_url(&org), membership.uuid), &token, json!({"displayName": "X"})).await;
+    let reply = server.put(&format!("{}/{}", users_url(&org), membership.uuid), &token, json!({"active": true})).await;
     assert_eq!(reply.status, Status::Ok, "{}", reply.body);
 
     let stored = server.reload_membership(&membership.uuid, &org.uuid).await.expect("membership");
@@ -1697,6 +1738,85 @@ async fn discovery_reports_only_what_is_supported() {
         .assert_error(Status::NotFound, None);
 }
 
+/// Pull one attribute definition out of a published schema document.
+fn schema_attribute<'a>(schema: &'a Value, name: &str) -> &'a Value {
+    schema["attributes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no attributes in {schema}"))
+        .iter()
+        .find(|a| a["name"] == json!(name))
+        .unwrap_or_else(|| panic!("no '{name}' attribute in {schema}"))
+}
+
+fn sub_attribute<'a>(attribute: &'a Value, name: &str) -> &'a Value {
+    attribute["subAttributes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no subAttributes in {attribute}"))
+        .iter()
+        .find(|a| a["name"] == json!(name))
+        .unwrap_or_else(|| panic!("no '{name}' sub-attribute in {attribute}"))
+}
+
+#[rocket::async_test]
+async fn the_published_user_schema_matches_what_the_server_enforces() {
+    // Discovery is a promise. Every mutability value here is checked against the behaviour it
+    // claims by the tests further down this file; this one just pins the advertisement.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+
+    let schema =
+        server.get(&format!("/scim/v2/{}/Schemas/urn:ietf:params:scim:schemas:core:2.0:User", org.uuid), &token).await;
+    let schema = schema.json();
+
+    // The account's global identity: settable at creation, never changed afterwards.
+    assert_eq!(schema_attribute(&schema, "userName")["mutability"], json!("immutable"));
+    // The account's global name: same rule.
+    assert_eq!(schema_attribute(&schema, "displayName")["mutability"], json!("immutable"));
+    // Ordinary directory data.
+    assert_eq!(schema_attribute(&schema, "externalId")["mutability"], json!("readWrite"));
+    assert_eq!(schema_attribute(&schema, "active")["mutability"], json!("readWrite"));
+
+    // `emails` is `immutable`, not `readOnly`: POST accepts `emails[].value` as the identity when
+    // `userName` is absent, so calling it read-only would describe a different server.
+    let emails = schema_attribute(&schema, "emails");
+    assert_eq!(emails["mutability"], json!("immutable"));
+    assert_eq!(sub_attribute(emails, "value")["mutability"], json!("immutable"), "the same address as userName");
+    // ...but the parts the server derives really are read-only.
+    assert_eq!(sub_attribute(emails, "type")["mutability"], json!("readOnly"));
+    assert_eq!(sub_attribute(emails, "primary")["mutability"], json!("readOnly"));
+}
+
+#[rocket::async_test]
+async fn group_display_name_uniqueness_is_not_over_advertised() {
+    // SCIM refuses to introduce a duplicate `displayName`, but `groups.name` carries no unique
+    // constraint and an installation may already hold duplicates from a legacy or manual path.
+    // `uniqueness: "server"` would claim an invariant the storage does not hold.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+
+    let schema = server
+        .get(&format!("/scim/v2/{}/Schemas/urn:ietf:params:scim:schemas:core:2.0:Group", org.uuid), &token)
+        .await
+        .json();
+
+    assert_eq!(schema_attribute(&schema, "displayName")["uniqueness"], json!("none"));
+    assert_eq!(schema_attribute(&schema, "displayName")["required"], json!(true));
+
+    // The SCIM-layer collision check is unaffected: it is an interoperability rule, not a
+    // storage guarantee, and it still refuses a new duplicate.
+    assert_eq!(server.post(&groups_url(&org), &token, json!({"displayName": "Eng"})).await.status, Status::Created);
+    server
+        .post(&groups_url(&org), &token, json!({"displayName": "eng"}))
+        .await
+        .assert_error(Status::Conflict, Some("uniqueness"));
+
+    // ...and a duplicate that already exists keeps working, which is exactly why the schema
+    // cannot promise uniqueness.
+    server.group(&org, "Eng", None).await;
+    let listed = server.get(&format!("{}?filter=displayName%20eq%20%22Eng%22", groups_url(&org)), &token).await.json();
+    assert_eq!(listed["totalResults"], json!(2), "pre-existing duplicates are still returned");
+}
+
 #[rocket::async_test]
 async fn discovery_requires_a_token() {
     let server = TestServer::new().await;
@@ -2300,6 +2420,59 @@ async fn provisioning_active_still_creates_an_invitation() {
     assert!(Invitation::find_by_mail("active@example.test", &conn).await.is_some());
 }
 
+#[rocket::async_test]
+async fn reactivation_is_idempotent_and_does_not_reissue_an_invitation() {
+    // A retry of a reactivation that already succeeded must not repeat the invitation side
+    // effect. With mail enabled that would be a second email; with mail disabled it would be a
+    // second `Invitation` row for the same address.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+
+    let created =
+        server.post(&users_url(&org), &token, json!({"userName": "again@example.test", "active": false})).await;
+    let member_id = created.json()["id"].as_str().unwrap().to_owned();
+    let path = format!("{}/{}", users_url(&org), member_id);
+    let activate = json!({"Operations": [{"op": "Replace", "path": "active", "value": true}]});
+
+    assert_eq!(server.patch(&path, &token, activate.clone()).await.status, Status::Ok);
+    let after_first = Invitation::find_by_mail("again@example.test", &server.conn().await).await;
+    assert!(after_first.is_some(), "the first reactivation issues the invitation");
+
+    // The second one changes nothing: the membership is already active, so the reactivation
+    // branch -- and with it the invitation -- is never entered again.
+    let second = server.patch(&path, &token, activate).await;
+    assert_eq!(second.status, Status::Ok, "{}", second.body);
+    assert_eq!(second.json()["active"], json!(true));
+    assert!(Invitation::find_by_mail("again@example.test", &server.conn().await).await.is_some());
+}
+
+#[rocket::async_test]
+async fn reactivating_a_registered_member_needs_no_invitation() {
+    // An account that can already sign in needs nothing issued, so there is no side effect that
+    // could fail and nothing for the reactivation to depend on.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (user, mut membership) = server.member(&org, "registered@example.test", MembershipType::User, true).await;
+
+    membership.revoke();
+    membership.save(&server.conn().await).await.expect("revoke");
+
+    let reply = server
+        .patch(
+            &format!("{}/{}", users_url(&org), membership.uuid),
+            &token,
+            json!({"Operations": [{"op": "Replace", "path": "active", "value": true}]}),
+        )
+        .await;
+    assert_eq!(reply.status, Status::Ok, "{}", reply.body);
+    assert_eq!(reply.json()["active"], json!(true));
+
+    assert!(
+        Invitation::find_by_mail(&user.email, &server.conn().await).await.is_none(),
+        "a registered account is not invited again"
+    );
+}
+
 // -- projection, Content-Location, pagination ------------------------------------------------------
 
 #[rocket::async_test]
@@ -2593,4 +2766,849 @@ async fn junk_requests_do_not_consume_the_provisioning_budget() {
 
     // ...while real provisioning traffic is unaffected.
     assert_eq!(server.get(&users_url(&org), &token).await.status, Status::Ok);
+}
+
+#[rocket::async_test]
+async fn unauthenticated_requests_never_reach_the_provisioning_limiter() {
+    // The inverse of the test above, and the one that actually proves the ordering: with the
+    // provisioning budget exhausted and the strict budget intact, junk still gets the plain 401
+    // it deserves. If the provisioning limiter still ran first these would all be 429, which is
+    // exactly the leak that let junk traffic eat a real sync's allowance.
+    let server = TestServer::with_exclusive_settings().await;
+    let (org, token) = server.org("acme").await;
+    let key_id = token.split('.').nth(1).unwrap();
+    let secret = token.rsplit('.').next().unwrap();
+
+    server.set_rate_limit_exhausted(true);
+
+    // No Authorization header at all.
+    server.get_unauthenticated(&users_url(&org)).await.assert_error(Status::Unauthorized, None);
+
+    for junk in [
+        // Not a bearer credential.
+        String::new(),
+        "not-a-token".to_owned(),
+        // Bearer, but not this server's token format.
+        format!("scim_v2.{key_id}.{secret}"),
+        format!("scim_v1.{key_id}"),
+        format!("scim_v1.{key_id}.{secret}.extra"),
+        format!("scim_v1..{secret}"),
+        format!("scim_v1.{key_id}."),
+        // Right prefix, wrong key-id shape.
+        format!("scim_v1.not-a-uuid.{secret}"),
+        // Right prefix and key id, wrong secret shape.
+        format!("scim_v1.{key_id}.short"),
+        format!("scim_v1.{key_id}.{secret}+"),
+    ] {
+        server.get(&users_url(&org), &junk).await.assert_error(Status::Unauthorized, None);
+    }
+
+    // A structurally valid credential with the wrong secret is an authentication failure too, so
+    // it is charged to the strict budget rather than the exhausted provisioning one.
+    server
+        .get(&users_url(&org), &format!("scim_v1.{key_id}.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"))
+        .await
+        .assert_error(Status::Unauthorized, None);
+
+    // ...and the valid token is the only thing the exhausted provisioning budget stops.
+    server.get(&users_url(&org), &token).await.assert_error(Status::TooManyRequests, None);
+}
+
+#[rocket::async_test]
+async fn a_wrong_but_well_formed_credential_is_charged_to_the_strict_budget() {
+    // Brute force does not get the generous provisioning allowance: an attempt that looks right
+    // and fails is throttled by the same strict budget as obvious junk.
+    let server = TestServer::with_exclusive_settings().await;
+    let (org, token) = server.org("acme").await;
+    let key_id = token.split('.').nth(1).unwrap();
+
+    server.set_unauthenticated_rate_limit_exhausted(true);
+
+    // Real key id, wrong secret.
+    server
+        .get(&users_url(&org), &format!("scim_v1.{key_id}.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"))
+        .await
+        .assert_error(Status::TooManyRequests, None);
+
+    // Unknown key id, well-formed secret.
+    server
+        .get(
+            &users_url(&org),
+            &format!("scim_v1.{}.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", crate::util::get_uuid()),
+        )
+        .await
+        .assert_error(Status::TooManyRequests, None);
+
+    // A valid token for another organization is an authentication failure here as well.
+    let (_org_b, token_b) = server.org("globex").await;
+    server.get(&users_url(&org), &token_b).await.assert_error(Status::TooManyRequests, None);
+
+    // The organization's own token still works: the two budgets are independent.
+    assert_eq!(server.get(&users_url(&org), &token).await.status, Status::Ok);
+}
+
+#[rocket::async_test]
+async fn a_disabled_server_is_not_an_authentication_failure() {
+    // With SCIM off the endpoints do not exist, whatever the credential. That answer must not
+    // depend on either budget, and must not consume either.
+    let server = TestServer::with_exclusive_settings().await;
+    let (org, token) = server.org("acme").await;
+
+    server.set_scim_enabled(false);
+    server.set_rate_limit_exhausted(true);
+    server.set_unauthenticated_rate_limit_exhausted(true);
+
+    server.get(&users_url(&org), &token).await.assert_error(Status::NotFound, None);
+    server.get_unauthenticated(&users_url(&org)).await.assert_error(Status::NotFound, None);
+    server.get(&users_url(&org), "not-a-token").await.assert_error(Status::NotFound, None);
+}
+
+// -- immutable account attributes ------------------------------------------------------------------
+//
+// `userName` and `displayName` both map to *global* account state that is visible in every
+// organization the account belongs to. Discovery advertises both as `immutable`, and these tests
+// are what make that advertisement true rather than aspirational: re-sending the stored value is
+// the no-op an identity provider performs on every sync, and a genuine change is refused instead
+// of being silently dropped.
+
+/// The display name a fresh shell account gets. `User::new` stores the address as the name when
+/// no name was supplied, so that is what `displayName` reads back as.
+const SHELL_NAME: &str = "alice@example.test";
+
+#[rocket::async_test]
+async fn re_asserting_the_stored_display_name_is_a_no_op() {
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (user, membership) = server.member(&org, SHELL_NAME, MembershipType::User, true).await;
+    let path = format!("{}/{}", users_url(&org), membership.uuid);
+
+    // PUT with the value the server would return.
+    let put = server.put(&path, &token, json!({"displayName": SHELL_NAME, "active": true})).await;
+    assert_eq!(put.status, Status::Ok, "{}", put.body);
+    assert_eq!(put.json()["displayName"], json!(SHELL_NAME));
+
+    // PATCH with a path...
+    let patched = server
+        .patch(&path, &token, json!({"Operations": [{"op": "Replace", "path": "displayName", "value": SHELL_NAME}]}))
+        .await;
+    assert_eq!(patched.status, Status::Ok, "{}", patched.body);
+
+    // ...and pathless, which is the shape Entra ID sends.
+    let pathless = server
+        .patch(&path, &token, json!({"Operations": [{"op": "Replace", "value": {"displayName": SHELL_NAME}}]}))
+        .await;
+    assert_eq!(pathless.status, Status::Ok, "{}", pathless.body);
+
+    let stored = User::find_by_uuid(&user.uuid, &server.conn().await).await.expect("account");
+    assert_eq!(stored.name, SHELL_NAME, "the account name is untouched either way");
+}
+
+#[rocket::async_test]
+async fn changing_the_display_name_is_refused_as_immutable() {
+    // Silently ignoring the change -- what this used to do -- contradicts the `immutable` the
+    // schema advertises and leaves the identity provider believing a rename took effect.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (user, membership) = server.member(&org, SHELL_NAME, MembershipType::User, true).await;
+    let path = format!("{}/{}", users_url(&org), membership.uuid);
+
+    // PUT.
+    server
+        .put(&path, &token, json!({"displayName": "Someone Else"}))
+        .await
+        .assert_error(Status::BadRequest, Some("mutability"));
+
+    // PATCH with a path.
+    server
+        .patch(
+            &path,
+            &token,
+            json!({"Operations": [{"op": "Replace", "path": "displayName", "value": "Someone Else"}]}),
+        )
+        .await
+        .assert_error(Status::BadRequest, Some("mutability"));
+
+    // Pathless PATCH.
+    server
+        .patch(&path, &token, json!({"Operations": [{"op": "Replace", "value": {"displayName": "Someone Else"}}]}))
+        .await
+        .assert_error(Status::BadRequest, Some("mutability"));
+
+    // `add` is a write too.
+    server
+        .patch(&path, &token, json!({"Operations": [{"op": "Add", "path": "displayName", "value": "Someone Else"}]}))
+        .await
+        .assert_error(Status::BadRequest, Some("mutability"));
+
+    // A qualified path is the same attribute.
+    server
+        .patch(
+            &path,
+            &token,
+            json!({"Operations": [{
+                "op": "Replace",
+                "path": "urn:ietf:params:scim:schemas:core:2.0:User:displayName",
+                "value": "Someone Else",
+            }]}),
+        )
+        .await
+        .assert_error(Status::BadRequest, Some("mutability"));
+
+    let stored = User::find_by_uuid(&user.uuid, &server.conn().await).await.expect("account");
+    assert_eq!(stored.name, SHELL_NAME, "nothing was renamed");
+}
+
+#[rocket::async_test]
+async fn removing_the_display_name_is_refused_as_immutable() {
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (user, membership) = server.member(&org, SHELL_NAME, MembershipType::User, true).await;
+
+    server
+        .patch(
+            &format!("{}/{}", users_url(&org), membership.uuid),
+            &token,
+            json!({"Operations": [{"op": "Remove", "path": "displayName"}]}),
+        )
+        .await
+        .assert_error(Status::BadRequest, Some("mutability"));
+
+    let stored = User::find_by_uuid(&user.uuid, &server.conn().await).await.expect("account");
+    assert_eq!(stored.name, SHELL_NAME);
+}
+
+#[rocket::async_test]
+async fn an_extension_display_name_does_not_trip_the_immutability_check() {
+    // The namespace rule and the mutability rule have to compose: an extension attribute whose
+    // last segment is `displayName` is not this server's `displayName`, so it is ignored rather
+    // than refused. Rejecting it would fail provisioning over an attribute that is none of this
+    // server's business.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (user, membership) = server.member(&org, SHELL_NAME, MembershipType::User, true).await;
+
+    let reply = server
+        .patch(
+            &format!("{}/{}", users_url(&org), membership.uuid),
+            &token,
+            json!({"Operations": [{"op": "Replace", "path": "urn:example:Custom:displayName", "value": "Ignored"}]}),
+        )
+        .await;
+    assert_eq!(reply.status, Status::Ok, "{}", reply.body);
+
+    let stored = User::find_by_uuid(&user.uuid, &server.conn().await).await.expect("account");
+    assert_eq!(stored.name, SHELL_NAME);
+}
+
+#[rocket::async_test]
+async fn display_name_names_a_new_account_and_is_bounded() {
+    // The one place SCIM writes a name: an account that did not exist a moment ago. Bounded by
+    // the same 50-character limit registration and the profile endpoint enforce, so SCIM cannot
+    // write a name the account's own owner would not be allowed to keep.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+
+    let created = server
+        .post(&users_url(&org), &token, json!({"userName": "new@example.test", "displayName": "Alice Example"}))
+        .await;
+    assert_eq!(created.status, Status::Created, "{}", created.body);
+    assert_eq!(created.json()["displayName"], json!("Alice Example"));
+
+    let account = User::find_by_mail("new@example.test", &server.conn().await).await.expect("account");
+    assert_eq!(account.name, "Alice Example");
+
+    // Exactly at the limit is accepted...
+    let at_limit = "a".repeat(MAX_ACCOUNT_NAME_LEN);
+    let ok =
+        server.post(&users_url(&org), &token, json!({"userName": "edge@example.test", "displayName": at_limit})).await;
+    assert_eq!(ok.status, Status::Created, "{}", ok.body);
+    assert_eq!(ok.json()["displayName"], json!(at_limit));
+
+    // ...one character past it is not.
+    server
+        .post(
+            &users_url(&org),
+            &token,
+            json!({"userName": "toolong@example.test", "displayName": "a".repeat(MAX_ACCOUNT_NAME_LEN + 1)}),
+        )
+        .await
+        .assert_error(Status::BadRequest, Some("invalidValue"));
+    assert!(
+        User::find_by_mail("toolong@example.test", &server.conn().await).await.is_none(),
+        "a rejected name must not have created an account"
+    );
+}
+
+#[rocket::async_test]
+async fn the_display_name_limit_counts_characters_not_bytes() {
+    // 50 is a character limit. Counting UTF-8 bytes would refuse a 50-character name of non-Latin
+    // text while accepting a 50-character ASCII one, which is a different rule than the one the
+    // rest of Vaultwarden documents.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+
+    // At the limit in characters, comfortably over it in bytes.
+    let wide: String = "\u{4e2d}".repeat(MAX_ACCOUNT_NAME_LEN);
+    assert_eq!(wide.chars().count(), MAX_ACCOUNT_NAME_LEN);
+    assert!(wide.len() > MAX_ACCOUNT_NAME_LEN, "and over the limit if it were counted in bytes");
+
+    let created =
+        server.post(&users_url(&org), &token, json!({"userName": "wide@example.test", "displayName": wide})).await;
+    assert_eq!(created.status, Status::Created, "{}", created.body);
+    assert_eq!(created.json()["displayName"], json!(wide));
+
+    server
+        .post(
+            &users_url(&org),
+            &token,
+            json!({
+                "userName": "wider@example.test",
+                "displayName": "\u{4e2d}".repeat(MAX_ACCOUNT_NAME_LEN + 1),
+            }),
+        )
+        .await
+        .assert_error(Status::BadRequest, Some("invalidValue"));
+}
+
+#[rocket::async_test]
+async fn an_existing_account_keeps_its_own_name_when_a_membership_is_added() {
+    // `POST /Users` creates a *membership*. An account that already exists keeps the name it
+    // chose, because that name is global; the response tells the identity provider what the
+    // server actually holds rather than echoing what it asked for.
+    let server = TestServer::new().await;
+    let (org_a, _) = server.org("acme").await;
+    let (org_b, token_b) = server.org("globex").await;
+
+    let (user, _) = server.member(&org_a, "shared@example.test", MembershipType::User, true).await;
+    let mut account = User::find_by_uuid(&user.uuid, &server.conn().await).await.expect("account");
+    account.name = "Chosen Name".to_owned();
+    account.save(&server.conn().await).await.expect("rename");
+
+    let created = server
+        .post(&users_url(&org_b), &token_b, json!({"userName": "shared@example.test", "displayName": "Directory Name"}))
+        .await;
+    assert_eq!(created.status, Status::Created, "{}", created.body);
+    assert_eq!(
+        created.json()["displayName"],
+        json!("Chosen Name"),
+        "the stored name is returned, not the asserted one"
+    );
+
+    let reloaded = User::find_by_uuid(&user.uuid, &server.conn().await).await.expect("account");
+    assert_eq!(reloaded.name, "Chosen Name", "another organization's identity provider cannot rename an account");
+}
+
+#[rocket::async_test]
+async fn emails_may_create_but_never_rename() {
+    // `emails[].value` is the same global account email as `userName`, which is why the schema
+    // now advertises it `immutable` rather than `readOnly`: it genuinely decides creation state.
+    // Everything after creation follows the `userName` rule exactly.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+
+    // POST with no `userName` at all: identity comes from the primary email.
+    let created = server
+        .post(
+            &users_url(&org),
+            &token,
+            json!({"emails": [
+                {"value": "secondary@example.test", "type": "home", "primary": false},
+                {"value": "Primary@Example.test", "type": "work", "primary": true},
+            ]}),
+        )
+        .await;
+    assert_eq!(created.status, Status::Created, "{}", created.body);
+    assert_eq!(created.json()["userName"], json!("primary@example.test"), "normalised like any account email");
+    assert_eq!(created.json()["emails"][0]["value"], json!("primary@example.test"));
+
+    let member_id = created.json()["id"].as_str().unwrap().to_owned();
+    let path = format!("{}/{}", users_url(&org), member_id);
+
+    // The identical address is the no-op an identity provider sends on every update.
+    let echo = server
+        .put(&path, &token, json!({"emails": [{"value": "PRIMARY@example.test", "primary": true}], "active": true}))
+        .await;
+    assert_eq!(echo.status, Status::Ok, "{}", echo.body);
+
+    // A different address is a rename of the global account, and is refused.
+    server
+        .put(&path, &token, json!({"emails": [{"value": "attacker@evil.test", "primary": true}]}))
+        .await
+        .assert_error(Status::BadRequest, Some("mutability"));
+
+    server
+        .patch(
+            &path,
+            &token,
+            json!({"Operations": [{"op": "Replace", "path": "emails", "value": [{"value": "attacker@evil.test"}]}]}),
+        )
+        .await
+        .assert_error(Status::BadRequest, Some("mutability"));
+
+    // Removing it is refused for the same reason.
+    server
+        .patch(&path, &token, json!({"Operations": [{"op": "Remove", "path": "emails"}]}))
+        .await
+        .assert_error(Status::BadRequest, Some("mutability"));
+
+    let account = User::find_by_mail("primary@example.test", &server.conn().await).await.expect("account");
+    assert_eq!(account.email, "primary@example.test", "the account email is untouched");
+    assert!(User::find_by_mail("attacker@evil.test", &server.conn().await).await.is_none());
+}
+
+#[rocket::async_test]
+async fn a_mapped_user_principal_name_and_mail_do_not_fight() {
+    // Entra ID maps `userName` from `userPrincipalName` and `emails` from `mail`, and in real
+    // tenants those differ for plenty of people. The account was provisioned from the UPN, so a
+    // document carrying both has to resolve to the UPN -- whichever order the operations arrive
+    // in, and on PUT as well as PATCH.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+
+    let created = server.post(&users_url(&org), &token, json!({"userName": "upn@example.test"})).await;
+    assert_eq!(created.status, Status::Created, "{}", created.body);
+    let path = format!("{}/{}", users_url(&org), created.json()["id"].as_str().unwrap());
+
+    let put = server
+        .put(
+            &path,
+            &token,
+            json!({
+                "userName": "upn@example.test",
+                "emails": [{"value": "mail@example.test", "type": "work", "primary": true}],
+                "active": true,
+            }),
+        )
+        .await;
+    assert_eq!(put.status, Status::Ok, "{}", put.body);
+
+    for operations in [
+        json!([
+            {"op": "Replace", "path": "userName", "value": "upn@example.test"},
+            {"op": "Replace", "path": "emails", "value": [{"value": "mail@example.test"}]},
+        ]),
+        json!([
+            {"op": "Replace", "path": "emails", "value": [{"value": "mail@example.test"}]},
+            {"op": "Replace", "path": "userName", "value": "upn@example.test"},
+        ]),
+    ] {
+        let reply = server.patch(&path, &token, json!({"Operations": operations})).await;
+        assert_eq!(reply.status, Status::Ok, "operation order must not decide the outcome: {}", reply.body);
+    }
+
+    // ...and `emails` on its own, with no `userName` to defer to, still asserts the identity.
+    server
+        .patch(
+            &path,
+            &token,
+            json!({"Operations": [{"op": "Replace", "path": "emails", "value": [{"value": "mail@example.test"}]}]}),
+        )
+        .await
+        .assert_error(Status::BadRequest, Some("mutability"));
+}
+
+#[rocket::async_test]
+async fn a_user_name_and_a_matching_email_agree() {
+    // Both spellings of the same identity in one document must not fight each other.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, membership) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
+
+    let reply = server
+        .put(
+            &format!("{}/{}", users_url(&org), membership.uuid),
+            &token,
+            json!({
+                "userName": "alice@example.test",
+                "emails": [{"value": "alice@example.test", "primary": true}],
+                "active": true,
+            }),
+        )
+        .await;
+    assert_eq!(reply.status, Status::Ok, "{}", reply.body);
+}
+
+// -- projection on every representation ---------------------------------------------------------
+//
+// RFC 7644 section 3.9 allows `attributes` and `excludedAttributes` on any operation that returns
+// a resource representation, not just on reads.
+
+#[rocket::async_test]
+async fn projection_applies_to_user_writes() {
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+
+    let created = server
+        .post(&format!("{}?attributes=userName", users_url(&org)), &token, json!({"userName": "new@example.test"}))
+        .await;
+    assert_eq!(created.status, Status::Created, "{}", created.body);
+    let body = created.json();
+    assert_eq!(body["userName"], json!("new@example.test"));
+    assert!(body.get("id").is_some(), "the minimum response set survives");
+    assert!(body.get("active").is_none(), "an unrequested attribute is not returned");
+    assert!(body.get("emails").is_none());
+    // Projection changes the representation, never the headers that identify the resource.
+    assert!(created.location.is_some(), "201 still carries Location");
+    assert_eq!(created.location.as_deref(), created.content_location.as_deref());
+
+    let path = format!("{}/{}", users_url(&org), body["id"].as_str().unwrap());
+
+    let put = server.put(&format!("{path}?excludedAttributes=emails"), &token, json!({"active": true})).await;
+    assert_eq!(put.status, Status::Ok, "{}", put.body);
+    assert!(put.json().get("emails").is_none());
+    assert_eq!(put.json()["userName"], json!("new@example.test"), "the rest of the resource is still there");
+    put.assert_content_location_matches_meta();
+
+    let patched = server
+        .patch(
+            &format!("{path}?attributes=active"),
+            &token,
+            json!({"Operations": [{"op": "Replace", "path": "active", "value": false}]}),
+        )
+        .await;
+    assert_eq!(patched.status, Status::Ok, "{}", patched.body);
+    assert_eq!(patched.json()["active"], json!(false), "projection does not change what the write did");
+    assert!(patched.json().get("userName").is_none());
+
+    // The mutation really happened, projected response or not.
+    let member_id = MembershipId::from(body["id"].as_str().unwrap().to_owned());
+    let stored = server.reload_membership(&member_id, &org.uuid).await.expect("membership");
+    assert!(stored.status < MembershipStatus::Invited as i32, "the member was revoked");
+}
+
+#[rocket::async_test]
+async fn projection_applies_to_group_writes() {
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, member) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
+
+    let created = server
+        .post(
+            &format!("{}?excludedAttributes=members", groups_url(&org)),
+            &token,
+            json!({"displayName": "Engineering", "members": [{"value": member.uuid}]}),
+        )
+        .await;
+    assert_eq!(created.status, Status::Created, "{}", created.body);
+    assert!(created.json().get("members").is_none(), "excluded from the representation");
+    assert_eq!(created.json()["displayName"], json!("Engineering"));
+    created.assert_content_location_matches_meta();
+
+    let group_id = created.json()["id"].as_str().unwrap().to_owned();
+    let path = format!("{}/{}", groups_url(&org), group_id);
+
+    // ...but the member was still written: projection is about the response, not the write.
+    let full = server.get(&path, &token).await.json();
+    assert_eq!(full["members"][0]["value"], json!(member.uuid.to_string()));
+
+    let put =
+        server.put(&format!("{path}?attributes=displayName"), &token, json!({"displayName": "Engineering"})).await;
+    assert_eq!(put.status, Status::Ok, "{}", put.body);
+    assert_eq!(put.json()["displayName"], json!("Engineering"));
+    assert!(put.json().get("members").is_none());
+    assert!(put.json().get("externalId").is_none());
+
+    let patched = server
+        .patch(
+            &format!("{path}?excludedAttributes=members"),
+            &token,
+            json!({"Operations": [{"op": "Remove", "path": "members", "value": [{"value": member.uuid}]}]}),
+        )
+        .await;
+    assert_eq!(patched.status, Status::Ok, "{}", patched.body);
+    assert!(patched.json().get("members").is_none());
+
+    // And the removal happened.
+    let after = server.get(&path, &token).await.json();
+    assert_eq!(after["members"], json!([]));
+}
+
+#[rocket::async_test]
+async fn projection_is_validated_before_a_write_happens() {
+    // `attributes` and `excludedAttributes` stay mutually exclusive on every verb, and the
+    // request fails before it provisions anybody.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+
+    server
+        .post(
+            &format!("{}?attributes=userName&excludedAttributes=emails", users_url(&org)),
+            &token,
+            json!({"userName": "never@example.test"}),
+        )
+        .await
+        .assert_error(Status::BadRequest, Some("invalidValue"));
+
+    assert!(
+        Membership::find_by_email_and_org("never@example.test", &org.uuid, &server.conn().await).await.is_none(),
+        "a rejected projection must not have created a membership"
+    );
+
+    server
+        .post(
+            &format!("{}?attributes=displayName&excludedAttributes=members", groups_url(&org)),
+            &token,
+            json!({"displayName": "Never"}),
+        )
+        .await
+        .assert_error(Status::BadRequest, Some("invalidValue"));
+
+    assert!(
+        Group::find_by_organization(&org.uuid, &server.conn().await).await.is_empty(),
+        "a rejected projection must not have created a group"
+    );
+}
+
+// -- projection namespace isolation over the wire -----------------------------------------------
+
+#[rocket::async_test]
+async fn a_group_qualified_attribute_does_not_project_a_user() {
+    // The bug this guards: parsing the projection against both core schemas at once let a
+    // Group-qualified name select the User attribute that shares its last segment.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, mut membership) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
+
+    membership.set_external_id(Some("ext-1".to_owned()));
+    membership.save(&server.conn().await).await.expect("set external id");
+    let path = format!("{}/{}", users_url(&org), membership.uuid);
+
+    // Selecting a Group attribute on /Users selects nothing of the User.
+    let selected = server
+        .get(&format!("{path}?attributes=urn:ietf:params:scim:schemas:core:2.0:Group:externalId"), &token)
+        .await
+        .json();
+    assert!(selected.get("externalId").is_none(), "a Group-qualified name must not select the User's externalId");
+    assert!(selected.get("userName").is_none());
+    assert_eq!(selected["id"], json!(membership.uuid.to_string()), "the minimum response set survives");
+
+    // Excluding one excludes nothing of the User.
+    let excluded = server
+        .get(&format!("{path}?excludedAttributes=urn:ietf:params:scim:schemas:core:2.0:Group:externalId"), &token)
+        .await
+        .json();
+    assert_eq!(excluded["externalId"], json!("ext-1"), "a Group-qualified name must not exclude the User's");
+
+    // And the User's own qualified name still works, so this is isolation rather than blanket
+    // rejection.
+    let own = server
+        .get(&format!("{path}?attributes=urn:ietf:params:scim:schemas:core:2.0:User:externalId"), &token)
+        .await
+        .json();
+    assert_eq!(own["externalId"], json!("ext-1"));
+}
+
+#[rocket::async_test]
+async fn a_user_qualified_attribute_does_not_project_a_group() {
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, member) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
+
+    let created = server
+        .post(&groups_url(&org), &token, json!({"displayName": "Engineering", "members": [{"value": member.uuid}]}))
+        .await;
+    let path = format!("{}/{}", groups_url(&org), created.json()["id"].as_str().unwrap());
+
+    let selected = server
+        .get(&format!("{path}?attributes=urn:ietf:params:scim:schemas:core:2.0:User:displayName"), &token)
+        .await
+        .json();
+    assert!(selected.get("displayName").is_none(), "a User-qualified name must not select the Group's displayName");
+
+    let excluded = server
+        .get(&format!("{path}?excludedAttributes=urn:ietf:params:scim:schemas:core:2.0:User:displayName"), &token)
+        .await
+        .json();
+    assert_eq!(excluded["displayName"], json!("Engineering"));
+
+    // A User-qualified `members` must not trigger the Group-specific membership optimisation.
+    let members_kept = server
+        .get(&format!("{path}?excludedAttributes=urn:ietf:params:scim:schemas:core:2.0:User:members"), &token)
+        .await
+        .json();
+    assert_eq!(members_kept["members"][0]["value"], json!(member.uuid.to_string()), "membership must still be loaded");
+}
+
+#[rocket::async_test]
+async fn an_arbitrary_extension_attribute_cannot_project_a_core_one() {
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, membership) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
+    let path = format!("{}/{}", users_url(&org), membership.uuid);
+
+    // An extension attribute called `active` is not the core `active`.
+    let excluded = server.get(&format!("{path}?excludedAttributes=urn:example:Custom:active"), &token).await.json();
+    assert_eq!(excluded["active"], json!(true), "an extension attribute must not hide a core one");
+
+    let selected = server.get(&format!("{path}?attributes=urn:example:Custom:active"), &token).await.json();
+    assert!(selected.get("active").is_none(), "an extension attribute must not select a core one");
+    assert!(selected.get("userName").is_none(), "the list named nothing this server renders");
+    assert_eq!(selected["id"], json!(membership.uuid.to_string()));
+}
+
+// -- the membership-loading optimisation ---------------------------------------------------------
+
+#[rocket::async_test]
+async fn membership_is_loaded_only_when_the_projection_asks_for_it() {
+    // `excludedAttributes=members` is what Entra ID sends when it resolves a group by name, and
+    // honouring it saves one query per group. Making projection schema-aware must not have broken
+    // it -- nor started skipping the load for a projection that does need it.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, member) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
+
+    let created = server
+        .post(&groups_url(&org), &token, json!({"displayName": "Engineering", "members": [{"value": member.uuid}]}))
+        .await;
+    let path = format!("{}/{}", groups_url(&org), created.json()["id"].as_str().unwrap());
+
+    // Excluded outright: not loaded, so the key is absent rather than an empty array. An empty
+    // array would be a lie -- the group does have a member.
+    let skipped = server.get(&format!("{path}?excludedAttributes=members"), &token).await.json();
+    assert!(skipped.get("members").is_none());
+
+    // A projection that does not name `members` at all: also not loaded.
+    let narrowed = server.get(&format!("{path}?attributes=displayName"), &token).await.json();
+    assert!(narrowed.get("members").is_none());
+    assert_eq!(narrowed["displayName"], json!("Engineering"));
+
+    // A sub-attribute selection needs the data, so it is loaded.
+    let sub = server.get(&format!("{path}?attributes=members.value"), &token).await.json();
+    assert_eq!(sub["members"][0]["value"], json!(member.uuid.to_string()));
+    assert!(sub["members"][0].get("$ref").is_none(), "only the named sub-attribute survives");
+
+    // Excluding a *sub*-attribute must not skip the load either: the rest of the parent is wanted.
+    let sub_excluded = server.get(&format!("{path}?excludedAttributes=members.type"), &token).await.json();
+    assert_eq!(sub_excluded["members"][0]["value"], json!(member.uuid.to_string()));
+    assert!(sub_excluded["members"][0].get("type").is_none());
+
+    // The same rules on the list endpoint, which is where the per-group cost actually adds up.
+    let listed = server.get(&format!("{}?excludedAttributes=members", groups_url(&org)), &token).await.json();
+    assert!(listed["Resources"][0].get("members").is_none());
+}
+
+#[rocket::async_test]
+async fn a_group_qualified_attribute_on_users_does_no_group_work() {
+    // `/Users` has no membership to load and no group to resolve; a Group-qualified projection
+    // must not change that, it must simply select nothing.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    server.member(&org, "alice@example.test", MembershipType::User, true).await;
+
+    let listed = server
+        .get(&format!("{}?attributes=urn:ietf:params:scim:schemas:core:2.0:Group:members", users_url(&org)), &token)
+        .await;
+    assert_eq!(listed.status, Status::Ok, "{}", listed.body);
+
+    let resource = &listed.json()["Resources"][0];
+    assert!(resource.get("members").is_none(), "a User has no members, projected or otherwise");
+    assert!(resource.get("userName").is_none(), "the list named nothing this server renders on a User");
+    assert!(resource.get("id").is_some());
+}
+
+// -- filter operator/type validation over the wire ------------------------------------------------
+//
+// A filter whose operator cannot apply to the attribute's type used to evaluate to "no match",
+// which a client cannot tell apart from a correct filter over an empty directory. It is a
+// `400`/`invalidFilter` now, with a detail that says what is wrong.
+
+#[rocket::async_test]
+async fn a_semantically_invalid_filter_is_a_400_not_an_empty_list() {
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    server.member(&org, "alice@example.test", MembershipType::User, true).await;
+
+    for filter in [
+        // Substring and ordering operators on a boolean.
+        "active%20co%20true",
+        "active%20gt%20true",
+        "active%20sw%20false",
+        "active%20ew%20true",
+        "active%20ge%20false",
+        "active%20lt%20true",
+        "active%20le%20true",
+        // A literal that is not a boolean at all.
+        "active%20eq%20%22yes%22",
+        "active%20eq%201",
+        // A complex attribute compared directly.
+        "emails%20eq%20%22alice@example.test%22",
+        // `null` with an operator that cannot use it.
+        "externalId%20co%20null",
+    ] {
+        let reply = server.get(&format!("{}?filter={filter}", users_url(&org)), &token).await;
+        reply.assert_error(Status::BadRequest, Some("invalidFilter"));
+        assert!(!reply.body.is_empty(), "the error should say what is wrong: {filter}");
+    }
+
+    // Groups too.
+    server
+        .get(&format!("{}?filter=members%20eq%20%22m1%22", groups_url(&org)), &token)
+        .await
+        .assert_error(Status::BadRequest, Some("invalidFilter"));
+}
+
+#[rocket::async_test]
+async fn valid_boolean_filters_still_work() {
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    server.member(&org, "active@example.test", MembershipType::User, true).await;
+    let (_, mut revoked) = server.member(&org, "revoked@example.test", MembershipType::User, true).await;
+    revoked.revoke();
+    revoked.save(&server.conn().await).await.expect("revoke");
+
+    let active = server.get(&format!("{}?filter=active%20eq%20true", users_url(&org)), &token).await;
+    assert_eq!(active.json()["totalResults"], json!(1), "{}", active.body);
+    assert_eq!(active.json()["Resources"][0]["userName"], json!("active@example.test"));
+
+    let inactive = server.get(&format!("{}?filter=active%20eq%20false", users_url(&org)), &token).await;
+    assert_eq!(inactive.json()["totalResults"], json!(1), "{}", inactive.body);
+    assert_eq!(inactive.json()["Resources"][0]["userName"], json!("revoked@example.test"));
+
+    let ne = server.get(&format!("{}?filter=active%20ne%20true", users_url(&org)), &token).await;
+    assert_eq!(ne.json()["totalResults"], json!(1), "{}", ne.body);
+
+    let present = server.get(&format!("{}?filter=active%20pr", users_url(&org)), &token).await;
+    assert_eq!(present.json()["totalResults"], json!(2), "{}", present.body);
+
+    // A quoted boolean is still a boolean: Entra ID sends them that way in some flows.
+    let quoted = server.get(&format!("{}?filter=active%20eq%20%22true%22", users_url(&org)), &token).await;
+    assert_eq!(quoted.json()["totalResults"], json!(1), "{}", quoted.body);
+}
+
+#[rocket::async_test]
+async fn an_unquoted_value_on_a_string_attribute_is_still_text() {
+    // The tokenizer types a literal by shape. Against a string attribute the literal text is what
+    // the client meant, so a numeric-looking externalId must not become a type mismatch that
+    // matches nothing.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, mut membership) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
+
+    membership.set_external_id(Some("12345".to_owned()));
+    membership.save(&server.conn().await).await.expect("set external id");
+
+    let unquoted = server.get(&format!("{}?filter=externalId%20eq%2012345", users_url(&org)), &token).await;
+    assert_eq!(unquoted.json()["totalResults"], json!(1), "{}", unquoted.body);
+
+    let quoted = server.get(&format!("{}?filter=externalId%20eq%20%2212345%22", users_url(&org)), &token).await;
+    assert_eq!(quoted.json()["totalResults"], json!(1), "{}", quoted.body);
+}
+
+#[rocket::async_test]
+async fn a_null_comparison_tests_for_absence() {
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, mut with) = server.member(&org, "with@example.test", MembershipType::User, true).await;
+    server.member(&org, "without@example.test", MembershipType::User, true).await;
+
+    with.set_external_id(Some("ext-1".to_owned()));
+    with.save(&server.conn().await).await.expect("set external id");
+
+    let absent = server.get(&format!("{}?filter=externalId%20eq%20null", users_url(&org)), &token).await;
+    assert_eq!(absent.json()["totalResults"], json!(1), "{}", absent.body);
+    assert_eq!(absent.json()["Resources"][0]["userName"], json!("without@example.test"));
+
+    let present = server.get(&format!("{}?filter=externalId%20ne%20null", users_url(&org)), &token).await;
+    assert_eq!(present.json()["totalResults"], json!(1), "{}", present.body);
+    assert_eq!(present.json()["Resources"][0]["userName"], json!("with@example.test"));
 }

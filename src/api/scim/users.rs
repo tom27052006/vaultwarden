@@ -29,8 +29,7 @@ use crate::{
 };
 
 use super::{
-    ACTING_SCIM_USER, AttributeProjection, ListQuery, Pagination, SCIM_DEVICE_TYPE, ScimContext, ScimToken,
-    USER_SCHEMA,
+    ACTING_SCIM_USER, ListQuery, ProjectionQuery, SCIM_DEVICE_TYPE, ScimContext, ScimToken, USER_SCHEMA,
     error::{ScimError, ScimResult},
     filter::{Filter, USER_ATTRS},
     json::{ScimBody, ScimResponse},
@@ -98,6 +97,30 @@ fn ensure_user_name_unchanged(asserted: Option<&String>, current: &str) -> ScimR
         "'userName' cannot be changed through SCIM because it is the account's global identity. \
          Deprovision the user and provision the new address instead.",
     ))
+}
+
+/// Reject an attempt to rename the underlying account's display name.
+///
+/// `User.name` is not an authorization attribute, but it is just as global as the email: it is
+/// shown in every organization the account belongs to, so one organization's identity provider
+/// must not rewrite what the others see. Discovery advertises `displayName` as `immutable`, and
+/// this is what makes that true: a value that matches is the no-op an identity provider sends on
+/// every update, and a genuine change is refused rather than silently dropped.
+///
+/// [`FieldChange::Clear`] -- an explicit `remove` -- is refused for the same reason: an immutable
+/// attribute cannot be unset any more than it can be changed.
+fn ensure_display_name_unchanged(asserted: &FieldChange, current: &str) -> ScimResult<()> {
+    match asserted {
+        FieldChange::Unchanged => Ok(()),
+        FieldChange::Set(asserted) if asserted == current => Ok(()),
+        FieldChange::Set(_) => Err(ScimError::immutable(
+            "'displayName' cannot be changed through SCIM because it is the account's global name, \
+             shown in every organization the account belongs to. Change it in the web vault instead.",
+        )),
+        FieldChange::Clear => Err(ScimError::immutable(
+            "'displayName' cannot be removed through SCIM because it is the account's global name.",
+        )),
+    }
 }
 
 /// Apply the server's signup policy to an address that has no Vaultwarden account yet.
@@ -202,8 +225,10 @@ async fn narrow_by_index(ctx: &ScimContext, filter: &Filter, conn: &DbConn) -> O
 async fn get_users(org_id: &str, query: ListQuery, token: ScimToken, conn: DbConn) -> ScimResult<ScimResponse> {
     let ctx = ScimContext::resolve(&token, org_id)?;
 
-    let pagination = Pagination::parse(query.start_index.as_deref(), query.count.as_deref())?;
-    let projection = AttributeProjection::parse(query.attributes.as_deref(), query.excluded_attributes.as_deref())?;
+    let pagination = query.pagination()?;
+    // Parsed against the User schema, so a Group-qualified attribute name is foreign here and
+    // cannot alias onto a User attribute that shares its last segment.
+    let projection = query.projection(USER_SCHEMA)?;
 
     let filter = query.filter.as_deref().map(|raw| Filter::parse(raw, USER_ATTRS, USER_SCHEMA)).transpose()?;
 
@@ -248,7 +273,7 @@ async fn get_users(org_id: &str, query: ListQuery, token: ScimToken, conn: DbCon
 async fn get_user(
     org_id: &str,
     user_id: &str,
-    query: ListQuery,
+    query: ProjectionQuery,
     token: ScimToken,
     conn: DbConn,
 ) -> ScimResult<ScimResponse> {
@@ -257,7 +282,7 @@ async fn get_user(
     let view = UserView::from_membership(&member, &user);
 
     // Projection applies to every representation, not just list endpoints.
-    let projection = AttributeProjection::parse(query.attributes.as_deref(), query.excluded_attributes.as_deref())?;
+    let projection = query.projection(USER_SCHEMA)?;
 
     let location = ctx.resource_location("User", &view.id);
     Ok(ScimResponse::resource(projection.apply(view.to_json(&location)), location))
@@ -267,9 +292,10 @@ async fn get_user(
 // Create
 // ---------------------------------------------------------------------------------------------
 
-#[post("/<org_id>/Users", data = "<body>")]
+#[post("/<org_id>/Users?<query..>", data = "<body>")]
 async fn post_user(
     org_id: &str,
+    query: ProjectionQuery,
     body: ScimBody<ScimUserRequest>,
     token: ScimToken,
     conn: DbConn,
@@ -277,10 +303,15 @@ async fn post_user(
     let ctx = ScimContext::resolve(&token, org_id)?;
     let request = body.into_inner()?;
 
-    // Validate everything before touching the database.
+    // Validate everything before touching the database. The projection is parsed here too, so a
+    // request that cannot be rendered fails before it provisions anybody.
+    let projection = query.projection(USER_SCHEMA)?;
     ensure_schema(request.schemas.as_ref(), USER_SCHEMA)?;
     let user_name = request.resolve_user_name()?;
     let external_id = normalize_external_id(request.external_id.as_deref())?;
+    // Bounded here, not inside the provisioning helper, because it is only ever written to an
+    // account this request creates. An over-long name is refused rather than silently truncated.
+    let display_name = request.resolve_display_name()?;
 
     if Membership::find_by_email_and_org(&user_name, &ctx.org_id, &conn).await.is_some() {
         return Err(ScimError::conflict(format!("User '{user_name}' is already a member of this organization.")));
@@ -312,9 +343,7 @@ async fn post_user(
 
     // The membership is always created as an unprivileged `User`; `provision_org_member` has no
     // parameter for anything else. The display name is only used if this creates a new account.
-    let member =
-        provision_org_member(&ctx.org_id, &user_name, request.resolve_display_name(), external_id, state, &conn)
-            .await?;
+    let member = provision_org_member(&ctx.org_id, &user_name, display_name, external_id, state, &conn).await?;
 
     let Some(user) = User::find_by_uuid(&member.user_uuid, &conn).await else {
         return Err(ScimError::internal("Provisioned membership has no account", &member.user_uuid));
@@ -347,7 +376,7 @@ async fn post_user(
     let view = UserView::from_membership(&member, &user);
     let location = ctx.resource_location("User", &view.id);
 
-    Ok(ScimResponse::created(view.to_json(&location), location))
+    Ok(ScimResponse::created(projection.apply(view.to_json(&location)), location))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -369,6 +398,7 @@ async fn apply_user_changes(
     let view = UserView::from_membership(member, user);
     ensure_manageable(&view)?;
     ensure_user_name_unchanged(changes.user_name_assertion.as_ref(), &view.user_name)?;
+    ensure_display_name_unchanged(&changes.display_name_assertion, &view.display_name)?;
 
     if !changes.external_id.is_unchanged() {
         ensure_external_id_available(ctx, changes.external_id.to_stored().as_ref(), Some(&member.uuid), conn).await?;
@@ -421,11 +451,41 @@ async fn apply_user_changes(
 
     // Somebody provisioned inactive never got an invitation, because sending one would have
     // contradicted the state the identity provider asked for. Reactivation is the moment it
-    // becomes wanted, so an account that still cannot sign in gets one now. Mail failures are
-    // logged rather than propagated: the membership is already active and correct, and failing
-    // the request would make the identity provider retry a change that has been applied.
+    // becomes wanted, so an account that still cannot sign in gets one now.
+    //
+    // If that fails, the reactivation fails with it. `active: true` on an unregistered account is
+    // a promise that the person can now get in; leaving the membership active while the only way
+    // in was never created would tell the identity provider the change succeeded when the user
+    // has no usable path to the organization, and nothing downstream would ever notice.
+    //
+    // The rollback is honest about what it can undo. Re-revoking the membership is a single row
+    // write and is reliable. An invitation *email* that was already handed to the MTA before the
+    // call reported failure cannot be recalled -- so the person may receive a mail for a
+    // membership that is revoked again, which is the same harmless state as any revoked invitee.
+    //
+    // An `externalId` set by the same request is deliberately *not* rolled back. It is directory
+    // metadata that is correct whether or not the invitation worked, undoing it would discard a
+    // correct value, and the identity provider re-sends it on the retry regardless.
+    // See docs/scim/design.md section 7.
     if restored && let Err(e) = ensure_invitation_for(member, conn).await {
-        warn!(target: "scim", "Reactivated {} but could not deliver an invitation: {e:?}", member.uuid);
+        warn!(target: "scim", "Could not issue an invitation while reactivating {}: {e:?}", member.uuid);
+
+        // Put the membership back where it was, so the identity provider's next attempt starts
+        // from the state it thinks it is in. Retries are safe: `ensure_invitation_for` is
+        // idempotent -- it creates an `Invitation` row only when none exists -- so a retry that
+        // succeeds does not double-provision, and a membership that is already active never
+        // reaches this path at all.
+        member.revoke();
+        if let Err(rollback) = member.save(conn).await {
+            error!(
+                target: "scim",
+                "Could not roll back the reactivation of {} after the invitation failed: {rollback:?}. \
+                 The membership is active but its account may have no way to accept the invitation.",
+                member.uuid
+            );
+        }
+
+        return Err(ScimError::internal("Issuing an invitation for a reactivated SCIM member", &e));
     }
 
     if let Some(event) = event {
@@ -435,48 +495,64 @@ async fn apply_user_changes(
     Ok(())
 }
 
-#[put("/<org_id>/Users/<user_id>", data = "<body>")]
+#[put("/<org_id>/Users/<user_id>?<query..>", data = "<body>")]
 async fn put_user(
     org_id: &str,
     user_id: &str,
+    query: ProjectionQuery,
     body: ScimBody<ScimUserRequest>,
     token: ScimToken,
     conn: DbConn,
 ) -> ScimResult<ScimResponse> {
     let ctx = ScimContext::resolve(&token, org_id)?;
     let request = body.into_inner()?;
+    let projection = query.projection(USER_SCHEMA)?;
     ensure_schema(request.schemas.as_ref(), USER_SCHEMA)?;
 
     let (mut member, user) = load_member(&ctx, user_id, &conn).await?;
 
     // An absent attribute means "unchanged", not "clear". A strict reading of RFC 7644 section
     // 3.5.1 would clear it, which turns a sparse client payload into silent deprovisioning.
+    //
+    // `userName` and `displayName` are assertions, not writes: the two immutable attributes are
+    // compared against the stored account and a genuine change is refused. Identity is resolved
+    // from `emails[].value` as well, because that is what `POST` accepts and a client that
+    // provisions by email updates by email.
     let changes = UserChanges {
         active: request.active,
         external_id: match request.external_id.as_deref() {
             Some(raw) => FieldChange::from_normalized(normalize_external_id(Some(raw))?),
             None => FieldChange::Unchanged,
         },
-        user_name_assertion: request.user_name.as_deref().map(normalize_user_name).transpose()?,
+        // Already resolved with `userName` taking precedence over `emails`, which is why the
+        // planner's separate email slot stays empty here.
+        user_name_assertion: request.resolve_user_name_assertion()?,
+        email_assertion: None,
+        display_name_assertion: match request.asserted_display_name() {
+            Some(name) => FieldChange::Set(name),
+            None => FieldChange::Unchanged,
+        },
     };
 
     apply_user_changes(&ctx, &token, &mut member, &user, &changes, &conn).await?;
 
     let view = UserView::from_membership(&member, &user);
     let location = ctx.resource_location("User", &view.id);
-    Ok(ScimResponse::resource(view.to_json(&location), location))
+    Ok(ScimResponse::resource(projection.apply(view.to_json(&location)), location))
 }
 
-#[patch("/<org_id>/Users/<user_id>", data = "<body>")]
+#[patch("/<org_id>/Users/<user_id>?<query..>", data = "<body>")]
 async fn patch_user(
     org_id: &str,
     user_id: &str,
+    query: ProjectionQuery,
     body: ScimBody<PatchRequest>,
     token: ScimToken,
     conn: DbConn,
 ) -> ScimResult<ScimResponse> {
     let ctx = ScimContext::resolve(&token, org_id)?;
     let request = body.into_inner()?;
+    let projection = query.projection(USER_SCHEMA)?;
     let (mut member, user) = load_member(&ctx, user_id, &conn).await?;
 
     // The whole document is planned and validated first; a single bad operation fails the request
@@ -487,7 +563,7 @@ async fn patch_user(
 
     let view = UserView::from_membership(&member, &user);
     let location = ctx.resource_location("User", &view.id);
-    Ok(ScimResponse::resource(view.to_json(&location), location))
+    Ok(ScimResponse::resource(projection.apply(view.to_json(&location)), location))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -616,5 +692,47 @@ mod tests {
         assert_eq!(err.status, rocket::http::Status::BadRequest);
         assert_eq!(err.scim_type, Some(super::super::error::ScimType::Mutability));
         assert!(err.detail.contains("Deprovision"), "the error should say what to do instead");
+    }
+
+    // -- displayName immutability ----------------------------------------------------------------
+    //
+    // The User schema advertises `displayName` as `immutable`, so the three outcomes have to be
+    // exactly the three the RFC gives that word: settable at creation, a no-op when re-asserted,
+    // and an error when changed.
+
+    #[test]
+    fn an_absent_display_name_is_accepted() {
+        assert!(ensure_display_name_unchanged(&FieldChange::Unchanged, "Alice").is_ok());
+    }
+
+    #[test]
+    fn a_matching_display_name_is_accepted_as_a_no_op() {
+        // What an identity provider sends on every sync once the account exists.
+        assert!(ensure_display_name_unchanged(&FieldChange::Set("Alice".to_owned()), "Alice").is_ok());
+    }
+
+    #[test]
+    fn a_changed_display_name_is_refused_as_immutable() {
+        let err = ensure_display_name_unchanged(&FieldChange::Set("Someone Else".to_owned()), "Alice").unwrap_err();
+
+        assert_eq!(err.status, rocket::http::Status::BadRequest);
+        assert_eq!(err.scim_type, Some(super::super::error::ScimType::Mutability));
+        assert!(err.detail.contains("web vault"), "the error should say where the name can be changed");
+    }
+
+    #[test]
+    fn removing_the_display_name_is_refused_as_immutable() {
+        // An immutable attribute cannot be unset any more than it can be changed.
+        let err = ensure_display_name_unchanged(&FieldChange::Clear, "Alice").unwrap_err();
+
+        assert_eq!(err.status, rocket::http::Status::BadRequest);
+        assert_eq!(err.scim_type, Some(super::super::error::ScimType::Mutability));
+    }
+
+    #[test]
+    fn display_name_comparison_is_exact() {
+        // Names are not identifiers: "alice" and "Alice" are different names, and accepting one
+        // for the other would mean the response did not describe what the server holds.
+        assert!(ensure_display_name_unchanged(&FieldChange::Set("alice".to_owned()), "Alice").is_err());
     }
 }

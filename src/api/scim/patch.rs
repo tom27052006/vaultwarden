@@ -275,6 +275,22 @@ pub struct UserChanges {
     /// A `userName` the client asserted. Vaultwarden never renames an account through SCIM, so
     /// the caller compares this against the stored email and rejects a genuine change.
     pub user_name_assertion: Option<String>,
+    /// An address asserted through `emails` rather than `userName`.
+    ///
+    /// Tracked separately and folded into `user_name_assertion` once the whole document has been
+    /// read, so that `userName` wins over `emails` no matter which order the operations arrive in.
+    /// Letting them overwrite each other made a document containing both -- which Entra ID sends
+    /// whenever `userPrincipalName` and `mail` are both mapped, and they routinely differ -- fail
+    /// or pass depending on operation order.
+    ///
+    /// Only [`plan_user_patch`] ever sets this, and it is always `None` by the time the change set
+    /// is returned. `PUT` resolves the same precedence up front, in
+    /// `ScimUserRequest::resolve_user_name_assertion`, so it leaves this empty.
+    pub email_assertion: Option<String>,
+    /// A `displayName` the client asserted, likewise never written to an existing account. A
+    /// [`FieldChange`] rather than an `Option` because `remove` has to be distinguishable from
+    /// "not mentioned": both leave the stored name alone, but only one of them is an error.
+    pub display_name_assertion: FieldChange,
 }
 
 /// Attributes a client may send on a user that this server knowingly does not store.
@@ -282,8 +298,12 @@ pub struct UserChanges {
 /// They are accepted and dropped rather than rejected: they are cosmetic, and failing the whole
 /// operation over them would break provisioning. See `docs/scim/design.md` section 7.
 const USER_IGNORED_ATTRS: &[&str] = &[
-    // Core User attributes Vaultwarden has nowhere to put.
-    "displayname",
+    // Core User attributes Vaultwarden has nowhere to put. `displayName` is *not* here: it maps
+    // to the account's global name, so it is asserted and checked rather than dropped.
+    //
+    // `name` and its sub-attributes stay ignored. They are not published in this server's User
+    // schema at all, so a client writing them is writing an attribute that does not exist here,
+    // which is a different thing from writing one that exists and cannot change.
     "name",
     "nickname",
     "title",
@@ -320,6 +340,14 @@ pub fn plan_user_patch(request: &PatchRequest) -> ScimResult<UserChanges> {
         let op = PatchOp::parse(&operation.op)?;
         apply_user_operation(&mut changes, op, operation)?;
     }
+
+    // `userName` and `emails[].value` are two spellings of the same account email, so a document
+    // that carries both has to resolve to one answer regardless of the order the operations were
+    // written in. `userName` wins, exactly as it does on `POST` and `PUT`.
+    if changes.user_name_assertion.is_none() {
+        changes.user_name_assertion = changes.email_assertion.take();
+    }
+    changes.email_assertion = None;
 
     Ok(changes)
 }
@@ -422,6 +450,35 @@ fn apply_user_attribute(
             Ok(())
         }
 
+        // `displayName` maps to the account's global name, which SCIM does not rewrite. It is
+        // recorded as an assertion for the caller to compare against the stored value: identical
+        // is the no-op an identity provider sends on every update, different is a `mutability`
+        // fault, and `remove` is refused outright.
+        "displayname" => {
+            if path.filter.is_some() {
+                return Err(ScimError::invalid_path("Value filters are not supported on 'displayName'."));
+            }
+            // `remove`, and an explicit `null` in a pathless object, both ask for the attribute to
+            // have no value. Neither is a syntax error -- it is a perfectly clear request, and the
+            // caller answers it with the same `mutability` fault it answers a change with.
+            if op == PatchOp::Remove || matches!(value, None | Some(Value::Null)) {
+                changes.display_name_assertion = FieldChange::Clear;
+                return Ok(());
+            }
+            let Some(raw) = value.and_then(as_string) else {
+                return Err(ScimError::invalid_value("'displayName' must be a string."));
+            };
+            // No length bound here: nothing on this path is ever written, the value is only
+            // compared with the stored name. See `ScimUserRequest::asserted_display_name`.
+            let trimmed = raw.trim();
+            changes.display_name_assertion = if trimmed.is_empty() {
+                FieldChange::Clear
+            } else {
+                FieldChange::Set(trimmed.to_owned())
+            };
+            Ok(())
+        }
+
         // `emails` is derived from the account email, which SCIM does not rename. Accept a write
         // that matches, so that an identity provider sending the full resource does not fail.
         "emails" => {
@@ -435,7 +492,9 @@ fn apply_user_attribute(
                 _ => None,
             };
             if let Some(asserted) = asserted {
-                changes.user_name_assertion = Some(normalize_user_name(asserted)?);
+                // Recorded separately from `userName`; `plan_user_patch` folds the two together
+                // once the whole document has been read, so order cannot change the answer.
+                changes.email_assertion = Some(normalize_user_name(asserted)?);
             }
             Ok(())
         }
@@ -905,7 +964,6 @@ mod tests {
     fn cosmetic_attributes_are_accepted_and_dropped() {
         let request = patch(json!({
             "Operations": [
-                {"op": "Replace", "path": "displayName", "value": "New Name"},
                 {"op": "Replace", "path": "name.givenName", "value": "New"},
                 {"op": "Replace", "path": "title", "value": "Staff Engineer"},
                 {"op": "Replace", "path": "active", "value": true},
@@ -916,6 +974,128 @@ mod tests {
         assert_eq!(changes.active, Some(true));
         assert!(changes.external_id.is_unchanged());
         assert_eq!(changes.user_name_assertion, None);
+        assert!(changes.display_name_assertion.is_unchanged(), "`name` is not `displayName`");
+    }
+
+    // -- displayName is an assertion, not a write --------------------------------------------------
+
+    #[test]
+    fn display_name_is_captured_as_an_assertion() {
+        // Like `userName`: the planner records what was asserted and the caller compares it with
+        // the stored account. Dropping it here -- what this used to do -- is what made the
+        // `immutable` in the published schema untrue.
+        let request = patch(json!({"Operations": [{"op": "replace", "path": "displayName", "value": "  New Name  "}]}));
+        let changes = plan_user_patch(&request).unwrap();
+
+        assert_eq!(changes.display_name_assertion, FieldChange::Set("New Name".to_owned()));
+        assert_eq!(changes.active, None, "asserting a displayName must not imply anything else");
+    }
+
+    #[test]
+    fn a_pathless_display_name_is_captured_too() {
+        // The shape Entra ID sends.
+        let request = patch(json!({"Operations": [{"op": "Replace", "value": {"displayName": "New Name"}}]}));
+        let changes = plan_user_patch(&request).unwrap();
+
+        assert_eq!(changes.display_name_assertion, FieldChange::Set("New Name".to_owned()));
+    }
+
+    #[test]
+    fn removing_the_display_name_is_a_clear_not_a_no_op() {
+        // `remove` is distinguishable from "not mentioned" so the caller can refuse it: both leave
+        // the stored name alone, but only one of them is an error.
+        let request = patch(json!({"Operations": [{"op": "remove", "path": "displayName"}]}));
+        let changes = plan_user_patch(&request).unwrap();
+
+        assert_eq!(changes.display_name_assertion, FieldChange::Clear);
+    }
+
+    #[test]
+    fn an_asserted_display_name_is_not_length_bounded() {
+        // Nothing on this path is written, so the 50-character limit -- which exists because the
+        // create path *does* write -- has nothing to apply to. Bounding it here would mean an
+        // account whose name predates the limit could not have its own name echoed back at it.
+        let long = "a".repeat(super::super::resource::MAX_ACCOUNT_NAME_LEN + 1);
+        let request = patch(json!({"Operations": [{"op": "replace", "path": "displayName", "value": &long}]}));
+
+        assert_eq!(plan_user_patch(&request).unwrap().display_name_assertion, FieldChange::Set(long));
+    }
+
+    #[test]
+    fn a_non_string_display_name_is_rejected() {
+        let request = patch(json!({"Operations": [{"op": "replace", "path": "displayName", "value": 42}]}));
+        assert_eq!(plan_user_patch(&request).unwrap_err().scim_type, Some(ScimType::InvalidValue));
+    }
+
+    #[test]
+    fn a_null_or_empty_display_name_reads_as_a_removal() {
+        // Both ask for the attribute to have no value. That is a clear request, not a malformed
+        // one, so it gets the same `mutability` answer from the caller that `remove` gets -- not
+        // an `invalidValue` about the JSON.
+        for value in [json!(null), json!("")] {
+            let request = patch(json!({"Operations": [{"op": "replace", "path": "displayName", "value": value}]}));
+            assert_eq!(plan_user_patch(&request).unwrap().display_name_assertion, FieldChange::Clear, "{value}");
+        }
+
+        let pathless = patch(json!({"Operations": [{"op": "Replace", "value": {"displayName": null}}]}));
+        assert_eq!(plan_user_patch(&pathless).unwrap().display_name_assertion, FieldChange::Clear);
+    }
+
+    // -- userName and emails are one identity -------------------------------------------------------
+
+    #[test]
+    fn user_name_wins_over_emails_whatever_the_operation_order() {
+        // Entra ID maps `userName` from `userPrincipalName` and `emails` from `mail`, and those
+        // routinely differ. Letting the two overwrite each other made such a document pass or
+        // fail depending on which operation happened to come last.
+        let user_name_first = patch(json!({"Operations": [
+            {"op": "replace", "path": "userName", "value": "upn@example.test"},
+            {"op": "replace", "path": "emails", "value": [{"value": "mail@example.test"}]},
+        ]}));
+        let emails_first = patch(json!({"Operations": [
+            {"op": "replace", "path": "emails", "value": [{"value": "mail@example.test"}]},
+            {"op": "replace", "path": "userName", "value": "upn@example.test"},
+        ]}));
+
+        for request in [user_name_first, emails_first] {
+            let changes = plan_user_patch(&request).unwrap();
+            assert_eq!(changes.user_name_assertion.as_deref(), Some("upn@example.test"));
+        }
+    }
+
+    #[test]
+    fn emails_alone_still_asserts_the_identity() {
+        // A client that provisions by email updates by email; the fallback is only a fallback.
+        let request = patch(
+            json!({"Operations": [{"op": "replace", "path": "emails", "value": [{"value": "Mail@Example.test"}]}]}),
+        );
+        let changes = plan_user_patch(&request).unwrap();
+
+        assert_eq!(changes.user_name_assertion.as_deref(), Some("mail@example.test"));
+    }
+
+    #[test]
+    fn an_extension_display_name_is_still_ignored() {
+        // The namespace rule wins: an extension attribute whose last segment is `displayName` is
+        // not this server's `displayName`, so it is dropped rather than asserted.
+        let request = patch(
+            json!({"Operations": [{"op": "replace", "path": "urn:example:Custom:displayName", "value": "Ignored"}]}),
+        );
+        let changes = plan_user_patch(&request).unwrap();
+
+        assert!(changes.display_name_assertion.is_unchanged());
+    }
+
+    #[test]
+    fn a_qualified_display_name_is_the_core_attribute() {
+        let request = patch(json!({"Operations": [{
+            "op": "replace",
+            "path": "urn:ietf:params:scim:schemas:core:2.0:User:displayName",
+            "value": "New Name",
+        }]}));
+        let changes = plan_user_patch(&request).unwrap();
+
+        assert_eq!(changes.display_name_assertion, FieldChange::Set("New Name".to_owned()));
     }
 
     #[test]

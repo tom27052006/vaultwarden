@@ -10,7 +10,6 @@
 //! is compiled into a release build.
 
 #[cfg(not(test))]
-#[cfg(not(test))]
 use std::net::IpAddr;
 
 #[cfg(not(test))]
@@ -23,25 +22,29 @@ pub fn groups_enabled() -> bool {
     crate::CONFIG.org_groups_enabled()
 }
 
+/// The high-volume provisioning budget, charged **only to requests that authenticated**.
+///
+/// A directory sync is inherently high-volume, so this budget is generous. That is exactly why
+/// nothing unauthenticated may draw on it: see [`check_auth_rate_limit`].
 #[cfg(not(test))]
 pub fn check_rate_limit(ip: &IpAddr) -> Result<(), ()> {
     crate::ratelimit::check_limit_scim(ip)
 }
 
-/// Budget for requests that cannot possibly be legitimate provisioning traffic.
+/// Budget for authentication *attempts* that did not succeed.
 ///
-/// A request with no bearer credential, or one whose token is not even the right shape, is never
-/// something an identity provider sends. Charging those to Vaultwarden's existing strict
-/// unauthenticated limiter keeps the generous provisioning budget for provisioning, so a flood of
-/// junk cannot consume the allowance a real sync needs -- and it is decided from the request
-/// headers alone, before any database work.
+/// A request with no bearer credential, one whose token is not even the right shape, and one whose
+/// secret is simply wrong are all charged here -- to Vaultwarden's existing strict unauthenticated
+/// limiter -- and never to the provisioning budget. A flood of junk therefore cannot consume the
+/// allowance a real sync needs, and conversely a saturated provisioning budget cannot stop the
+/// server from rejecting junk.
 #[cfg(not(test))]
-pub fn check_unauthenticated_rate_limit(ip: &IpAddr) -> Result<(), ()> {
+pub fn check_auth_rate_limit(ip: &IpAddr) -> Result<(), ()> {
     crate::ratelimit::check_limit_unauthenticated(ip).map_err(|_| ())
 }
 
 #[cfg(test)]
-pub use test_overrides::{check_rate_limit, check_unauthenticated_rate_limit, groups_enabled, scim_enabled};
+pub use test_overrides::{check_auth_rate_limit, check_rate_limit, groups_enabled, scim_enabled};
 
 #[cfg(test)]
 pub(in crate::api::scim) mod test_overrides {
@@ -74,7 +77,7 @@ pub(in crate::api::scim) mod test_overrides {
         }
     }
 
-    pub fn check_unauthenticated_rate_limit(_ip: &IpAddr) -> Result<(), ()> {
+    pub fn check_auth_rate_limit(_ip: &IpAddr) -> Result<(), ()> {
         if UNAUTH_RATE_LIMIT_EXHAUSTED.load(Ordering::Relaxed) {
             Err(())
         } else {

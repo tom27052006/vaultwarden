@@ -238,6 +238,24 @@ pub const DEFAULT_PAGE_SIZE: usize = 100;
 /// Hard cap on `count`, so a client cannot request an unbounded response.
 pub const MAX_PAGE_SIZE: usize = 500;
 
+/// The projection parameters, which RFC 7644 section 3.9 allows on **every** operation that
+/// returns a resource representation -- `POST` and `PUT` and `PATCH` as much as `GET`.
+///
+/// Kept separate from [`ListQuery`] so a `POST` does not silently accept `filter`, `startIndex`
+/// or `count`, none of which mean anything there.
+#[derive(FromForm)]
+pub struct ProjectionQuery {
+    pub attributes: Option<String>,
+    #[field(name = "excludedAttributes")]
+    pub excluded_attributes: Option<String>,
+}
+
+impl ProjectionQuery {
+    pub fn projection(&self, core_schema: &str) -> ScimResult<AttributeProjection> {
+        AttributeProjection::parse(self.attributes.as_deref(), self.excluded_attributes.as_deref(), core_schema)
+    }
+}
+
 /// Query parameters shared by the two list endpoints.
 ///
 /// Everything is taken as a string and parsed by hand: Rocket's own numeric parsing would fail
@@ -251,6 +269,16 @@ pub struct ListQuery {
     pub attributes: Option<String>,
     #[field(name = "excludedAttributes")]
     pub excluded_attributes: Option<String>,
+}
+
+impl ListQuery {
+    pub fn projection(&self, core_schema: &str) -> ScimResult<AttributeProjection> {
+        AttributeProjection::parse(self.attributes.as_deref(), self.excluded_attributes.as_deref(), core_schema)
+    }
+
+    pub fn pagination(&self) -> ScimResult<Pagination> {
+        Pagination::parse(self.start_index.as_deref(), self.count.as_deref())
+    }
 }
 
 /// A validated, 1-based SCIM page request.
@@ -319,6 +347,11 @@ struct AttrRef {
 ///
 /// `id` and `schemas` are the minimum response set and always survive. `meta` does **not**: RFC
 /// 7643 gives it `returned: default`, so `attributes=userName` legitimately omits it.
+///
+/// A projection is parsed **against the resource type being served**, never against both core
+/// schemas at once. `GET /Users?attributes=urn:...:core:2.0:Group:externalId` names an attribute
+/// of a schema the `User` resource does not have, so it selects nothing -- it must not be allowed
+/// to reach through to the User's own `externalId`.
 #[derive(Debug)]
 pub struct AttributeProjection {
     include: Option<Vec<AttrRef>>,
@@ -330,7 +363,13 @@ pub struct AttributeProjection {
 const MINIMUM_RETURNED: [&str; 2] = ["id", "schemas"];
 
 impl AttributeProjection {
-    pub fn parse(attributes: Option<&str>, excluded: Option<&str>) -> ScimResult<Self> {
+    /// Parse a projection for one resource type.
+    ///
+    /// `core_schema` is that resource type's own schema URN ([`USER_SCHEMA`] or [`GROUP_SCHEMA`]).
+    /// An unqualified name is one of its core attributes; a name qualified with `core_schema` is
+    /// the same attribute spelled out; anything else is an extension attribute in some other
+    /// namespace, which this server does not render and which therefore selects nothing.
+    pub fn parse(attributes: Option<&str>, excluded: Option<&str>, core_schema: &str) -> ScimResult<Self> {
         /// Parse one comma-separated list.
         ///
         /// Returns `None` only when the parameter was absent or blank. A list that names nothing
@@ -376,19 +415,6 @@ impl AttributeProjection {
             Some(refs)
         }
 
-        /// A projection list may name attributes of either resource type, so both core schemas
-        /// are tried and the union is kept; anything in a third namespace is an extension and is
-        /// dropped by `split`.
-        fn split_either(raw: Option<&str>) -> Option<Vec<AttrRef>> {
-            let mut refs = split(raw, USER_SCHEMA)?;
-            for entry in split(raw, GROUP_SCHEMA).unwrap_or_default() {
-                if !refs.contains(&entry) {
-                    refs.push(entry);
-                }
-            }
-            Some(refs)
-        }
-
         let has_attributes = attributes.is_some_and(|a| !a.trim().is_empty());
         let has_excluded = excluded.is_some_and(|a| !a.trim().is_empty());
         if has_attributes && has_excluded {
@@ -398,11 +424,16 @@ impl AttributeProjection {
         }
 
         Ok(Self {
-            include: split_either(attributes),
-            exclude: split_either(excluded).unwrap_or_default(),
+            include: split(attributes, core_schema),
+            exclude: split(excluded, core_schema).unwrap_or_default(),
         })
     }
 
+    /// The projection a client asked for nothing with: every attribute is returned.
+    ///
+    /// Only used by tests now that every handler parses the client's own parameters. Production
+    /// code reaches the same state through `parse(None, None, ..)`.
+    #[cfg(test)]
     pub fn none() -> Self {
         Self {
             include: None,
@@ -658,8 +689,13 @@ mod tests {
         })
     }
 
+    /// A Group projection, which is what most of these tests exercise.
     fn projection(attributes: Option<&str>, excluded: Option<&str>) -> AttributeProjection {
-        AttributeProjection::parse(attributes, excluded).expect("valid projection")
+        AttributeProjection::parse(attributes, excluded, GROUP_SCHEMA).expect("valid projection")
+    }
+
+    fn user_projection(attributes: Option<&str>, excluded: Option<&str>) -> AttributeProjection {
+        AttributeProjection::parse(attributes, excluded, USER_SCHEMA).expect("valid projection")
     }
 
     #[test]
@@ -701,14 +737,14 @@ mod tests {
         // RFC 7643 gives `meta` `returned: default`, not `returned: always`, so asking for a
         // specific attribute list legitimately leaves it out.
         assert!(AttributeProjection::none().apply(user()).get("meta").is_some());
-        assert!(projection(Some("userName"), None).apply(user()).get("meta").is_none());
-        assert!(projection(None, Some("meta")).apply(user()).get("meta").is_none());
-        assert!(projection(Some("userName,meta"), None).apply(user()).get("meta").is_some());
+        assert!(user_projection(Some("userName"), None).apply(user()).get("meta").is_none());
+        assert!(user_projection(None, Some("meta")).apply(user()).get("meta").is_none());
+        assert!(user_projection(Some("userName,meta"), None).apply(user()).get("meta").is_some());
     }
 
     #[test]
     fn a_sub_attribute_can_be_selected() {
-        let projected = projection(Some("emails.value"), None).apply(user());
+        let projected = user_projection(Some("emails.value"), None).apply(user());
 
         let email = &projected["emails"][0];
         assert_eq!(email["value"], json!("alice@example.test"));
@@ -718,7 +754,7 @@ mod tests {
 
     #[test]
     fn excluding_a_sub_attribute_keeps_the_parent() {
-        let projected = projection(None, Some("emails.type")).apply(user());
+        let projected = user_projection(None, Some("emails.type")).apply(user());
 
         let email = &projected["emails"][0];
         assert!(email.get("type").is_none(), "the named sub-attribute is gone");
@@ -728,7 +764,7 @@ mod tests {
 
     #[test]
     fn naming_the_whole_attribute_wins_over_a_sub_attribute() {
-        let projected = projection(Some("emails,emails.value"), None).apply(user());
+        let projected = user_projection(Some("emails,emails.value"), None).apply(user());
 
         assert!(projected["emails"][0].get("type").is_some(), "asking for `emails` asks for all of it");
     }
@@ -736,7 +772,7 @@ mod tests {
     #[test]
     fn attributes_and_excluded_attributes_are_mutually_exclusive() {
         // RFC 7644 section 3.9. Reconciling them silently would guess at the client's intent.
-        let err = AttributeProjection::parse(Some("userName"), Some("emails")).unwrap_err();
+        let err = AttributeProjection::parse(Some("userName"), Some("emails"), USER_SCHEMA).unwrap_err();
         assert_eq!(err.status, rocket::http::Status::BadRequest);
         assert_eq!(err.scim_type, Some(error::ScimType::InvalidValue));
     }
@@ -768,20 +804,78 @@ mod tests {
         assert!(projected.get("members").is_none());
     }
 
+    // -- cross-resource namespace isolation --------------------------------------------------------
+    //
+    // A projection is parsed against the resource type being served. Parsing it against both core
+    // schemas and keeping the union -- what an earlier revision did -- means a Group-qualified name
+    // selects the User attribute that happens to share its last segment, and vice versa.
+
     #[test]
-    fn a_projection_may_mix_user_and_group_attribute_names() {
-        // The two lists are tried against both core schemas and unioned, so a qualified name for
-        // either resource type is honoured.
-        let projection = projection(
-            Some(
-                "urn:ietf:params:scim:schemas:core:2.0:Group:displayName,urn:ietf:params:scim:schemas:core:2.0:User:userName",
-            ),
-            None,
-        );
+    fn a_group_qualified_name_does_not_select_a_user_attribute() {
+        // `GET /Users?attributes=urn:...:Group:externalId` names an attribute of a schema the User
+        // resource does not have. It selects nothing, so the response narrows to the minimum set;
+        // it must not reach through to the User's own `externalId`.
+        let projection = user_projection(Some("urn:ietf:params:scim:schemas:core:2.0:Group:externalId"), None);
+
+        assert!(!projection.wants("externalid"), "a Group-qualified name is foreign to a User");
+        let projected = projection.apply(user());
+        assert!(projected.get("externalId").is_none());
+        assert_eq!(projected["id"], json!("member-1"), "the minimum response set survives");
+    }
+
+    #[test]
+    fn a_group_qualified_name_does_not_exclude_a_user_attribute() {
+        let projection = user_projection(None, Some("urn:ietf:params:scim:schemas:core:2.0:Group:externalId"));
+
+        assert!(projection.wants("externalid"), "excluding a foreign attribute excludes nothing");
+        assert_eq!(projection.apply(user())["externalId"], json!("ext-1"));
+    }
+
+    #[test]
+    fn a_user_qualified_name_does_not_select_a_group_attribute() {
+        let projection = projection(Some("urn:ietf:params:scim:schemas:core:2.0:User:externalId"), None);
+
+        assert!(!projection.wants("externalid"));
+        let projected = projection.apply(group());
+        assert!(projected.get("externalId").is_none());
+        assert!(projected.get("displayName").is_none());
+    }
+
+    #[test]
+    fn a_user_qualified_name_does_not_exclude_a_group_attribute() {
+        let projection = projection(None, Some("urn:ietf:params:scim:schemas:core:2.0:User:displayName"));
 
         assert!(projection.wants("displayname"));
-        assert!(projection.wants("username"));
-        assert!(!projection.wants("members"));
+        assert_eq!(projection.apply(group())["displayName"], json!("Engineering"));
+    }
+
+    #[test]
+    fn a_user_qualified_members_cannot_hide_a_groups_membership() {
+        // The optimisation that skips loading membership keys off `wants("members")`, so a
+        // foreign-namespace `members` must not be able to trigger it either.
+        let projection = projection(None, Some("urn:ietf:params:scim:schemas:core:2.0:User:members"));
+
+        assert!(projection.wants("members"), "only the Group's own `members` may skip the membership load");
+        assert!(projection.apply(group()).get("members").is_some());
+    }
+
+    #[test]
+    fn each_resource_type_honours_its_own_qualified_names() {
+        // The other half of the rule: a name qualified with the *active* core schema still works.
+        assert!(projection(Some("urn:ietf:params:scim:schemas:core:2.0:Group:displayName"), None).wants("displayname"));
+        assert!(user_projection(Some("urn:ietf:params:scim:schemas:core:2.0:User:userName"), None).wants("username"));
+    }
+
+    #[test]
+    fn an_arbitrary_extension_attribute_never_projects_a_core_one() {
+        // Not just the other resource type: any third namespace is foreign too.
+        for name in ["active", "externalId", "members", "displayName", "userName"] {
+            let excluded = user_projection(None, Some(&format!("urn:example:Custom:{name}")));
+            assert!(excluded.wants(&name.to_lowercase()), "urn:example:Custom:{name} must not exclude the core one");
+
+            let included = user_projection(Some(&format!("urn:example:Custom:{name}")), None);
+            assert!(!included.wants(&name.to_lowercase()), "urn:example:Custom:{name} must not select the core one");
+        }
     }
 
     #[test]

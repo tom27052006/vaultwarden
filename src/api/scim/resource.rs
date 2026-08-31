@@ -28,6 +28,17 @@ const MAX_USER_NAME_LEN: usize = 255;
 const MAX_EXTERNAL_ID_LEN: usize = 255;
 /// Upper bound on a group `displayName`. MySQL stores `groups.name` as `VARCHAR(100)`.
 const MAX_DISPLAY_NAME_LEN: usize = 100;
+/// Upper bound on the name given to an account SCIM creates.
+///
+/// `users.name` is `TEXT` on every backend, so storage is not the constraint; Vaultwarden's own
+/// limit is. Registration and `POST /accounts/profile` both refuse a name longer than 50, matching
+/// upstream Bitwarden and keeping the JWT that carries it small (see upstream issue #2419). SCIM
+/// creates accounts through the same model, so it applies the same bound rather than writing a
+/// name the account's owner would not be allowed to keep.
+///
+/// Counted in **characters**, because 50 is a character limit -- a 50-character name of non-ASCII
+/// text is not a longer name than a 50-character ASCII one.
+pub const MAX_ACCOUNT_NAME_LEN: usize = 50;
 /// Most members a single request may reference.
 pub const MAX_MEMBERS_PER_REQUEST: usize = 5000;
 
@@ -87,6 +98,25 @@ pub fn normalize_display_name(raw: &str) -> ScimResult<String> {
     if trimmed.chars().count() > MAX_DISPLAY_NAME_LEN {
         return Err(ScimError::invalid_value(format!(
             "'displayName' must be at most {MAX_DISPLAY_NAME_LEN} characters."
+        )));
+    }
+
+    Ok(trimmed.to_owned())
+}
+
+/// Validate the name SCIM would give an account it creates.
+///
+/// Bounded by [`MAX_ACCOUNT_NAME_LEN`] characters, the same limit registration and the profile
+/// endpoint enforce, so SCIM cannot write a name the account's own owner could not have set.
+pub fn normalize_account_name(raw: &str) -> ScimResult<String> {
+    let trimmed = raw.trim();
+
+    if trimmed.is_empty() {
+        return Err(ScimError::invalid_value("'displayName' must not be empty."));
+    }
+    if trimmed.chars().count() > MAX_ACCOUNT_NAME_LEN {
+        return Err(ScimError::invalid_value(format!(
+            "'displayName' must be at most {MAX_ACCOUNT_NAME_LEN} characters."
         )));
     }
 
@@ -320,31 +350,67 @@ pub struct ScimUserRequest {
 }
 
 impl ScimUserRequest {
-    /// The email this document identifies, preferring `userName` and falling back to the primary
-    /// (or first) email, which is what identity providers that omit `userName` expect.
-    pub fn resolve_user_name(&self) -> ScimResult<String> {
+    /// The address this document identifies, if it names one at all.
+    ///
+    /// `userName` first, then the primary (or first) `emails` entry, which is what identity
+    /// providers that omit `userName` expect. Both resolve to the same thing here: SCIM's
+    /// `userName` and `emails[].value` are two spellings of the one global account email.
+    fn identity_candidate(&self) -> Option<&str> {
         if let Some(user_name) = self.user_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            return normalize_user_name(user_name);
+            return Some(user_name);
         }
 
         let emails = self.emails.as_deref().unwrap_or_default();
-        let candidate = emails
+        emails
             .iter()
             .find(|e| e.primary == Some(true) && e.value.is_some())
-            .or_else(|| emails.iter().find(|e| e.value.is_some()));
+            .or_else(|| emails.iter().find(|e| e.value.is_some()))
+            .and_then(|e| e.value.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
 
-        match candidate.and_then(|e| e.value.as_deref()) {
+    /// The email this document identifies. Required, because it is what a `POST` creates.
+    pub fn resolve_user_name(&self) -> ScimResult<String> {
+        match self.identity_candidate() {
             Some(value) => normalize_user_name(value),
             None => Err(ScimError::invalid_value("'userName' is required.")),
         }
     }
 
-    /// A human-readable name for an account this request is about to create.
+    /// The email this document *asserts*, for an update.
     ///
-    /// Only ever applied to a brand-new shell account. An account that already exists keeps its
-    /// name: that name is global, and one organization's identity provider must not rewrite what
-    /// every other organization sees.
-    pub fn resolve_display_name(&self) -> Option<String> {
+    /// `None` when the document says nothing about identity, which means "unchanged". Anything
+    /// else is compared against the stored account email by the caller: the same address is an
+    /// accepted no-op, a different one is a `mutability` fault. `emails` is included because a
+    /// client that provisions by email also updates by email, and accepting the attribute on
+    /// create while ignoring it on update would be the inconsistency this exists to remove.
+    pub fn resolve_user_name_assertion(&self) -> ScimResult<Option<String>> {
+        self.identity_candidate().map(normalize_user_name).transpose()
+    }
+
+    /// The name to give an account this request **creates**, validated and bounded.
+    ///
+    /// Only `POST` reaches this: it is the one place SCIM writes an account name, so it is the one
+    /// place the length limit belongs.
+    pub fn resolve_display_name(&self) -> ScimResult<Option<String>> {
+        self.asserted_display_name().map(|name| normalize_account_name(&name)).transpose()
+    }
+
+    /// The name this request *asserts*, for an update.
+    ///
+    /// Deliberately **not** length-bounded. On `PUT` the value is only ever compared with the
+    /// stored account name, never written, so the bound has nothing to apply to -- and applying it
+    /// anyway would mean an account whose name predates the limit could not even have its own name
+    /// echoed back at it without a `400`.
+    ///
+    /// `displayName` first, then `name.formatted`, then `givenName`/`familyName` -- the order
+    /// Entra ID's default mapping makes useful.
+    pub fn asserted_display_name(&self) -> Option<String> {
+        self.raw_display_name()
+    }
+
+    fn raw_display_name(&self) -> Option<String> {
         let from_display = self.display_name.as_deref().map(str::trim).filter(|s| !s.is_empty());
         if let Some(name) = from_display {
             return Some(name.to_owned());
@@ -524,6 +590,106 @@ mod tests {
     fn a_document_with_no_identifier_is_rejected() {
         assert!(parse_user(json!({})).resolve_user_name().is_err());
         assert!(parse_user(json!({"emails": []})).resolve_user_name().is_err());
+    }
+
+    #[test]
+    fn an_identity_assertion_is_absent_rather_than_an_error() {
+        // On an update a document that says nothing about identity means "unchanged", which is a
+        // perfectly ordinary sparse payload -- unlike a create, where the identity is required.
+        assert_eq!(parse_user(json!({"active": true})).resolve_user_name_assertion().unwrap(), None);
+        assert_eq!(parse_user(json!({"emails": []})).resolve_user_name_assertion().unwrap(), None);
+    }
+
+    #[test]
+    fn an_identity_assertion_reads_user_name_or_emails() {
+        // The same resolution as a create, so a client that provisions by email also updates by
+        // email. Both spellings are the one global account address.
+        assert_eq!(
+            parse_user(json!({"userName": "Alice@Example.test"})).resolve_user_name_assertion().unwrap(),
+            Some("alice@example.test".to_owned())
+        );
+        assert_eq!(
+            parse_user(json!({"emails": [{"value": "Alice@Example.test", "primary": true}]}))
+                .resolve_user_name_assertion()
+                .unwrap(),
+            Some("alice@example.test".to_owned())
+        );
+        // `userName` wins when both are present.
+        assert_eq!(
+            parse_user(json!({
+                "userName": "chosen@example.test",
+                "emails": [{"value": "other@example.test", "primary": true}],
+            }))
+            .resolve_user_name_assertion()
+            .unwrap(),
+            Some("chosen@example.test".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_malformed_identity_assertion_is_an_error_not_a_silent_pass() {
+        assert!(parse_user(json!({"userName": "not-an-email"})).resolve_user_name_assertion().is_err());
+        assert!(parse_user(json!({"emails": [{"value": "not-an-email"}]})).resolve_user_name_assertion().is_err());
+    }
+
+    // -- display name ---------------------------------------------------------------------------
+
+    #[test]
+    fn display_name_prefers_the_explicit_attribute() {
+        let request = parse_user(json!({
+            "userName": "alice@example.test",
+            "displayName": "  Alice Example  ",
+            "name": {"formatted": "Ignored"},
+        }));
+        assert_eq!(request.resolve_display_name().unwrap(), Some("Alice Example".to_owned()));
+    }
+
+    #[test]
+    fn display_name_falls_back_through_the_name_object() {
+        // The order Entra ID's default mapping makes useful.
+        let formatted = parse_user(json!({"name": {"formatted": "Alice Example", "givenName": "Alice"}}));
+        assert_eq!(formatted.resolve_display_name().unwrap(), Some("Alice Example".to_owned()));
+
+        let parts = parse_user(json!({"name": {"givenName": "Alice", "familyName": "Example"}}));
+        assert_eq!(parts.resolve_display_name().unwrap(), Some("Alice Example".to_owned()));
+
+        let one_part = parse_user(json!({"name": {"familyName": "Example"}}));
+        assert_eq!(one_part.resolve_display_name().unwrap(), Some("Example".to_owned()));
+
+        assert_eq!(parse_user(json!({"userName": "a@example.test"})).resolve_display_name().unwrap(), None);
+        assert_eq!(parse_user(json!({"displayName": "   "})).resolve_display_name().unwrap(), None);
+    }
+
+    #[test]
+    fn account_names_are_bounded_by_characters_not_bytes() {
+        // Vaultwarden's own registration and profile endpoints cap a name at 50; SCIM must not be
+        // able to write one those endpoints would refuse.
+        assert!(normalize_account_name(&"a".repeat(MAX_ACCOUNT_NAME_LEN)).is_ok());
+        assert!(normalize_account_name(&"a".repeat(MAX_ACCOUNT_NAME_LEN + 1)).is_err());
+
+        // 50 characters of three-byte text is 150 bytes and still a 50-character name.
+        let wide = "\u{4e2d}".repeat(MAX_ACCOUNT_NAME_LEN);
+        assert!(wide.len() > MAX_ACCOUNT_NAME_LEN, "would trip a byte-oriented check");
+        assert!(normalize_account_name(&wide).is_ok());
+        assert!(normalize_account_name(&"\u{4e2d}".repeat(MAX_ACCOUNT_NAME_LEN + 1)).is_err());
+
+        // The limit applies after trimming, not before.
+        assert!(normalize_account_name(&format!("  {}  ", "a".repeat(MAX_ACCOUNT_NAME_LEN))).is_ok());
+        assert!(normalize_account_name("   ").is_err());
+    }
+
+    #[test]
+    fn an_over_long_display_name_is_rejected_wherever_it_came_from() {
+        let long = "a".repeat(MAX_ACCOUNT_NAME_LEN + 1);
+
+        assert!(parse_user(json!({"displayName": long})).resolve_display_name().is_err());
+        assert!(parse_user(json!({"name": {"formatted": long}})).resolve_display_name().is_err());
+        assert!(
+            parse_user(json!({"name": {"givenName": "a".repeat(30), "familyName": "b".repeat(30)}}))
+                .resolve_display_name()
+                .is_err(),
+            "the joined name is what gets stored, so that is what is bounded"
+        );
     }
 
     #[test]
