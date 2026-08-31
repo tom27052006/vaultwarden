@@ -17,9 +17,7 @@ use crate::{
         Notify, UpdateType,
         core::{
             log_event,
-            organizations::{
-                ProvisionState, ensure_invitation_for, provision_org_member, try_restore_member, try_revoke_member,
-            },
+            organizations::{ProvisionState, provision_org_member, try_restore_member, try_revoke_member},
         },
     },
     db::{
@@ -63,14 +61,20 @@ async fn load_member(ctx: &ScimContext, id: &str, conn: &DbConn) -> ScimResult<(
 /// Owners, Admins and Managers are read-only through SCIM. This one rule is what makes "SCIM
 /// cannot create, demote, restore or remove a privileged member" true by construction: there is
 /// no code path that writes to such a membership at all.
+///
+/// A plain `403` with **no** `scimType`. This is Vaultwarden's provisioning policy refusing to
+/// hand a whole *resource* to an identity provider, not a schema statement about one *attribute*:
+/// there is no `active`, no `externalId` and no anything else that would be accepted on this
+/// member, so `mutability` -- which tells a client one attribute violated its declared
+/// changeability -- would describe the wrong fault and point at a fix that does not exist. The
+/// attribute-level faults (`userName`, `displayName`, `emails`) keep the RFC's `400` +
+/// `mutability`. See `docs/scim/design.md` section 7.
 fn ensure_manageable(view: &UserView) -> ScimResult<()> {
     if view.is_scim_manageable() {
         return Ok(());
     }
 
-    // A genuine mutability fault: the client asked to change a resource this server treats as
-    // read-only, as opposed to an authorization or policy refusal.
-    Err(ScimError::read_only(format!(
+    Err(ScimError::forbidden(format!(
         "User '{}' holds a privileged organization role and cannot be modified through SCIM. \
          Change the member's role to 'User' in the web vault first.",
         view.id
@@ -383,10 +387,49 @@ async fn post_user(
 // Update
 // ---------------------------------------------------------------------------------------------
 
+/// Everything about a membership that a SCIM `User` write can change.
+///
+/// Captured before the first mutation so a failure *after* the row has been saved can put the
+/// resource back exactly as the client found it, which is what RFC 7644 section 3.5.2 requires of
+/// a `PATCH`: "if any operation fails, the service provider SHALL return the resource to its
+/// original state".
+///
+/// An explicit snapshot rather than a handful of local variables, so that adding a SCIM-writable
+/// membership field is a compile-time prompt to include it here: the struct is built and restored
+/// field by field, and a new one that is not listed is visible in this file rather than absent
+/// from a rollback nobody re-reads.
+///
+/// Only the two SCIM-visible fields are held. Restoring the whole `Membership` would also undo
+/// anything another request changed in between, which is a wider promise than this makes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScimMembershipSnapshot {
+    /// The raw status column, not the derived `active` flag: `restore()` returns a membership to
+    /// its *previous* status (Invited, Accepted or Confirmed), so "was it active" is not enough
+    /// to put it back.
+    status: i32,
+    external_id: Option<String>,
+}
+
+impl ScimMembershipSnapshot {
+    fn capture(member: &Membership) -> Self {
+        Self {
+            status: member.status,
+            external_id: member.external_id.clone(),
+        }
+    }
+
+    /// Put the captured state back into `member`, in memory.
+    fn restore_into(&self, member: &mut Membership) {
+        member.status = self.status;
+        member.external_id.clone_from(&self.external_id);
+    }
+}
+
 /// Apply a validated change set to a membership.
 ///
 /// Both `PUT` and `PATCH` funnel through here, so the rules about what SCIM may change live in
-/// one place. Nothing is written until every check has passed.
+/// one place. Nothing is written until every check has passed, and anything that fails after the
+/// write is rolled back from [`ScimMembershipSnapshot`].
 async fn apply_user_changes(
     ctx: &ScimContext,
     token: &ScimToken,
@@ -404,7 +447,10 @@ async fn apply_user_changes(
         ensure_external_id_available(ctx, changes.external_id.to_stored().as_ref(), Some(&member.uuid), conn).await?;
     }
 
-    // Decide the whole outcome before writing anything.
+    // Decide the whole outcome before writing anything. The snapshot is taken here, after the
+    // last check that can refuse the request and before the first mutation, so it always holds
+    // the state the client would see if the request had never arrived.
+    let original = ScimMembershipSnapshot::capture(member);
     let mut dirty = false;
     let mut event: Option<EventType> = None;
     let mut restored = false;
@@ -453,21 +499,24 @@ async fn apply_user_changes(
     // contradicted the state the identity provider asked for. Reactivation is the moment it
     // becomes wanted, so an account that still cannot sign in gets one now.
     //
-    // If that fails, the reactivation fails with it. `active: true` on an unregistered account is
+    // If that fails, the whole request fails with it. `active: true` on an unregistered account is
     // a promise that the person can now get in; leaving the membership active while the only way
     // in was never created would tell the identity provider the change succeeded when the user
     // has no usable path to the organization, and nothing downstream would ever notice.
     //
-    // The rollback is honest about what it can undo. Re-revoking the membership is a single row
-    // write and is reliable. An invitation *email* that was already handed to the MTA before the
-    // call reported failure cannot be recalled -- so the person may receive a mail for a
-    // membership that is revoked again, which is the same harmless state as any revoked invitee.
+    // This is the one side effect that can fail *after* the row has been saved, so it is the one
+    // place a rollback is needed. Every SCIM-visible field this request may have written is put
+    // back from the snapshot -- not just the status. A `PATCH` that set `externalId` and `active`
+    // in one document is a single operation as far as RFC 7644 section 3.5.2 is concerned: an
+    // earlier revision kept the new `externalId` on the grounds that it was "correct anyway",
+    // which left the resource in a state the client never asked for and never saw reported.
     //
-    // An `externalId` set by the same request is deliberately *not* rolled back. It is directory
-    // metadata that is correct whether or not the invitation worked, undoing it would discard a
-    // correct value, and the identity provider re-sends it on the retry regardless.
-    // See docs/scim/design.md section 7.
-    if restored && let Err(e) = ensure_invitation_for(member, conn).await {
+    // The rollback is honest about what it cannot undo. Restoring the membership is a single row
+    // write on a row already loaded and is reliable. An invitation *email* that was already handed
+    // to the MTA before the call reported failure cannot be recalled -- so the person may receive
+    // a mail for a membership that is revoked again, which is the same harmless state as any
+    // revoked invitee. See docs/scim/design.md section 7.
+    if restored && let Err(e) = super::settings::ensure_invitation(member, conn).await {
         warn!(target: "scim", "Could not issue an invitation while reactivating {}: {e:?}", member.uuid);
 
         // Put the membership back where it was, so the identity provider's next attempt starts
@@ -475,16 +524,19 @@ async fn apply_user_changes(
         // idempotent -- it creates an `Invitation` row only when none exists -- so a retry that
         // succeeds does not double-provision, and a membership that is already active never
         // reaches this path at all.
-        member.revoke();
+        original.restore_into(member);
         if let Err(rollback) = member.save(conn).await {
             error!(
                 target: "scim",
-                "Could not roll back the reactivation of {} after the invitation failed: {rollback:?}. \
-                 The membership is active but its account may have no way to accept the invitation.",
+                "Could not roll back the SCIM changes to {} after the invitation failed: {rollback:?}. \
+                 The membership may be left active with an updated externalId while its account has \
+                 no way to accept the invitation.",
                 member.uuid
             );
         }
 
+        // No event is logged for any of it: nothing that was asked for survived, so an
+        // `OrganizationUserRestored` entry would record a change that did not happen.
         return Err(ScimError::internal("Issuing an invitation for a reactivated SCIM member", &e));
     }
 
@@ -557,7 +609,12 @@ async fn patch_user(
 
     // The whole document is planned and validated first; a single bad operation fails the request
     // without any of it having been applied.
-    let changes = plan_user_patch(&request)?;
+    //
+    // The stored address goes in because a value path (`emails[type eq "work"].value`) selects
+    // against the resource as it is now, and the one virtual `emails` element this server renders
+    // carries that address. Planning still touches nothing: it only decides whether the selector
+    // matched.
+    let changes = plan_user_patch(&request, &user.email.to_lowercase())?;
 
     apply_user_changes(&ctx, &token, &mut member, &user, &changes, &conn).await?;
 
@@ -641,11 +698,14 @@ mod tests {
     }
 
     #[test]
-    fn privileged_members_are_refused_with_403() {
+    fn privileged_members_are_refused_with_a_plain_403() {
+        // A provisioning-policy refusal of a whole resource, not an attribute mutability fault:
+        // there is no value for any attribute that would make the request work, so labelling it
+        // `mutability` would describe a problem the client could fix by sending something else.
         for role in [MembershipType::Owner, MembershipType::Admin, MembershipType::Manager] {
             let err = ensure_manageable(&view(true, role, "a@example.test")).unwrap_err();
             assert_eq!(err.status, rocket::http::Status::Forbidden);
-            assert_eq!(err.scim_type, Some(super::super::error::ScimType::Mutability));
+            assert_eq!(err.scim_type, None, "a resource-level refusal carries no scimType");
         }
     }
 

@@ -12,7 +12,7 @@ use std::{fmt, io::Cursor};
 
 use rocket::{
     Request,
-    http::Status,
+    http::{Header, Status},
     response::{self, Responder, Response},
 };
 use serde_json::Value;
@@ -20,6 +20,9 @@ use serde_json::Value;
 use super::SCIM_CONTENT_TYPE;
 
 pub const ERROR_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:Error";
+
+/// The challenge every SCIM `401` carries, identical whatever the cause.
+pub const WWW_AUTHENTICATE: &str = "Bearer";
 
 /// The `scimType` values defined by RFC 7644 section 3.12.
 ///
@@ -108,6 +111,9 @@ impl ScimError {
 
     /// The single, uniform authentication failure. Callers must never add detail that would let a
     /// client tell "no such organization" apart from "no such key" apart from "wrong secret".
+    ///
+    /// The response carries [`WWW_AUTHENTICATE`], added by the responder for every `401` this
+    /// module produces.
     pub fn unauthorized() -> Self {
         Self::new(Status::Unauthorized, None, "Authorization failed.")
     }
@@ -115,19 +121,16 @@ impl ScimError {
     /// A plain authorization refusal: the request was understood, and the server will not do it.
     ///
     /// Deliberately carries **no** `scimType`. RFC 7644 section 3.12 defines `scimType` values for
-    /// specific protocol faults, and none of them describes "an operator switched this off" or
-    /// "an organization policy says no". Labelling those `mutability` would tell a client the
-    /// request was structurally wrong when it was perfectly well formed.
+    /// specific protocol faults, and none of them describes "an operator switched this off", "an
+    /// organization policy says no", or "this server's provisioning policy does not hand that
+    /// resource to SCIM at all". Labelling those `mutability` would tell a client the request was
+    /// structurally wrong when it was perfectly well formed, and would conflate a policy decision
+    /// about a *resource* with a schema statement about one *attribute*.
+    ///
+    /// The attribute-level counterpart is [`Self::immutable`], which is a genuine `mutability`
+    /// fault and is a `400`.
     pub fn forbidden(detail: impl Into<String>) -> Self {
         Self::new(Status::Forbidden, None, detail)
-    }
-
-    /// The client tried to modify a resource this server treats as read-only.
-    ///
-    /// This is a genuine `mutability` fault: the request asked to change something the schema and
-    /// this implementation do not allow to be changed.
-    pub fn read_only(detail: impl Into<String>) -> Self {
-        Self::new(Status::Forbidden, Some(ScimType::Mutability), detail)
     }
 
     pub fn not_found(detail: impl Into<String>) -> Self {
@@ -184,11 +187,20 @@ impl fmt::Display for ScimError {
 impl Responder<'_, 'static> for ScimError {
     fn respond_to(self, _: &Request<'_>) -> response::Result<'static> {
         let body = self.to_json().to_string();
-        Response::build()
-            .status(self.status)
-            .header(SCIM_CONTENT_TYPE.clone())
-            .sized_body(body.len(), Cursor::new(body))
-            .ok()
+        let mut builder = Response::build();
+        builder.status(self.status).header(SCIM_CONTENT_TYPE.clone());
+
+        // RFC 7235 section 3.1 requires a `WWW-Authenticate` challenge on a 401, and
+        // `/ServiceProviderConfig` already advertises `oauthbearertoken` pointing at RFC 6750.
+        // The challenge is a bare `Bearer`: no `realm`, no `error`, no `error_description`. Each
+        // of those would vary with the reason a request failed, and that is precisely what the
+        // uniform 401 exists to prevent -- a `realm` naming the organization would turn the header
+        // into the tenant-existence oracle the body carefully is not.
+        if self.status == Status::Unauthorized {
+            builder.header(Header::new("WWW-Authenticate", WWW_AUTHENTICATE));
+        }
+
+        builder.sized_body(body.len(), Cursor::new(body)).ok()
     }
 }
 
@@ -257,11 +269,14 @@ mod tests {
     }
 
     #[test]
-    fn writing_a_read_only_resource_is_a_mutability_fault() {
-        let body = ScimError::read_only("That member is read-only through SCIM.").to_json();
+    fn refusing_a_resource_is_not_an_attribute_mutability_fault() {
+        // A membership this server's provisioning policy does not hand to SCIM at all is refused
+        // as a resource, not as one attribute that violates its schema. `mutability` would tell a
+        // client the fix is to send a different attribute value; there is no value that works.
+        let body = ScimError::forbidden("That member is managed outside SCIM.").to_json();
 
         assert_eq!(body["status"], json!("403"));
-        assert_eq!(body["scimType"], json!("mutability"));
+        assert!(body.get("scimType").is_none(), "a resource-level refusal must not be labelled: {body}");
     }
 
     #[test]

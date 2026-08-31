@@ -19,7 +19,7 @@ use crate::db::models::MembershipId;
 use super::{
     GROUP_SCHEMA, PATCH_OP_SCHEMA, QualifiedAttr, USER_SCHEMA,
     error::{ScimError, ScimResult, ScimType},
-    filter::{CompValue, CompareOp, Filter, GROUP_ATTRS},
+    filter::{CompValue, CompareOp, Filter, FilterResource, FilterValue, GROUP_ATTRS, USER_ATTRS},
     is_schema_urn, qualify,
     resource::{MAX_MEMBERS_PER_REQUEST, normalize_display_name, normalize_external_id, normalize_user_name},
 };
@@ -332,13 +332,19 @@ const USER_IGNORED_ATTRS: &[&str] = &[
     "manager",
 ];
 
-pub fn plan_user_patch(request: &PatchRequest) -> ScimResult<UserChanges> {
+/// Plan a `PATCH /Users/<id>` document.
+///
+/// `current_email` is the account email the resource currently renders, already lower-cased. It is
+/// needed because a value path selects against the resource *as it is*: `emails[value eq
+/// "..."].value` can only be answered by looking at the element the server actually publishes.
+/// Nothing is written here; the current state is read, never changed.
+pub fn plan_user_patch(request: &PatchRequest, current_email: &str) -> ScimResult<UserChanges> {
     validate_patch_envelope(request)?;
 
     let mut changes = UserChanges::default();
     for operation in &request.operations {
         let op = PatchOp::parse(&operation.op)?;
-        apply_user_operation(&mut changes, op, operation)?;
+        apply_user_operation(&mut changes, op, operation, current_email)?;
     }
 
     // `userName` and `emails[].value` are two spellings of the same account email, so a document
@@ -352,7 +358,12 @@ pub fn plan_user_patch(request: &PatchRequest) -> ScimResult<UserChanges> {
     Ok(changes)
 }
 
-fn apply_user_operation(changes: &mut UserChanges, op: PatchOp, operation: &PatchOperation) -> ScimResult<()> {
+fn apply_user_operation(
+    changes: &mut UserChanges,
+    op: PatchOp,
+    operation: &PatchOperation,
+    current_email: &str,
+) -> ScimResult<()> {
     let Some(raw_path) = operation.path.as_deref().map(str::trim).filter(|p| !p.is_empty()) else {
         // A pathless operation carries an object whose keys are the attributes to change.
         if op == PatchOp::Remove {
@@ -374,20 +385,20 @@ fn apply_user_operation(changes: &mut UserChanges, op: PatchOp, operation: &Patc
                 {
                     for (inner_key, inner_value) in inner {
                         let path = PatchPath::parse(inner_key, USER_SCHEMA)?;
-                        apply_user_attribute(changes, op, &path, Some(inner_value))?;
+                        apply_user_attribute(changes, op, &path, Some(inner_value), current_email)?;
                     }
                 }
                 continue;
             }
 
             let path = PatchPath::parse(key, USER_SCHEMA)?;
-            apply_user_attribute(changes, op, &path, Some(value))?;
+            apply_user_attribute(changes, op, &path, Some(value), current_email)?;
         }
         return Ok(());
     };
 
     let path = PatchPath::parse(raw_path, USER_SCHEMA)?;
-    apply_user_attribute(changes, op, &path, operation.value.as_ref())
+    apply_user_attribute(changes, op, &path, operation.value.as_ref(), current_email)
 }
 
 fn apply_user_attribute(
@@ -395,6 +406,7 @@ fn apply_user_attribute(
     op: PatchOp,
     path: &PatchPath,
     value: Option<&Value>,
+    current_email: &str,
 ) -> ScimResult<()> {
     // Anything outside the core User schema is an extension Vaultwarden does not store. Entra ID
     // maps `urn:...:extension:enterprise:2.0:User:department` and friends by default, so failing
@@ -409,6 +421,19 @@ fn apply_user_attribute(
     if path.filter.is_some() && path.attr != "emails" {
         return Err(ScimError::invalid_path(format!(
             "Value filters are not supported on '{}' for User resources.",
+            path.attr
+        )));
+    }
+
+    // `active.anything` is not the core `active`: these are simple attributes with no
+    // sub-attributes at all, so a path that names one is addressing something this schema does not
+    // define. Ignoring the sub-attribute and writing the parent would let `active.whatever`
+    // deprovision somebody.
+    if let Some(sub) = path.sub.as_deref()
+        && matches!(path.attr.as_str(), "active" | "externalid" | "username" | "displayname" | "id")
+    {
+        return Err(ScimError::invalid_path(format!(
+            "'{}' is a simple attribute and has no sub-attribute '{sub}'.",
             path.attr
         )));
     }
@@ -481,28 +506,178 @@ fn apply_user_attribute(
 
         // `emails` is derived from the account email, which SCIM does not rename. Accept a write
         // that matches, so that an identity provider sending the full resource does not fail.
-        "emails" => {
-            if op == PatchOp::Remove {
-                return Err(ScimError::immutable("'emails' is derived from the account and cannot be removed."));
-            }
-            let asserted = match value {
-                Some(Value::String(s)) => Some(s.as_str()),
-                Some(Value::Array(entries)) => entries.iter().find_map(|e| e.get("value").and_then(Value::as_str)),
-                Some(Value::Object(map)) => map.get("value").and_then(Value::as_str),
-                _ => None,
-            };
-            if let Some(asserted) = asserted {
-                // Recorded separately from `userName`; `plan_user_patch` folds the two together
-                // once the whole document has been read, so order cannot change the answer.
-                changes.email_assertion = Some(normalize_user_name(asserted)?);
-            }
-            Ok(())
-        }
+        "emails" => apply_email_operation(changes, op, path, value, current_email),
 
         attr if USER_IGNORED_ATTRS.contains(&attr) => Ok(()),
 
         other => Err(ScimError::invalid_path(format!("Unsupported PATCH path '{other}' for User resources."))),
     }
+}
+
+/// What an `emails` PATCH path addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmailTarget {
+    /// The address itself: the only sub-attribute that carries an assertion.
+    Value,
+    /// `type`, which this server always derives as `"work"`.
+    Type,
+    /// `primary`, which this server always derives as `true`.
+    Primary,
+}
+
+/// Resolve the sub-attribute of an `emails` path.
+///
+/// A path with no sub-attribute addresses the whole element, whose only meaningful content here is
+/// the address, so it is treated as `value`. Anything this server does not render is an
+/// `invalidPath` -- including `display`, which the User schema does not publish.
+fn email_target(sub: Option<&str>) -> ScimResult<EmailTarget> {
+    match sub {
+        None | Some("value") => Ok(EmailTarget::Value),
+        Some("type") => Ok(EmailTarget::Type),
+        Some("primary") => Ok(EmailTarget::Primary),
+        Some(unknown) => {
+            Err(ScimError::invalid_path(format!("'emails' has no sub-attribute '{unknown}' on this server.")))
+        }
+    }
+}
+
+/// Check a write to a sub-attribute this server derives.
+///
+/// `type` and `primary` are published `readOnly`, and they follow the same three-outcome rule the
+/// other unwritable attributes in this module follow: re-asserting the value the server already
+/// renders is the no-op an identity provider sends on every sync, and anything else is a
+/// `mutability` fault.
+///
+/// Accepting the matching value matters for interoperability -- a client echoing the whole element
+/// back is not asking for a change -- and refusing a *different* one is what stops
+/// `emails[...].type` from carrying a smuggled address change, which is what treating every
+/// `emails` path as the same assertion amounted to.
+fn assert_derived_email_part(target: EmailTarget, value: Option<&Value>) -> ScimResult<()> {
+    let (name, derived, matches) = match target {
+        EmailTarget::Type => {
+            ("type", "\"work\"", value.and_then(as_string).is_some_and(|t| t.eq_ignore_ascii_case("work")))
+        }
+        EmailTarget::Primary => ("primary", "true", value.and_then(as_bool) == Some(true)),
+        // The caller never routes `value` here; it carries an assertion rather than a derived part.
+        EmailTarget::Value => return Ok(()),
+    };
+
+    if matches {
+        return Ok(());
+    }
+
+    Err(ScimError::immutable(format!(
+        "'emails.{name}' is derived by this server and is always {derived}; it cannot be changed through SCIM."
+    )))
+}
+
+/// Does an `emails[<selector>]` value path select the one element this server renders?
+///
+/// The selector is untrusted text, so it goes through the same validated filter parser the query
+/// filters use rather than any ad-hoc string handling, and it is evaluated against the element as
+/// it is actually published: `{"value": <account email>, "type": "work", "primary": true}`.
+/// An arbitrary selector therefore cannot stand in for the real one -- `emails[type eq "home"]`
+/// matches nothing, and `emails[nonsense eq "x"]` is not even a filterable attribute.
+///
+/// The parse result has to be a value path *on `emails`* and nothing else. `PatchPath` splits on
+/// the first `[` and the last `]`, so the selector text may contain brackets of its own; without
+/// this check a path like `emails[type eq "home"] or emails[type eq "work"].value` would parse
+/// into a disjunction and select the element through a clause the client never targeted. RFC 7644's
+/// `valuePath` grammar is one `attrPath[valFilter]`, and this holds the parser to it.
+fn email_value_path_matches(filter_text: &str, current_email: &str) -> ScimResult<bool> {
+    let parsed = Filter::parse(&format!("emails[{filter_text}]"), USER_ATTRS, USER_SCHEMA)
+        .map_err(|e| ScimError::invalid_path(format!("Unsupported 'emails' value selection: {}", e.detail)))?;
+
+    let selects_emails = matches!(
+        &parsed,
+        Filter::ValuePath {
+            path,
+            ..
+        } if path.base == "emails"
+    );
+    if !selects_emails {
+        return Err(ScimError::invalid_path(
+            "An 'emails' value selection must be a single 'emails[<filter>]' expression.",
+        ));
+    }
+
+    let mut element = FilterResource::new();
+    element
+        .set("emails.value", Some(FilterValue::str(current_email)))
+        .set("emails.type", Some(FilterValue::str("work")))
+        .set("emails.primary", Some(FilterValue::Bool(true)));
+
+    let mut resource = FilterResource::new();
+    resource.push_element("emails", element);
+
+    Ok(parsed.matches(&resource, USER_ATTRS))
+}
+
+/// Pull the asserted address out of a PATCH `value`.
+///
+/// Accepts the shapes seen in the wild: a bare string (what `emails[...].value` carries), a single
+/// `{"value": ...}` object, and an array of them.
+fn asserted_email(value: Option<&Value>) -> Option<&str> {
+    match value {
+        Some(Value::String(s)) => Some(s.as_str()),
+        Some(Value::Array(entries)) => entries.iter().find_map(|e| e.get("value").and_then(Value::as_str)),
+        Some(Value::Object(map)) => map.get("value").and_then(Value::as_str),
+        _ => None,
+    }
+}
+
+/// Handle every `emails` path shape: bare, `emails.value`, and `emails[<selector>].value`.
+///
+/// Microsoft Entra ID documents the value-path form, so it has to work -- but it has to work
+/// *properly*: the selector is evaluated, and the sub-attribute decides what the operation means.
+/// Treating every path whose base is `emails` as the same assertion, which an earlier revision
+/// did, meant `emails[type eq "home"].primary` and `emails[type eq "work"].value` were the same
+/// request.
+fn apply_email_operation(
+    changes: &mut UserChanges,
+    op: PatchOp,
+    path: &PatchPath,
+    value: Option<&Value>,
+    current_email: &str,
+) -> ScimResult<()> {
+    // The target is resolved before anything else is decided about it, because "there is nothing
+    // there" and "what is there cannot be changed" are different answers and RFC 7644 section
+    // 3.5.2 gives the first one its own error code.
+    if let Some(filter_text) = &path.filter
+        && !email_value_path_matches(filter_text, current_email)?
+    {
+        // RFC 7644 sections 3.5.2.2 and 3.5.2.3: a value selection filter that matches no element
+        // is `400` with `scimType: noTarget`. `add` gets the same answer: this server publishes
+        // exactly one, server-derived `emails` element, so there is no element to create either.
+        return Err(ScimError::no_target(format!(
+            "The 'emails' value selection '[{filter_text}]' matched no value on this resource."
+        )));
+    }
+
+    let target = email_target(path.sub.as_deref())?;
+
+    if op == PatchOp::Remove {
+        return Err(ScimError::immutable("'emails' is derived from the account and cannot be removed."));
+    }
+
+    if target != EmailTarget::Value {
+        return assert_derived_email_part(target, value);
+    }
+
+    // An explicit `.value` path names exactly one address. A value that carries none is a client
+    // error rather than something to skip: reporting success for a write that did nothing is how a
+    // broken mapping goes unnoticed. A bare `emails` path stays lenient, because a client sending
+    // the whole element without a `value` has not asserted an identity at all.
+    if path.sub.is_some() && asserted_email(value).is_none() {
+        return Err(ScimError::invalid_value("'emails.value' must be an email address."));
+    }
+
+    if let Some(asserted) = asserted_email(value) {
+        // Recorded separately from `userName`; `plan_user_patch` folds the two together once the
+        // whole document has been read, so order cannot change the answer.
+        changes.email_assertion = Some(normalize_user_name(asserted)?);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -810,8 +985,16 @@ fn validate_patch_envelope(request: &PatchRequest) -> ScimResult<()> {
 mod tests {
     use super::*;
 
+    /// The account email the resource under test currently renders, for the value-path selector.
+    const CURRENT_EMAIL: &str = "alice@example.test";
+
     fn patch(body: Value) -> PatchRequest {
         serde_json::from_value(body).expect("should deserialize")
+    }
+
+    /// Plan a User PATCH against a resource whose one `emails` element holds [`CURRENT_EMAIL`].
+    fn plan_user(request: &PatchRequest) -> ScimResult<UserChanges> {
+        plan_user_patch(request, CURRENT_EMAIL)
     }
 
     fn ids(raw: &[&str]) -> Vec<MembershipId> {
@@ -841,8 +1024,8 @@ mod tests {
         let upper = patch(json!({"Operations": [{"op": "replace", "path": "active", "value": false}]}));
         let lower = patch(json!({"operations": [{"op": "replace", "path": "active", "value": false}]}));
 
-        assert_eq!(plan_user_patch(&upper).unwrap().active, Some(false));
-        assert_eq!(plan_user_patch(&lower).unwrap().active, Some(false));
+        assert_eq!(plan_user(&upper).unwrap().active, Some(false));
+        assert_eq!(plan_user(&lower).unwrap().active, Some(false));
     }
 
     // -- path parsing --------------------------------------------------------------------------
@@ -903,7 +1086,7 @@ mod tests {
             "Operations": [{"op": "Replace", "path": "active", "value": false}],
         }));
 
-        assert_eq!(plan_user_patch(&request).unwrap().active, Some(false));
+        assert_eq!(plan_user(&request).unwrap().active, Some(false));
     }
 
     #[test]
@@ -912,11 +1095,11 @@ mod tests {
         // deprovisioning for a purely cosmetic reason.
         for raw in ["False", "false", "FALSE"] {
             let request = patch(json!({"Operations": [{"op": "Replace", "path": "active", "value": raw}]}));
-            assert_eq!(plan_user_patch(&request).unwrap().active, Some(false), "{raw}");
+            assert_eq!(plan_user(&request).unwrap().active, Some(false), "{raw}");
         }
         for raw in ["True", "true"] {
             let request = patch(json!({"Operations": [{"op": "Replace", "path": "active", "value": raw}]}));
-            assert_eq!(plan_user_patch(&request).unwrap().active, Some(true), "{raw}");
+            assert_eq!(plan_user(&request).unwrap().active, Some(true), "{raw}");
         }
     }
 
@@ -926,7 +1109,7 @@ mod tests {
             "Operations": [{"op": "Replace", "value": {"active": false, "externalId": "ext-9"}}],
         }));
 
-        let changes = plan_user_patch(&request).unwrap();
+        let changes = plan_user(&request).unwrap();
         assert_eq!(changes.active, Some(false));
         assert_eq!(changes.external_id, FieldChange::Set("ext-9".to_owned()));
     }
@@ -934,13 +1117,13 @@ mod tests {
     #[test]
     fn external_id_can_be_set_and_cleared() {
         let set = patch(json!({"Operations": [{"op": "add", "path": "externalId", "value": "ext-1"}]}));
-        assert_eq!(plan_user_patch(&set).unwrap().external_id, FieldChange::Set("ext-1".to_owned()));
+        assert_eq!(plan_user(&set).unwrap().external_id, FieldChange::Set("ext-1".to_owned()));
 
         let cleared = patch(json!({"Operations": [{"op": "remove", "path": "externalId"}]}));
-        assert_eq!(plan_user_patch(&cleared).unwrap().external_id, FieldChange::Clear);
+        assert_eq!(plan_user(&cleared).unwrap().external_id, FieldChange::Clear);
 
         let blanked = patch(json!({"Operations": [{"op": "replace", "path": "externalId", "value": "  "}]}));
-        assert_eq!(plan_user_patch(&blanked).unwrap().external_id, FieldChange::Clear);
+        assert_eq!(plan_user(&blanked).unwrap().external_id, FieldChange::Clear);
     }
 
     #[test]
@@ -948,7 +1131,7 @@ mod tests {
         // The planner records what was asserted; the caller compares it to the stored account and
         // rejects a genuine change. This keeps the "no account rename via SCIM" rule in one place.
         let request = patch(json!({"Operations": [{"op": "replace", "path": "userName", "value": "A@Example.test"}]}));
-        let changes = plan_user_patch(&request).unwrap();
+        let changes = plan_user(&request).unwrap();
 
         assert_eq!(changes.user_name_assertion.as_deref(), Some("a@example.test"));
         assert_eq!(changes.active, None, "asserting a userName must not imply anything else");
@@ -957,7 +1140,7 @@ mod tests {
     #[test]
     fn a_malformed_user_name_fails_planning_before_anything_is_written() {
         let request = patch(json!({"Operations": [{"op": "replace", "path": "userName", "value": "not-an-email"}]}));
-        assert!(plan_user_patch(&request).is_err());
+        assert!(plan_user(&request).is_err());
     }
 
     #[test]
@@ -970,7 +1153,7 @@ mod tests {
             ],
         }));
 
-        let changes = plan_user_patch(&request).unwrap();
+        let changes = plan_user(&request).unwrap();
         assert_eq!(changes.active, Some(true));
         assert!(changes.external_id.is_unchanged());
         assert_eq!(changes.user_name_assertion, None);
@@ -985,7 +1168,7 @@ mod tests {
         // the stored account. Dropping it here -- what this used to do -- is what made the
         // `immutable` in the published schema untrue.
         let request = patch(json!({"Operations": [{"op": "replace", "path": "displayName", "value": "  New Name  "}]}));
-        let changes = plan_user_patch(&request).unwrap();
+        let changes = plan_user(&request).unwrap();
 
         assert_eq!(changes.display_name_assertion, FieldChange::Set("New Name".to_owned()));
         assert_eq!(changes.active, None, "asserting a displayName must not imply anything else");
@@ -995,7 +1178,7 @@ mod tests {
     fn a_pathless_display_name_is_captured_too() {
         // The shape Entra ID sends.
         let request = patch(json!({"Operations": [{"op": "Replace", "value": {"displayName": "New Name"}}]}));
-        let changes = plan_user_patch(&request).unwrap();
+        let changes = plan_user(&request).unwrap();
 
         assert_eq!(changes.display_name_assertion, FieldChange::Set("New Name".to_owned()));
     }
@@ -1005,7 +1188,7 @@ mod tests {
         // `remove` is distinguishable from "not mentioned" so the caller can refuse it: both leave
         // the stored name alone, but only one of them is an error.
         let request = patch(json!({"Operations": [{"op": "remove", "path": "displayName"}]}));
-        let changes = plan_user_patch(&request).unwrap();
+        let changes = plan_user(&request).unwrap();
 
         assert_eq!(changes.display_name_assertion, FieldChange::Clear);
     }
@@ -1018,13 +1201,13 @@ mod tests {
         let long = "a".repeat(super::super::resource::MAX_ACCOUNT_NAME_LEN + 1);
         let request = patch(json!({"Operations": [{"op": "replace", "path": "displayName", "value": &long}]}));
 
-        assert_eq!(plan_user_patch(&request).unwrap().display_name_assertion, FieldChange::Set(long));
+        assert_eq!(plan_user(&request).unwrap().display_name_assertion, FieldChange::Set(long));
     }
 
     #[test]
     fn a_non_string_display_name_is_rejected() {
         let request = patch(json!({"Operations": [{"op": "replace", "path": "displayName", "value": 42}]}));
-        assert_eq!(plan_user_patch(&request).unwrap_err().scim_type, Some(ScimType::InvalidValue));
+        assert_eq!(plan_user(&request).unwrap_err().scim_type, Some(ScimType::InvalidValue));
     }
 
     #[test]
@@ -1034,11 +1217,11 @@ mod tests {
         // an `invalidValue` about the JSON.
         for value in [json!(null), json!("")] {
             let request = patch(json!({"Operations": [{"op": "replace", "path": "displayName", "value": value}]}));
-            assert_eq!(plan_user_patch(&request).unwrap().display_name_assertion, FieldChange::Clear, "{value}");
+            assert_eq!(plan_user(&request).unwrap().display_name_assertion, FieldChange::Clear, "{value}");
         }
 
         let pathless = patch(json!({"Operations": [{"op": "Replace", "value": {"displayName": null}}]}));
-        assert_eq!(plan_user_patch(&pathless).unwrap().display_name_assertion, FieldChange::Clear);
+        assert_eq!(plan_user(&pathless).unwrap().display_name_assertion, FieldChange::Clear);
     }
 
     // -- userName and emails are one identity -------------------------------------------------------
@@ -1058,7 +1241,7 @@ mod tests {
         ]}));
 
         for request in [user_name_first, emails_first] {
-            let changes = plan_user_patch(&request).unwrap();
+            let changes = plan_user(&request).unwrap();
             assert_eq!(changes.user_name_assertion.as_deref(), Some("upn@example.test"));
         }
     }
@@ -1069,7 +1252,7 @@ mod tests {
         let request = patch(
             json!({"Operations": [{"op": "replace", "path": "emails", "value": [{"value": "Mail@Example.test"}]}]}),
         );
-        let changes = plan_user_patch(&request).unwrap();
+        let changes = plan_user(&request).unwrap();
 
         assert_eq!(changes.user_name_assertion.as_deref(), Some("mail@example.test"));
     }
@@ -1081,7 +1264,7 @@ mod tests {
         let request = patch(
             json!({"Operations": [{"op": "replace", "path": "urn:example:Custom:displayName", "value": "Ignored"}]}),
         );
-        let changes = plan_user_patch(&request).unwrap();
+        let changes = plan_user(&request).unwrap();
 
         assert!(changes.display_name_assertion.is_unchanged());
     }
@@ -1093,7 +1276,7 @@ mod tests {
             "path": "urn:ietf:params:scim:schemas:core:2.0:User:displayName",
             "value": "New Name",
         }]}));
-        let changes = plan_user_patch(&request).unwrap();
+        let changes = plan_user(&request).unwrap();
 
         assert_eq!(changes.display_name_assertion, FieldChange::Set("New Name".to_owned()));
     }
@@ -1103,7 +1286,7 @@ mod tests {
         // Silently accepting these would make a broken attribute mapping look like it works.
         for path in ["members", "id", "meta.location", "somethingMadeUp"] {
             let request = patch(json!({"Operations": [{"op": "replace", "path": path, "value": "x"}]}));
-            let err = plan_user_patch(&request).unwrap_err();
+            let err = plan_user(&request).unwrap_err();
             assert_eq!(err.scim_type, Some(ScimType::InvalidPath), "path {path} should be rejected");
         }
     }
@@ -1111,23 +1294,23 @@ mod tests {
     #[test]
     fn remove_without_a_path_is_a_no_target_error() {
         let request = patch(json!({"Operations": [{"op": "remove"}]}));
-        let err = plan_user_patch(&request).unwrap_err();
+        let err = plan_user(&request).unwrap_err();
         assert_eq!(err.scim_type, Some(ScimType::NoTarget));
     }
 
     #[test]
     fn a_bad_value_type_is_rejected() {
         let request = patch(json!({"Operations": [{"op": "replace", "path": "active", "value": 42}]}));
-        assert_eq!(plan_user_patch(&request).unwrap_err().scim_type, Some(ScimType::InvalidValue));
+        assert_eq!(plan_user(&request).unwrap_err().scim_type, Some(ScimType::InvalidValue));
 
         let request = patch(json!({"Operations": [{"op": "replace", "path": "externalId", "value": 42}]}));
-        assert_eq!(plan_user_patch(&request).unwrap_err().scim_type, Some(ScimType::InvalidValue));
+        assert_eq!(plan_user(&request).unwrap_err().scim_type, Some(ScimType::InvalidValue));
     }
 
     #[test]
     fn an_empty_operation_list_is_rejected() {
         let request = patch(json!({"Operations": []}));
-        assert!(plan_user_patch(&request).is_err());
+        assert!(plan_user(&request).is_err());
     }
 
     #[test]
@@ -1136,7 +1319,7 @@ mod tests {
             (0..=MAX_PATCH_OPERATIONS).map(|_| json!({"op": "replace", "path": "active", "value": true})).collect();
         let request = patch(json!({"Operations": ops}));
 
-        assert_eq!(plan_user_patch(&request).unwrap_err().scim_type, Some(ScimType::TooMany));
+        assert_eq!(plan_user(&request).unwrap_err().scim_type, Some(ScimType::TooMany));
     }
 
     #[test]
@@ -1150,7 +1333,7 @@ mod tests {
             ],
         }));
 
-        assert!(plan_user_patch(&request).is_err());
+        assert!(plan_user(&request).is_err());
     }
 
     #[test]
@@ -1162,7 +1345,7 @@ mod tests {
             ],
         }));
 
-        assert_eq!(plan_user_patch(&request).unwrap().active, Some(true));
+        assert_eq!(plan_user(&request).unwrap().active, Some(true));
     }
 
     // -- group patches -------------------------------------------------------------------------
@@ -1453,7 +1636,7 @@ mod tests {
             ],
         }));
 
-        let changes = plan_user_patch(&request).unwrap();
+        let changes = plan_user(&request).unwrap();
         assert_eq!(changes.active, Some(true), "only the core attribute had an effect");
     }
 
@@ -1483,7 +1666,7 @@ mod tests {
             }],
         }));
 
-        let changes = plan_user_patch(&request).unwrap();
+        let changes = plan_user(&request).unwrap();
         assert_eq!(changes.active, Some(false), "the core attribute alongside it still applies");
     }
 
@@ -1496,7 +1679,7 @@ mod tests {
             }],
         }));
 
-        assert_eq!(plan_user_patch(&request).unwrap().active, Some(false));
+        assert_eq!(plan_user(&request).unwrap().active, Some(false));
     }
 
     #[test]
@@ -1520,5 +1703,308 @@ mod tests {
         let request = patch(json!({"Operations": [{"op": "Remove", "path": r#"members[value eq "zzz"]"#}]}));
         let changes = plan_group_patch(&request).expect("planning a remove of a non-member must succeed");
         assert_eq!(changes.member_ops, vec![MemberOp::Remove(ids(&["zzz"]))]);
+    }
+
+    // -- emails value paths ------------------------------------------------------------------------
+    //
+    // The selector is parsed by the same validated filter machinery the query filters use and then
+    // evaluated against the one element this server renders:
+    // `{"value": <account email>, "type": "work", "primary": true}`. The sub-attribute decides what
+    // the operation means. An earlier revision parsed the selector and then ignored it, so every
+    // path whose base was `emails` was the same assertion.
+
+    fn email_patch(op: &str, path: &str, value: Value) -> PatchRequest {
+        let mut operation = serde_json::Map::new();
+        operation.insert("op".to_owned(), json!(op));
+        operation.insert("path".to_owned(), json!(path));
+        operation.insert("value".to_owned(), value);
+        patch(json!({"Operations": [operation]}))
+    }
+
+    #[test]
+    fn the_selector_microsoft_documents_selects_the_rendered_element() {
+        let request =
+            email_patch("replace", r#"emails[type eq "work" and primary eq true].value"#, json!(CURRENT_EMAIL));
+        let changes = plan_user(&request).expect("Entra's documented value path must work");
+
+        assert_eq!(changes.user_name_assertion.as_deref(), Some(CURRENT_EMAIL), "it asserts the account address");
+    }
+
+    #[test]
+    fn a_selector_can_match_on_the_value_itself() {
+        let request =
+            email_patch("replace", &format!(r#"emails[value eq "{CURRENT_EMAIL}"].value"#), json!(CURRENT_EMAIL));
+        assert!(plan_user(&request).is_ok());
+    }
+
+    #[test]
+    fn a_selector_that_matches_no_element_is_a_no_target() {
+        // RFC 7644 sections 3.5.2.2 and 3.5.2.3.
+        for selector in [
+            r#"emails[type eq "home"].value"#,
+            "emails[primary eq false].value",
+            r#"emails[type eq "work" and primary eq false].value"#,
+            r#"emails[value eq "someone@else.test"].value"#,
+        ] {
+            for op in ["replace", "add", "remove"] {
+                let err = plan_user(&email_patch(op, selector, json!(CURRENT_EMAIL)))
+                    .expect_err(&format!("{op} {selector} should not have been accepted"));
+                assert_eq!(err.scim_type, Some(ScimType::NoTarget), "{op} {selector}");
+                assert_eq!(err.status, rocket::http::Status::BadRequest, "{op} {selector}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_negated_selector_is_evaluated_rather_than_assumed() {
+        // `not (type eq "home")` matches the work element, so it is a target; `not (type eq
+        // "work")` matches nothing. Both answers come from the evaluator, not from the base name.
+        assert!(
+            plan_user(&email_patch("replace", r#"emails[not (type eq "home")].value"#, json!(CURRENT_EMAIL))).is_ok()
+        );
+
+        let err = plan_user(&email_patch("replace", r#"emails[not (type eq "work")].value"#, json!(CURRENT_EMAIL)))
+            .unwrap_err();
+        assert_eq!(err.scim_type, Some(ScimType::NoTarget));
+    }
+
+    #[test]
+    fn a_selected_element_still_cannot_rename_the_account() {
+        // Matching the selector only decides *what* is being addressed. What may be done to it is
+        // the same rule as everywhere else: the address is the account's global identity.
+        let request = email_patch("replace", r#"emails[type eq "work"].value"#, json!("attacker@evil.test"));
+        let changes = plan_user(&request).expect("planning records the assertion");
+
+        assert_eq!(
+            changes.user_name_assertion.as_deref(),
+            Some("attacker@evil.test"),
+            "the caller compares it with the stored account and refuses the change"
+        );
+    }
+
+    #[test]
+    fn changing_a_derived_sub_attribute_is_a_mutability_fault() {
+        for (selector, value) in [
+            (r#"emails[type eq "work"].type"#, json!("home")),
+            ("emails.type", json!("other")),
+            (r#"emails[type eq "work" and primary eq true].primary"#, json!(false)),
+            ("emails.primary", json!(false)),
+            // A value of the wrong JSON type is a change too, not something to skip.
+            ("emails.type", json!(true)),
+            ("emails.primary", json!("yes")),
+            ("emails.primary", Value::Null),
+        ] {
+            let err = plan_user(&email_patch("replace", selector, value)).unwrap_err();
+            assert_eq!(err.scim_type, Some(ScimType::Mutability), "{selector}");
+            assert_eq!(err.status, rocket::http::Status::BadRequest, "{selector}");
+        }
+    }
+
+    #[test]
+    fn re_asserting_a_derived_sub_attribute_is_a_no_op() {
+        // The same three-outcome rule the other unwritable attributes follow. A client that echoes
+        // the element back is not asking for a change, and failing it would break a sync over an
+        // attribute the client could not have sent differently.
+        for (selector, value) in [
+            (r#"emails[type eq "work"].type"#, json!("work")),
+            ("emails.type", json!("Work")),
+            (r#"emails[type eq "work" and primary eq true].primary"#, json!(true)),
+            ("emails.primary", json!(true)),
+            // Entra sends booleans as strings in some flows, here as elsewhere.
+            ("emails.primary", json!("True")),
+        ] {
+            let changes = plan_user(&email_patch("replace", selector, value))
+                .unwrap_or_else(|e| panic!("{selector} should be a no-op, got {e}"));
+            assert_eq!(changes, UserChanges::default(), "{selector} must assert nothing");
+        }
+    }
+
+    #[test]
+    fn a_derived_sub_attribute_never_carries_an_address() {
+        // The concrete danger of treating every `emails` path as the same assertion.
+        for selector in [r#"emails[type eq "work"].type"#, "emails.primary"] {
+            let err = plan_user(&email_patch("replace", selector, json!("attacker@evil.test"))).unwrap_err();
+            assert_eq!(err.scim_type, Some(ScimType::Mutability), "{selector}");
+        }
+    }
+
+    #[test]
+    fn display_is_not_a_sub_attribute_this_server_renders() {
+        // The User schema publishes `value`, `type` and `primary` and nothing else, so `display` is
+        // an unknown path rather than a read-only one.
+        let err = plan_user(&email_patch("replace", "emails.display", json!("Alice"))).unwrap_err();
+        assert_eq!(err.scim_type, Some(ScimType::InvalidPath));
+    }
+
+    #[test]
+    fn an_explicit_value_path_needs_an_address() {
+        // A `.value` path names exactly one address. Skipping a value that carries none would
+        // report success for a write that did nothing.
+        for value in [json!(123), json!(true), Value::Null, json!({"type": "work"}), json!([])] {
+            let err = plan_user(&email_patch("replace", r#"emails[type eq "work"].value"#, value.clone())).unwrap_err();
+            assert_eq!(err.scim_type, Some(ScimType::InvalidValue), "{value}");
+
+            let err = plan_user(&email_patch("replace", "emails.value", value.clone())).unwrap_err();
+            assert_eq!(err.scim_type, Some(ScimType::InvalidValue), "{value}");
+        }
+
+        // A bare `emails` path stays lenient: a client sending the element without a `value` has
+        // asserted no identity at all, which is not the same as asserting a broken one.
+        let changes = plan_user(&email_patch("replace", "emails", json!([{"type": "work"}]))).unwrap();
+        assert_eq!(changes, UserChanges::default());
+    }
+
+    #[test]
+    fn a_selector_must_be_one_value_path_on_emails() {
+        // `PatchPath` splits on the first `[` and the last `]`, so a selector may carry brackets of
+        // its own. Without the shape check, this parses into a disjunction and selects the element
+        // through a clause the client never targeted -- the RFC's `valuePath` is one
+        // `attrPath[valFilter]`.
+        for selector in [
+            r#"emails[type eq "home"] or emails[type eq "work"].value"#,
+            r#"emails[type eq "home"] or userName eq "alice@example.test"].value"#,
+        ] {
+            let err = plan_user(&email_patch("replace", selector, json!(CURRENT_EMAIL)))
+                .expect_err(&format!("{selector} should be refused"));
+            assert_eq!(err.scim_type, Some(ScimType::InvalidPath), "{selector}");
+        }
+    }
+
+    #[test]
+    fn a_read_only_sub_attribute_never_becomes_an_address_change() {
+        // The concrete danger of ignoring the sub-attribute: an address smuggled through `.type`.
+        let err = plan_user(&email_patch("replace", r#"emails[type eq "work"].type"#, json!("attacker@evil.test")))
+            .unwrap_err();
+
+        assert_eq!(err.scim_type, Some(ScimType::Mutability));
+    }
+
+    #[test]
+    fn an_unknown_email_sub_attribute_is_an_invalid_path() {
+        for selector in [r#"emails[type eq "work"].nonsense"#, "emails.nonsense", "emails.href"] {
+            let err = plan_user(&email_patch("replace", selector, json!("x"))).unwrap_err();
+            assert_eq!(err.scim_type, Some(ScimType::InvalidPath), "{selector}");
+        }
+    }
+
+    #[test]
+    fn an_arbitrary_selector_is_not_the_real_element() {
+        // `emails[whatever eq "x"]` must not be quietly treated as the rendered element. The
+        // parser knows this resource type's attributes, so an attribute that is not one of them is
+        // a client error rather than a silent match.
+        for selector in [
+            r#"emails[whatever eq "x"].value"#,
+            r#"emails[userName eq "alice@example.test"].value"#,
+            "emails[active eq true].value",
+        ] {
+            let err = plan_user(&email_patch("replace", selector, json!(CURRENT_EMAIL))).unwrap_err();
+            assert_eq!(err.scim_type, Some(ScimType::InvalidPath), "{selector}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_selector_is_an_invalid_path() {
+        for selector in ["emails[type eq].value", r#"emails[type "work"].value"#, "emails[].value"] {
+            let err = plan_user(&email_patch("replace", selector, json!(CURRENT_EMAIL))).unwrap_err();
+            assert_eq!(err.scim_type, Some(ScimType::InvalidPath), "{selector}");
+        }
+    }
+
+    #[test]
+    fn a_selector_using_the_wrong_operator_for_a_boolean_is_refused() {
+        // The filter parser types every attribute, so `primary co "true"` is a client error rather
+        // than a filter that quietly matches nothing -- which would have looked like `noTarget`.
+        let err =
+            plan_user(&email_patch("replace", r#"emails[primary co "true"].value"#, json!(CURRENT_EMAIL))).unwrap_err();
+        assert_eq!(err.scim_type, Some(ScimType::InvalidPath));
+    }
+
+    #[test]
+    fn an_extension_namespaced_emails_path_is_ignored() {
+        // The namespace rule composes with the value-path rule: an extension attribute whose last
+        // segment is `emails` is not this server's `emails`, brackets or no brackets.
+        for selector in [
+            r#"urn:example:Custom:emails[type eq "work"].value"#,
+            "urn:example:Custom:emails.value",
+            r#"urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:emails[type eq "home"].value"#,
+        ] {
+            let changes = plan_user(&email_patch("replace", selector, json!("attacker@evil.test")))
+                .unwrap_or_else(|e| panic!("{selector} should be ignored, got {e}"));
+            assert_eq!(changes, UserChanges::default(), "{selector} changed something");
+        }
+    }
+
+    #[test]
+    fn the_core_qualified_emails_path_is_the_real_attribute() {
+        let changes = plan_user(&email_patch(
+            "replace",
+            r#"urn:ietf:params:scim:schemas:core:2.0:User:emails[type eq "work"].value"#,
+            json!("attacker@evil.test"),
+        ))
+        .expect("planning records the assertion");
+
+        assert_eq!(changes.user_name_assertion.as_deref(), Some("attacker@evil.test"));
+    }
+
+    #[test]
+    fn a_value_path_email_still_loses_to_user_name() {
+        // Entra maps `userName` from `userPrincipalName` and `emails` from `mail`, and in real
+        // tenants those differ. Whichever spelling the address arrives in, `userName` decides.
+        let request = patch(json!({"Operations": [
+            {"op": "Replace", "path": r#"emails[type eq "work"].value"#, "value": "mail@example.test"},
+            {"op": "Replace", "path": "userName", "value": "upn@example.test"},
+        ]}));
+        assert_eq!(plan_user(&request).unwrap().user_name_assertion.as_deref(), Some("upn@example.test"));
+
+        // ...in either order.
+        let reversed = patch(json!({"Operations": [
+            {"op": "Replace", "path": "userName", "value": "upn@example.test"},
+            {"op": "Replace", "path": r#"emails[type eq "work"].value"#, "value": "mail@example.test"},
+        ]}));
+        assert_eq!(plan_user(&reversed).unwrap().user_name_assertion.as_deref(), Some("upn@example.test"));
+    }
+
+    #[test]
+    fn a_bare_emails_path_is_unchanged() {
+        // No selector and no sub-attribute: the shape identity providers send when they replace the
+        // whole attribute. It keeps working exactly as before.
+        let array = email_patch("replace", "emails", json!([{"value": CURRENT_EMAIL, "primary": true}]));
+        assert_eq!(plan_user(&array).unwrap().user_name_assertion.as_deref(), Some(CURRENT_EMAIL));
+
+        let object = email_patch("replace", "emails", json!({"value": CURRENT_EMAIL}));
+        assert_eq!(plan_user(&object).unwrap().user_name_assertion.as_deref(), Some(CURRENT_EMAIL));
+
+        let bare = email_patch("replace", "emails", json!(CURRENT_EMAIL));
+        assert_eq!(plan_user(&bare).unwrap().user_name_assertion.as_deref(), Some(CURRENT_EMAIL));
+    }
+
+    #[test]
+    fn removing_emails_outright_is_still_immutable_not_no_target() {
+        // No selector, so there is nothing to fail to match: the answer is the attribute rule.
+        let err = plan_user(&patch(json!({"Operations": [{"op": "Remove", "path": "emails"}]}))).unwrap_err();
+        assert_eq!(err.scim_type, Some(ScimType::Mutability));
+    }
+
+    #[test]
+    fn removing_a_matched_email_is_immutable() {
+        // The selector resolves first -- a matched element exists -- and then the attribute rule
+        // applies. The two errors answer different questions and must not be swapped.
+        let err = plan_user(&patch(json!({"Operations": [
+            {"op": "Remove", "path": r#"emails[type eq "work"].value"#}
+        ]})))
+        .unwrap_err();
+        assert_eq!(err.scim_type, Some(ScimType::Mutability));
+    }
+
+    // -- simple attributes have no sub-attributes ---------------------------------------------------
+
+    #[test]
+    fn a_simple_attribute_rejects_a_sub_attribute_path() {
+        // `active.whatever` is not the core `active`. Ignoring the sub-attribute and writing the
+        // parent would let a path this schema does not define deprovision somebody.
+        for selector in ["active.whatever", "externalId.value", "userName.value", "displayName.formatted"] {
+            let err = plan_user(&email_patch("replace", selector, json!(false))).unwrap_err();
+            assert_eq!(err.scim_type, Some(ScimType::InvalidPath), "{selector}");
+        }
     }
 }

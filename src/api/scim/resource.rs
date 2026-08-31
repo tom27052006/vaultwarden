@@ -392,28 +392,38 @@ impl ScimUserRequest {
     /// The name to give an account this request **creates**, validated and bounded.
     ///
     /// Only `POST` reaches this: it is the one place SCIM writes an account name, so it is the one
-    /// place the length limit belongs.
+    /// place the length limit belongs, and the one place `name.*` is consulted at all.
     pub fn resolve_display_name(&self) -> ScimResult<Option<String>> {
-        self.asserted_display_name().map(|name| normalize_account_name(&name)).transpose()
+        self.creation_name().map(|name| normalize_account_name(&name)).transpose()
     }
 
-    /// The name this request *asserts*, for an update.
+    /// The name this request *asserts* about an account that already exists.
+    ///
+    /// **`displayName` only.** `name` and its sub-attributes are deliberately excluded: this
+    /// server does not publish `name` in its User schema, so a client sending it is sending an
+    /// attribute that does not exist here. Reinterpreting it as `displayName` -- what an earlier
+    /// revision did -- meant an unsupported attribute could fail a `PUT` with a `mutability` fault
+    /// about a *different* attribute, and made `PUT` and `PATCH` disagree: `PATCH` has always
+    /// ignored `name` outright. Now both do. See `docs/scim/design.md` section 7.
     ///
     /// Deliberately **not** length-bounded. On `PUT` the value is only ever compared with the
     /// stored account name, never written, so the bound has nothing to apply to -- and applying it
     /// anyway would mean an account whose name predates the limit could not even have its own name
     /// echoed back at it without a `400`.
-    ///
-    /// `displayName` first, then `name.formatted`, then `givenName`/`familyName` -- the order
-    /// Entra ID's default mapping makes useful.
     pub fn asserted_display_name(&self) -> Option<String> {
-        self.raw_display_name()
+        self.display_name.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned)
     }
 
-    fn raw_display_name(&self) -> Option<String> {
-        let from_display = self.display_name.as_deref().map(str::trim).filter(|s| !s.is_empty());
-        if let Some(name) = from_display {
-            return Some(name.to_owned());
+    /// The name for a brand-new account: `displayName`, then `name.formatted`, then
+    /// `givenName`/`familyName` -- the order Entra ID's default mapping makes useful.
+    ///
+    /// The `name.*` fallback is **input compatibility**, not schema support: an identity provider
+    /// that maps only `name` still gets a usefully named shell account instead of one named after
+    /// its own email address. It applies to creation and nowhere else, so it can never contradict
+    /// a name an account already has.
+    fn creation_name(&self) -> Option<String> {
+        if let Some(name) = self.asserted_display_name() {
+            return Some(name);
         }
 
         let name = self.name.as_ref()?;
@@ -645,8 +655,8 @@ mod tests {
     }
 
     #[test]
-    fn display_name_falls_back_through_the_name_object() {
-        // The order Entra ID's default mapping makes useful.
+    fn display_name_falls_back_through_the_name_object_when_creating() {
+        // The order Entra ID's default mapping makes useful. Creation only -- see the test below.
         let formatted = parse_user(json!({"name": {"formatted": "Alice Example", "givenName": "Alice"}}));
         assert_eq!(formatted.resolve_display_name().unwrap(), Some("Alice Example".to_owned()));
 
@@ -658,6 +668,51 @@ mod tests {
 
         assert_eq!(parse_user(json!({"userName": "a@example.test"})).resolve_display_name().unwrap(), None);
         assert_eq!(parse_user(json!({"displayName": "   "})).resolve_display_name().unwrap(), None);
+    }
+
+    // -- `name.*` is input compatibility, not schema support -----------------------------------
+    //
+    // `name` is not published in this server's User schema, so it is not an attribute of this
+    // resource. `POST` still reads it as a fallback when naming an account it is *creating*,
+    // because an identity provider that maps only `name` would otherwise get shell accounts named
+    // after their own email address. Nothing else looks at it: reinterpreting an unsupported
+    // attribute as a supported one on an existing account made `PUT` fail with a `mutability`
+    // fault about `displayName`, which the client had never sent, while `PATCH` ignored the same
+    // document entirely. See docs/scim/design.md section 7.
+
+    #[test]
+    fn name_parts_never_assert_anything_about_an_existing_account() {
+        for document in [
+            json!({"userName": "a@example.test", "name": {"formatted": "Someone Else"}}),
+            json!({"userName": "a@example.test", "name": {"givenName": "Someone", "familyName": "Else"}}),
+            json!({"userName": "a@example.test", "name": {"familyName": "Else"}}),
+        ] {
+            assert_eq!(
+                parse_user(document.clone()).asserted_display_name(),
+                None,
+                "an unsupported attribute must not become an assertion about a supported one: {document}"
+            );
+        }
+    }
+
+    #[test]
+    fn display_name_is_still_asserted_on_its_own() {
+        // The immutability rule is not weakened: the supported attribute is still compared.
+        assert_eq!(
+            parse_user(json!({"displayName": "  Alice Example  "})).asserted_display_name(),
+            Some("Alice Example".to_owned())
+        );
+        assert_eq!(parse_user(json!({"displayName": "   "})).asserted_display_name(), None);
+        assert_eq!(parse_user(json!({"userName": "a@example.test"})).asserted_display_name(), None);
+    }
+
+    #[test]
+    fn display_name_still_wins_over_name_when_creating() {
+        // The two paths agree wherever both have something to say.
+        let request = parse_user(json!({"displayName": "From displayName", "name": {"formatted": "From name"}}));
+
+        assert_eq!(request.asserted_display_name(), Some("From displayName".to_owned()));
+        assert_eq!(request.resolve_display_name().unwrap(), Some("From displayName".to_owned()));
     }
 
     #[test]

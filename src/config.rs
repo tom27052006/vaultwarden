@@ -795,6 +795,13 @@ make_config! {
         /// Max burst size for SCIM requests |> Allow a burst of requests of up to this size, while maintaining the average indicated by `scim_ratelimit_per_second`
         scim_ratelimit_max_burst:      u32, false, def, 1000;
 
+        /// Sustained SCIM authentication attempts per second |> Requests per second, per IP address, carrying a well-formed SCIM token that this server is willing to verify against the database.
+        /// Checked before the key lookup, so a flood of valid-looking but wrong tokens is bounded before it costs any database work.
+        /// Every request with a well-formed token is charged here, including the ones that go on to authenticate, so keep it above `scim_ratelimit_per_second`.
+        scim_auth_ratelimit_per_second: u32, false, def, 60;
+        /// Max burst size for SCIM authentication attempts |> Allow a burst of requests of up to this size, while maintaining the average indicated by `scim_auth_ratelimit_per_second`
+        scim_auth_ratelimit_max_burst: u32, false, def, 3000;
+
         /// Seconds between admin login requests |> Number of seconds, on average, between admin requests from the same IP address before rate limiting kicks in
         admin_ratelimit_seconds:       u64, false, def, 300;
         /// Max burst size for admin login requests |> Allow a burst of requests of up to this size, while maintaining the average indicated by `admin_ratelimit_seconds`
@@ -994,6 +1001,19 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
         println!(
             "[WARNING] `SCIM_ENABLED` is set but `ORG_EVENTS_ENABLED` is not.\n\
              [WARNING] SCIM provisioning changes will not be recorded in the organization event log."
+        );
+    }
+
+    // Every SCIM request carrying a well-formed token is charged to the pre-verification budget,
+    // including the ones that authenticate, so a value below the provisioning rate makes it the
+    // limit a legitimate sync hits first -- and it is per IP where the provisioning budget is per
+    // organization, so several tenants behind one address share it.
+    if cfg.scim_enabled && cfg.scim_auth_ratelimit_per_second < cfg.scim_ratelimit_per_second {
+        println!(
+            "[WARNING] `SCIM_AUTH_RATELIMIT_PER_SECOND` ({}) is below `SCIM_RATELIMIT_PER_SECOND` ({}).\n\
+             [WARNING] It is charged to every well-formed token, so it will throttle successful \
+             provisioning before the provisioning budget does.",
+            cfg.scim_auth_ratelimit_per_second, cfg.scim_ratelimit_per_second
         );
     }
 

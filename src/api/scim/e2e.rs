@@ -31,7 +31,9 @@ use crate::{
 
 use super::resource::MAX_ACCOUNT_NAME_LEN;
 use super::settings::test_overrides::{
-    GROUPS_ENABLED, RATE_LIMIT_EXHAUSTED, SCIM_ENABLED, UNAUTH_RATE_LIMIT_EXHAUSTED,
+    GROUPS_ENABLED, INVITATION_FAILS, KEY_LOOKUPS, PRE_AUTH_RATE_LIMIT_CHECKS, PRE_AUTH_RATE_LIMIT_EXHAUSTED,
+    RATE_LIMIT_CHECKS, RATE_LIMIT_KEYS, RATE_LIMITED_ORG, SCIM_ENABLED, UNAUTH_RATE_LIMIT_CHECKS,
+    UNAUTH_RATE_LIMIT_EXHAUSTED, reset as reset_settings,
 };
 
 /// Serialises the tests that change server settings against the ones that assume the defaults.
@@ -61,8 +63,13 @@ impl TestServer {
     }
 
     /// A server whose settings this test is free to change; other tests are locked out meanwhile.
+    ///
+    /// Only these tests may read the limiter counters, because only they hold the lock that keeps
+    /// another test's requests from incrementing them.
     async fn with_exclusive_settings() -> Self {
-        Self::build(SettingsGuard::Exclusive(SETTINGS_LOCK.write().await)).await
+        let guard = SettingsGuard::Exclusive(SETTINGS_LOCK.write().await);
+        reset_settings();
+        Self::build(guard).await
     }
 
     async fn build(guard: SettingsGuard) -> Self {
@@ -100,14 +107,73 @@ impl TestServer {
         GROUPS_ENABLED.store(enabled, Ordering::Relaxed);
     }
 
-    fn set_rate_limit_exhausted(&self, exhausted: bool) {
+    /// Exhaust the provisioning budget for one organization.
+    ///
+    /// Per organization rather than globally, because the budget is keyed by
+    /// `(organization, address)`: a test that could only exhaust "everything" could not show that
+    /// two organizations on one address have separate allowances.
+    fn set_rate_limited_org(&self, org: Option<&OrganizationId>) {
         assert!(matches!(self.guard, SettingsGuard::Exclusive(_)), "changing settings needs the exclusive lock");
-        RATE_LIMIT_EXHAUSTED.store(exhausted, Ordering::Relaxed);
+        *RATE_LIMITED_ORG.lock().expect("rate-limited organization") = org.cloned();
     }
 
     fn set_unauthenticated_rate_limit_exhausted(&self, exhausted: bool) {
         assert!(matches!(self.guard, SettingsGuard::Exclusive(_)), "changing settings needs the exclusive lock");
         UNAUTH_RATE_LIMIT_EXHAUSTED.store(exhausted, Ordering::Relaxed);
+    }
+
+    fn set_pre_auth_rate_limit_exhausted(&self, exhausted: bool) {
+        assert!(matches!(self.guard, SettingsGuard::Exclusive(_)), "changing settings needs the exclusive lock");
+        PRE_AUTH_RATE_LIMIT_EXHAUSTED.store(exhausted, Ordering::Relaxed);
+    }
+
+    /// Make the invitation side effect of a reactivation fail.
+    ///
+    /// The only way to reach the rollback in `apply_user_changes` from a test: every real cause of
+    /// failure is a database state the foreign keys will not let a test construct.
+    fn set_invitation_fails(&self, fails: bool) {
+        assert!(matches!(self.guard, SettingsGuard::Exclusive(_)), "changing settings needs the exclusive lock");
+        INVITATION_FAILS.store(fails, Ordering::Relaxed);
+    }
+
+    /// The counters and the recorded limiter keys are process-wide, so reading them is only
+    /// meaningful while no other test can be making requests.
+    fn assert_counters_are_readable(&self) {
+        assert!(matches!(self.guard, SettingsGuard::Exclusive(_)), "reading counters needs the exclusive lock");
+    }
+
+    fn reset_counters(&self) {
+        self.assert_counters_are_readable();
+        RATE_LIMIT_CHECKS.store(0, Ordering::Relaxed);
+        UNAUTH_RATE_LIMIT_CHECKS.store(0, Ordering::Relaxed);
+        PRE_AUTH_RATE_LIMIT_CHECKS.store(0, Ordering::Relaxed);
+        KEY_LOOKUPS.store(0, Ordering::Relaxed);
+        RATE_LIMIT_KEYS.lock().expect("rate-limit keys").clear();
+    }
+
+    fn provisioning_checks(&self) -> usize {
+        self.assert_counters_are_readable();
+        RATE_LIMIT_CHECKS.load(Ordering::Relaxed)
+    }
+
+    fn unauthenticated_checks(&self) -> usize {
+        self.assert_counters_are_readable();
+        UNAUTH_RATE_LIMIT_CHECKS.load(Ordering::Relaxed)
+    }
+
+    fn pre_auth_checks(&self) -> usize {
+        self.assert_counters_are_readable();
+        PRE_AUTH_RATE_LIMIT_CHECKS.load(Ordering::Relaxed)
+    }
+
+    fn key_lookups(&self) -> usize {
+        self.assert_counters_are_readable();
+        KEY_LOOKUPS.load(Ordering::Relaxed)
+    }
+
+    fn provisioning_keys(&self) -> Vec<(OrganizationId, std::net::IpAddr)> {
+        self.assert_counters_are_readable();
+        RATE_LIMIT_KEYS.lock().expect("rate-limit keys").clone()
     }
 
     // -- fixtures ------------------------------------------------------------------------------
@@ -235,10 +301,7 @@ impl Drop for TestServer {
     fn drop(&mut self) {
         // Always put the shared settings back, so an exclusive test cannot leak state.
         if matches!(self.guard, SettingsGuard::Exclusive(_)) {
-            SCIM_ENABLED.store(true, Ordering::Relaxed);
-            GROUPS_ENABLED.store(true, Ordering::Relaxed);
-            RATE_LIMIT_EXHAUSTED.store(false, Ordering::Relaxed);
-            UNAUTH_RATE_LIMIT_EXHAUSTED.store(false, Ordering::Relaxed);
+            reset_settings();
         }
 
         // Best effort: on Windows the pool may still hold the file open.
@@ -258,6 +321,7 @@ struct ScimReply {
     content_type: Option<ContentType>,
     location: Option<String>,
     content_location: Option<String>,
+    www_authenticate: Option<String>,
     body: String,
 }
 
@@ -267,6 +331,7 @@ impl ScimReply {
         let content_type = response.content_type();
         let location = response.headers().get_one("Location").map(str::to_owned);
         let content_location = response.headers().get_one("Content-Location").map(str::to_owned);
+        let www_authenticate = response.headers().get_one("WWW-Authenticate").map(str::to_owned);
         let body = response.into_string().await.unwrap_or_default();
 
         Self {
@@ -274,8 +339,19 @@ impl ScimReply {
             content_type,
             location,
             content_location,
+            www_authenticate,
             body,
         }
+    }
+
+    /// A `401` carries the generic bearer challenge and nothing that varies with the cause.
+    fn assert_generic_bearer_challenge(&self) {
+        assert_eq!(self.status, Status::Unauthorized, "body was {}", self.body);
+        assert_eq!(
+            self.www_authenticate.as_deref(),
+            Some("Bearer"),
+            "every SCIM 401 carries the same bare Bearer challenge"
+        );
     }
 
     /// A single-resource response identifies the resource it carries, and says the same thing in
@@ -476,7 +552,7 @@ async fn rate_limited_requests_get_a_scim_429() {
     let server = TestServer::with_exclusive_settings().await;
     let (org, token) = server.org("acme").await;
 
-    server.set_rate_limit_exhausted(true);
+    server.set_rate_limited_org(Some(&org.uuid));
 
     server.get(&users_url(&org), &token).await.assert_error(Status::TooManyRequests, None);
 }
@@ -490,7 +566,7 @@ async fn authenticated_traffic_consumes_the_provisioning_budget() {
     let (_, membership) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
     let user_path = format!("{}/{}", users_url(&org), membership.uuid);
 
-    server.set_rate_limit_exhausted(true);
+    server.set_rate_limited_org(Some(&org.uuid));
 
     server.get(&users_url(&org), &token).await.assert_error(Status::TooManyRequests, None);
     server.get(&user_path, &token).await.assert_error(Status::TooManyRequests, None);
@@ -1185,7 +1261,7 @@ async fn deleting_a_user_removes_the_membership_but_keeps_the_account() {
 // =============================================================================================
 
 #[rocket::async_test]
-async fn privileged_memberships_are_visible_but_read_only() {
+async fn privileged_memberships_are_visible_but_not_writable() {
     let server = TestServer::new().await;
     let (org, token) = server.org("acme").await;
     let (_, owner) = server.member(&org, "owner@example.test", MembershipType::Owner, true).await;
@@ -1200,9 +1276,9 @@ async fn privileged_memberships_are_visible_but_read_only() {
     server
         .patch(&path, &token, json!({"Operations": [{"op": "Replace", "path": "active", "value": false}]}))
         .await
-        .assert_error(Status::Forbidden, Some("mutability"));
-    server.put(&path, &token, json!({"active": false})).await.assert_error(Status::Forbidden, Some("mutability"));
-    server.delete(&path, &token).await.assert_error(Status::Forbidden, Some("mutability"));
+        .assert_error(Status::Forbidden, None);
+    server.put(&path, &token, json!({"active": false})).await.assert_error(Status::Forbidden, None);
+    server.delete(&path, &token).await.assert_error(Status::Forbidden, None);
 
     let stored = server.reload_membership(&owner.uuid, &org.uuid).await.expect("owner still there");
     assert_eq!(stored.atype, MembershipType::Owner as i32);
@@ -1210,7 +1286,7 @@ async fn privileged_memberships_are_visible_but_read_only() {
 }
 
 #[rocket::async_test]
-async fn admins_and_managers_are_equally_read_only() {
+async fn admins_and_managers_are_equally_off_limits() {
     let server = TestServer::new().await;
     let (org, token) = server.org("acme").await;
 
@@ -1221,7 +1297,7 @@ async fn admins_and_managers_are_equally_read_only() {
         server
             .delete(&format!("{}/{}", users_url(&org), membership.uuid), &token)
             .await
-            .assert_error(Status::Forbidden, Some("mutability"));
+            .assert_error(Status::Forbidden, None);
     }
 }
 
@@ -1232,11 +1308,11 @@ async fn the_last_owner_cannot_be_removed_or_disabled_through_scim() {
     let (_, owner) = server.member(&org, "owner@example.test", MembershipType::Owner, true).await;
 
     let path = format!("{}/{}", users_url(&org), owner.uuid);
-    server.delete(&path, &token).await.assert_error(Status::Forbidden, Some("mutability"));
+    server.delete(&path, &token).await.assert_error(Status::Forbidden, None);
     server
         .patch(&path, &token, json!({"Operations": [{"op": "Replace", "path": "active", "value": false}]}))
         .await
-        .assert_error(Status::Forbidden, Some("mutability"));
+        .assert_error(Status::Forbidden, None);
 
     assert_eq!(
         Membership::count_confirmed_by_org_and_type(&org.uuid, MembershipType::Owner, &server.conn().await).await,
@@ -1262,7 +1338,7 @@ async fn a_revoked_owner_cannot_be_reactivated_through_scim() {
             json!({"Operations": [{"op": "Replace", "path": "active", "value": true}]}),
         )
         .await
-        .assert_error(Status::Forbidden, Some("mutability"));
+        .assert_error(Status::Forbidden, None);
 
     let stored = server.reload_membership(&owner.uuid, &org.uuid).await.expect("membership");
     assert!(stored.status < MembershipStatus::Invited as i32, "still revoked");
@@ -1724,8 +1800,17 @@ async fn discovery_reports_only_what_is_supported() {
     assert_eq!(body["changePassword"]["supported"], json!(false));
     assert_eq!(body["authenticationSchemes"][0]["type"], json!("oauthbearertoken"));
 
+    // The full listing is checked by `schemas_publishes_every_schema_the_server_uses`; this only
+    // pins that the endpoint answers and carries the resource type's own schema.
     let schemas = server.get(&format!("/scim/v2/{}/Schemas", org.uuid), &token).await.json();
-    assert_eq!(schemas["totalResults"], json!(2));
+    assert!(
+        schemas["Resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == json!("urn:ietf:params:scim:schemas:core:2.0:User")),
+        "{schemas}"
+    );
 
     let user_schema =
         server.get(&format!("/scim/v2/{}/Schemas/urn:ietf:params:scim:schemas:core:2.0:User", org.uuid), &token).await;
@@ -2680,27 +2765,51 @@ async fn privileged_members_may_be_managed_in_groups() {
             json!({"Operations": [{"op": "Replace", "path": "active", "value": false}]}),
         )
         .await
-        .assert_error(Status::Forbidden, Some("mutability"));
+        .assert_error(Status::Forbidden, None);
 }
 
-// -- forbidden vs mutability ----------------------------------------------------------------------------
+// -- resource refusals vs attribute mutability -------------------------------------------------------
 
 #[rocket::async_test]
-async fn a_read_only_resource_is_a_mutability_fault_and_a_policy_refusal_is_not() {
+async fn a_refused_resource_is_not_an_attribute_mutability_fault() {
+    // Two different faults that an earlier revision spelled the same way.
+    //
+    // A privileged membership is a *resource* this server's provisioning policy does not hand to
+    // SCIM: no attribute value makes the request work, so `scimType: mutability` -- which tells a
+    // client one attribute violated its declared changeability -- names the wrong problem and
+    // points at a fix that does not exist. It is a plain 403.
+    //
+    // An attempt to change `userName` really is an attribute mutability fault, and keeps the pair
+    // RFC 7644 section 3.12 gives it: 400 with `scimType: mutability`.
     let server = TestServer::new().await;
     let (org, token) = server.org("acme").await;
     let (_, owner) = server.member(&org, "owner@example.test", MembershipType::Owner, true).await;
 
-    // Writing a resource this server treats as read-only is a genuine `mutability` fault.
-    server
-        .delete(&format!("{}/{}", users_url(&org), owner.uuid), &token)
-        .await
-        .assert_error(Status::Forbidden, Some("mutability"));
+    let refused = server.delete(&format!("{}/{}", users_url(&org), owner.uuid), &token).await;
+    refused.assert_error(Status::Forbidden, None);
+    assert!(
+        refused.json()["detail"].as_str().unwrap_or_default().contains("privileged"),
+        "the refusal still says why: {}",
+        refused.body
+    );
 
-    // Renaming an account is refused as immutable, with the RFC's 400 rather than a 403.
     let (_, member) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
     server
         .put(&format!("{}/{}", users_url(&org), member.uuid), &token, json!({"userName": "other@example.test"}))
+        .await
+        .assert_error(Status::BadRequest, Some("mutability"));
+
+    // ...and so does an attempt to change the other two immutable account attributes.
+    server
+        .put(&format!("{}/{}", users_url(&org), member.uuid), &token, json!({"displayName": "Someone Else"}))
+        .await
+        .assert_error(Status::BadRequest, Some("mutability"));
+    server
+        .put(
+            &format!("{}/{}", users_url(&org), member.uuid),
+            &token,
+            json!({"emails": [{"value": "other@example.test", "primary": true}]}),
+        )
         .await
         .assert_error(Status::BadRequest, Some("mutability"));
 }
@@ -2779,7 +2888,7 @@ async fn unauthenticated_requests_never_reach_the_provisioning_limiter() {
     let key_id = token.split('.').nth(1).unwrap();
     let secret = token.rsplit('.').next().unwrap();
 
-    server.set_rate_limit_exhausted(true);
+    server.set_rate_limited_org(Some(&org.uuid));
 
     // No Authorization header at all.
     server.get_unauthenticated(&users_url(&org)).await.assert_error(Status::Unauthorized, None);
@@ -2855,12 +2964,21 @@ async fn a_disabled_server_is_not_an_authentication_failure() {
     let (org, token) = server.org("acme").await;
 
     server.set_scim_enabled(false);
-    server.set_rate_limit_exhausted(true);
+    server.set_rate_limited_org(Some(&org.uuid));
     server.set_unauthenticated_rate_limit_exhausted(true);
+    server.set_pre_auth_rate_limit_exhausted(true);
+    server.reset_counters();
 
     server.get(&users_url(&org), &token).await.assert_error(Status::NotFound, None);
     server.get_unauthenticated(&users_url(&org)).await.assert_error(Status::NotFound, None);
     server.get(&users_url(&org), "not-a-token").await.assert_error(Status::NotFound, None);
+
+    // Not one budget was consulted, and the database was never asked for a key: a switched-off
+    // endpoint is answered from configuration alone.
+    assert_eq!(server.provisioning_checks(), 0);
+    assert_eq!(server.unauthenticated_checks(), 0);
+    assert_eq!(server.pre_auth_checks(), 0);
+    assert_eq!(server.key_lookups(), 0);
 }
 
 // -- immutable account attributes ------------------------------------------------------------------
@@ -3611,4 +3729,1169 @@ async fn a_null_comparison_tests_for_absence() {
     let present = server.get(&format!("{}?filter=externalId%20ne%20null", users_url(&org)), &token).await;
     assert_eq!(present.json()["totalResults"], json!(1), "{}", present.body);
     assert_eq!(present.json()["Resources"][0]["userName"], json!("with@example.test"));
+}
+
+// =============================================================================================
+// PATCH atomicity (RFC 7644 section 3.5.2)
+// =============================================================================================
+//
+// "If any operation fails, the service provider SHALL return the resource to its original state."
+// The only side effect in the User write path that can fail *after* the row has been saved is the
+// invitation a reactivation issues, so that is the failure these tests force. Every SCIM-visible
+// field the request touched has to come back, not just the one the side effect belonged to.
+//
+// No event assertions here: `log_event` is a no-op unless `ORG_EVENTS_ENABLED` is set, and that is
+// read from the process environment, which a test cannot change in a crate that forbids `unsafe`.
+// The property is structural instead -- the rollback returns before any `log_event` call -- and is
+// noted in docs/scim/design.md section 7.
+
+/// Provision an inactive member carrying `externalId`, and return its SCIM id.
+async fn inactive_member_with_external_id(server: &TestServer, org: &Organization, token: &str, email: &str) -> String {
+    let created =
+        server.post(&users_url(org), token, json!({"userName": email, "externalId": "old", "active": false})).await;
+    assert_eq!(created.status, Status::Created, "{}", created.body);
+    created.json()["id"].as_str().unwrap().to_owned()
+}
+
+#[rocket::async_test]
+async fn a_failed_reactivation_rolls_back_every_field_the_patch_changed() {
+    // The motivating case. Before: `active = false`, `externalId = "old"`. The PATCH asks for both
+    // `externalId = "new"` and `active = true`; the invitation the reactivation needs then fails.
+    //
+    // An earlier revision re-revoked the membership but deliberately kept `externalId = "new"`, on
+    // the grounds that directory metadata is "correct anyway". That left the resource in a state
+    // the client never asked for -- half of a document it was told had failed -- and no response
+    // said so.
+    let server = TestServer::with_exclusive_settings().await;
+    let (org, token) = server.org("acme").await;
+    let member_id = inactive_member_with_external_id(&server, &org, &token, "rollback@example.test").await;
+    let path = format!("{}/{}", users_url(&org), member_id);
+
+    let combined = json!({"Operations": [
+        {"op": "Replace", "path": "externalId", "value": "new"},
+        {"op": "Replace", "path": "active", "value": true},
+    ]});
+
+    server.set_invitation_fails(true);
+    let failed = server.patch(&path, &token, combined.clone()).await;
+    assert_eq!(failed.status, Status::InternalServerError, "{}", failed.body);
+
+    let id = MembershipId::from(member_id.clone());
+    let stored = server.reload_membership(&id, &org.uuid).await.expect("membership");
+    assert!(stored.status < MembershipStatus::Invited as i32, "the membership must be revoked again");
+    assert_eq!(stored.external_id.as_deref(), Some("old"), "and the externalId the same PATCH set must be back");
+
+    // The representation a client reads back agrees with the row.
+    let after = server.get(&path, &token).await;
+    assert_eq!(after.json()["active"], json!(false));
+    assert_eq!(after.json()["externalId"], json!("old"));
+
+    // The retry the identity provider makes next succeeds, and applies the whole document.
+    server.set_invitation_fails(false);
+    let retried = server.patch(&path, &token, combined).await;
+    assert_eq!(retried.status, Status::Ok, "{}", retried.body);
+    assert_eq!(retried.json()["active"], json!(true));
+    assert_eq!(retried.json()["externalId"], json!("new"));
+
+    let stored = server.reload_membership(&id, &org.uuid).await.expect("membership");
+    assert!(stored.status > MembershipStatus::Revoked as i32);
+    assert_eq!(stored.external_id.as_deref(), Some("new"));
+    assert!(
+        Invitation::find_by_mail("rollback@example.test", &server.conn().await).await.is_some(),
+        "the retry issued the invitation the first attempt could not"
+    );
+}
+
+#[rocket::async_test]
+async fn a_failed_reactivation_through_put_rolls_back_too() {
+    // `PUT` has no explicit atomicity requirement in RFC 7644, but it runs the same write path and
+    // can leave the same half-applied state, so it gets the same rollback.
+    let server = TestServer::with_exclusive_settings().await;
+    let (org, token) = server.org("acme").await;
+    let member_id = inactive_member_with_external_id(&server, &org, &token, "putback@example.test").await;
+    let path = format!("{}/{}", users_url(&org), member_id);
+
+    server.set_invitation_fails(true);
+    let failed = server
+        .put(&path, &token, json!({"userName": "putback@example.test", "externalId": "new", "active": true}))
+        .await;
+    assert_eq!(failed.status, Status::InternalServerError, "{}", failed.body);
+
+    let stored = server.reload_membership(&MembershipId::from(member_id), &org.uuid).await.expect("membership");
+    assert!(stored.status < MembershipStatus::Invited as i32);
+    assert_eq!(stored.external_id.as_deref(), Some("old"));
+}
+
+#[rocket::async_test]
+async fn a_failed_reactivation_rolls_back_a_cleared_external_id() {
+    // `remove` is a change too: a document that clears `externalId` and reactivates has to put the
+    // old value back, not leave the attribute unset.
+    let server = TestServer::with_exclusive_settings().await;
+    let (org, token) = server.org("acme").await;
+    let member_id = inactive_member_with_external_id(&server, &org, &token, "cleared@example.test").await;
+    let path = format!("{}/{}", users_url(&org), member_id);
+
+    server.set_invitation_fails(true);
+    server
+        .patch(
+            &path,
+            &token,
+            json!({"Operations": [
+                {"op": "Remove", "path": "externalId"},
+                {"op": "Replace", "path": "active", "value": true},
+            ]}),
+        )
+        .await
+        .assert_error(Status::InternalServerError, None);
+
+    let stored = server.reload_membership(&MembershipId::from(member_id), &org.uuid).await.expect("membership");
+    assert_eq!(stored.external_id.as_deref(), Some("old"), "a cleared externalId comes back too");
+    assert!(stored.status < MembershipStatus::Invited as i32);
+}
+
+#[rocket::async_test]
+async fn a_reactivation_restores_the_exact_previous_status_on_rollback() {
+    // `restore()` returns a membership to whatever it was before -- Invited, Accepted or Confirmed
+    // -- so a rollback that only knew "it was inactive" could put a Confirmed member back as
+    // Invited and silently deprovision their access.
+    let server = TestServer::with_exclusive_settings().await;
+    let (org, token) = server.org("acme").await;
+    let (_, mut membership) = server.member(&org, "confirmed@example.test", MembershipType::User, false).await;
+
+    // Confirmed, then revoked: the stored status encodes "was Confirmed".
+    membership.revoke();
+    membership.save(&server.conn().await).await.expect("revoke");
+    let revoked_status = server.reload_membership(&membership.uuid, &org.uuid).await.expect("membership").status;
+
+    server.set_invitation_fails(true);
+    server
+        .patch(
+            &format!("{}/{}", users_url(&org), membership.uuid),
+            &token,
+            json!({"Operations": [{"op": "Replace", "path": "active", "value": true}]}),
+        )
+        .await
+        .assert_error(Status::InternalServerError, None);
+
+    let stored = server.reload_membership(&membership.uuid, &org.uuid).await.expect("membership");
+    assert_eq!(stored.status, revoked_status, "the exact status is restored, not merely 'revoked'");
+}
+
+#[rocket::async_test]
+async fn a_successful_patch_is_unaffected_by_the_rollback_path() {
+    // The ordinary case still writes both fields and issues the invitation exactly once.
+    let server = TestServer::with_exclusive_settings().await;
+    let (org, token) = server.org("acme").await;
+    let member_id = inactive_member_with_external_id(&server, &org, &token, "happy@example.test").await;
+    let path = format!("{}/{}", users_url(&org), member_id);
+
+    let reply = server
+        .patch(
+            &path,
+            &token,
+            json!({"Operations": [
+                {"op": "Replace", "path": "externalId", "value": "new"},
+                {"op": "Replace", "path": "active", "value": true},
+            ]}),
+        )
+        .await;
+    assert_eq!(reply.status, Status::Ok, "{}", reply.body);
+    assert_eq!(reply.json()["externalId"], json!("new"));
+    assert_eq!(reply.json()["active"], json!(true));
+    assert!(Invitation::find_by_mail("happy@example.test", &server.conn().await).await.is_some());
+}
+
+#[rocket::async_test]
+async fn a_combined_patch_that_fails_validation_writes_nothing_at_all() {
+    // The other half of atomicity, and the cheaper one: a document whose *planning* fails never
+    // reaches the database, so there is nothing to roll back. Combined documents, not just
+    // single-operation ones -- the operation that fails is deliberately not the first.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, membership) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
+    let path = format!("{}/{}", users_url(&org), membership.uuid);
+
+    for (operations, status, scim_type) in [
+        // A valid change followed by an immutable assertion.
+        (
+            json!([
+                {"op": "Replace", "path": "externalId", "value": "should-not-stick"},
+                {"op": "Replace", "path": "active", "value": false},
+                {"op": "Replace", "path": "userName", "value": "attacker@evil.test"},
+            ]),
+            Status::BadRequest,
+            Some("mutability"),
+        ),
+        // A valid change followed by an unsupported path.
+        (
+            json!([
+                {"op": "Replace", "path": "externalId", "value": "should-not-stick"},
+                {"op": "Replace", "path": "nonsense", "value": "x"},
+            ]),
+            Status::BadRequest,
+            Some("invalidPath"),
+        ),
+        // A valid change followed by a value the schema cannot accept.
+        (
+            json!([
+                {"op": "Replace", "path": "externalId", "value": "should-not-stick"},
+                {"op": "Replace", "path": "active", "value": "maybe"},
+            ]),
+            Status::BadRequest,
+            Some("invalidValue"),
+        ),
+    ] {
+        server.patch(&path, &token, json!({"Operations": operations})).await.assert_error(status, scim_type);
+
+        let stored = server.reload_membership(&membership.uuid, &org.uuid).await.expect("membership");
+        assert_eq!(stored.external_id, None, "the earlier operation in the same document must not have been applied");
+        assert!(stored.status > MembershipStatus::Revoked as i32, "and neither must the deactivation");
+    }
+}
+
+#[rocket::async_test]
+async fn repeated_operations_on_one_attribute_resolve_to_the_last() {
+    // A document may touch the same attribute more than once. The change set is a plan, so the
+    // last operation wins and exactly one write happens -- rather than two writes, or a rollback
+    // that only knows about one of them.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, membership) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
+    let path = format!("{}/{}", users_url(&org), membership.uuid);
+
+    let reply = server
+        .patch(
+            &path,
+            &token,
+            json!({"Operations": [
+                {"op": "Replace", "path": "externalId", "value": "first"},
+                {"op": "Replace", "path": "externalId", "value": "second"},
+                {"op": "Replace", "path": "active", "value": false},
+                {"op": "Replace", "path": "active", "value": true},
+            ]}),
+        )
+        .await;
+    assert_eq!(reply.status, Status::Ok, "{}", reply.body);
+    assert_eq!(reply.json()["externalId"], json!("second"));
+    assert_eq!(reply.json()["active"], json!(true), "the membership was never revoked on the way through");
+
+    let stored = server.reload_membership(&membership.uuid, &org.uuid).await.expect("membership");
+    assert_eq!(stored.external_id.as_deref(), Some("second"));
+    assert!(stored.status > MembershipStatus::Revoked as i32);
+}
+
+// =============================================================================================
+// Rate-limit budgets
+// =============================================================================================
+//
+// Three budgets, and these tests are about which one a given request draws on. The counters come
+// from `settings::test_overrides` and are only readable under the exclusive settings lock, so no
+// other test can be incrementing them at the same time.
+
+#[rocket::async_test]
+async fn malformed_credentials_never_reach_the_provisioning_limiter_or_the_database() {
+    // Junk is settled from the request headers alone: the strict budget, and nothing else. Neither
+    // the provisioning budget nor the pre-verification budget is even consulted, and no key row is
+    // ever fetched.
+    let server = TestServer::with_exclusive_settings().await;
+    let (org, token) = server.org("acme").await;
+    let key_id = token.split('.').nth(1).unwrap().to_owned();
+    let secret = token.rsplit('.').next().unwrap().to_owned();
+
+    server.reset_counters();
+
+    let junk = [
+        String::new(),
+        "not-a-token".to_owned(),
+        format!("scim_v2.{key_id}.{secret}"),
+        format!("scim_v1.{key_id}"),
+        format!("scim_v1.{key_id}.{secret}.extra"),
+        format!("scim_v1..{secret}"),
+        format!("scim_v1.{key_id}."),
+        format!("scim_v1.not-a-uuid.{secret}"),
+        format!("scim_v1.{key_id}.short"),
+        format!("scim_v1.{key_id}.{secret}+"),
+    ];
+    for bad in &junk {
+        server.get(&users_url(&org), bad).await.assert_generic_bearer_challenge();
+    }
+    server.get_unauthenticated(&users_url(&org)).await.assert_generic_bearer_challenge();
+
+    assert_eq!(server.unauthenticated_checks(), junk.len() + 1, "every one is charged to the strict budget");
+    assert_eq!(server.provisioning_checks(), 0, "and none of them to the provisioning budget");
+    assert_eq!(server.pre_auth_checks(), 0, "nor to the pre-verification budget");
+    assert_eq!(server.key_lookups(), 0, "and none of them cost a database lookup");
+}
+
+#[rocket::async_test]
+async fn structurally_valid_junk_is_bounded_before_the_database_is_asked() {
+    // The gap this budget closes. A credential of the right shape cannot be told apart from a real
+    // one without an indexed lookup and a hash comparison, so before this the strict budget could
+    // only throttle the *next* attempt: every request of a spray still bought a database round trip
+    // on its way to a 429.
+    //
+    // With the pre-verification budget exhausted, the same requests cost nothing at all.
+    let server = TestServer::with_exclusive_settings().await;
+    let (org, token) = server.org("acme").await;
+    let key_id = token.split('.').nth(1).unwrap().to_owned();
+
+    // First, with budget: a valid-looking credential does reach the database and is rejected.
+    server.reset_counters();
+    let spray: Vec<String> = (0..5)
+        .map(|_| format!("scim_v1.{}.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", crate::util::get_uuid()))
+        .collect();
+    for credential in &spray {
+        server.get(&users_url(&org), credential).await.assert_generic_bearer_challenge();
+    }
+    assert_eq!(server.pre_auth_checks(), spray.len(), "each one is charged before the lookup");
+    assert_eq!(server.key_lookups(), spray.len(), "and each one costs exactly one lookup");
+    assert_eq!(server.unauthenticated_checks(), spray.len(), "the failures are still charged to the strict budget");
+
+    // Now exhaust it. The same requests -- and a real key id with a wrong secret, and even the
+    // organization's own valid token -- are refused without the database being asked at all.
+    server.set_pre_auth_rate_limit_exhausted(true);
+    server.reset_counters();
+
+    for credential in &spray {
+        server.get(&users_url(&org), credential).await.assert_error(Status::TooManyRequests, None);
+    }
+    server
+        .get(&users_url(&org), &format!("scim_v1.{key_id}.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"))
+        .await
+        .assert_error(Status::TooManyRequests, None);
+    server.get(&users_url(&org), &token).await.assert_error(Status::TooManyRequests, None);
+
+    assert_eq!(server.key_lookups(), 0, "nothing reached the database");
+    assert_eq!(server.provisioning_checks(), 0, "and a throttled request draws on no other budget");
+    assert_eq!(server.unauthenticated_checks(), 0, "including the strict one: a 429 is not an auth failure");
+}
+
+#[rocket::async_test]
+async fn a_malformed_credential_is_still_rejected_when_only_the_pre_verification_budget_is_gone() {
+    // The budgets stay separate in this direction too: exhausting the one that gates the database
+    // must not change how junk that never gets that far is answered.
+    let server = TestServer::with_exclusive_settings().await;
+    let (org, _token) = server.org("acme").await;
+
+    server.set_pre_auth_rate_limit_exhausted(true);
+    server.reset_counters();
+
+    server.get(&users_url(&org), "not-a-token").await.assert_generic_bearer_challenge();
+    assert_eq!(server.pre_auth_checks(), 0, "a malformed credential never reaches that budget");
+    assert_eq!(server.unauthenticated_checks(), 1);
+}
+
+#[rocket::async_test]
+async fn authenticated_traffic_is_charged_to_the_provisioning_budget_alone() {
+    let server = TestServer::with_exclusive_settings().await;
+    let (org, token) = server.org("acme").await;
+
+    server.reset_counters();
+    assert_eq!(server.get(&users_url(&org), &token).await.status, Status::Ok);
+
+    assert_eq!(server.provisioning_checks(), 1);
+    assert_eq!(server.unauthenticated_checks(), 0, "a request that authenticated is not an authentication failure");
+    assert_eq!(server.pre_auth_checks(), 1, "it is charged for the lookup it caused, like any other well-formed token");
+    assert_eq!(server.key_lookups(), 1);
+}
+
+#[rocket::async_test]
+async fn two_organizations_on_one_address_have_independent_provisioning_budgets() {
+    // Two tenants syncing through one NAT, proxy or Microsoft egress address is a normal
+    // deployment. Keyed by address alone -- what an earlier revision did -- organization A's burst
+    // would throttle organization B, and B's operator would have no way to see why.
+    let server = TestServer::with_exclusive_settings().await;
+    let (org_a, token_a) = server.org("acme").await;
+    let (org_b, token_b) = server.org("globex").await;
+
+    server.reset_counters();
+    assert_eq!(server.get(&users_url(&org_a), &token_a).await.status, Status::Ok);
+    assert_eq!(server.get(&users_url(&org_b), &token_b).await.status, Status::Ok);
+
+    // Both requests came from the same client address, and produced two different keys.
+    let keys = server.provisioning_keys();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0].1, keys[1].1, "the local client is one address");
+    assert_eq!(keys[0].0, org_a.uuid);
+    assert_eq!(keys[1].0, org_b.uuid);
+
+    // Exhausting one organization's budget leaves the other's untouched.
+    server.set_rate_limited_org(Some(&org_a.uuid));
+    server.get(&users_url(&org_a), &token_a).await.assert_error(Status::TooManyRequests, None);
+    assert_eq!(
+        server.get(&users_url(&org_b), &token_b).await.status,
+        Status::Ok,
+        "one tenant's burst must not throttle another on the same address"
+    );
+
+    // ...and the throttled organization is genuinely throttled, not merely slowed.
+    server.get(&users_url(&org_a), &token_a).await.assert_error(Status::TooManyRequests, None);
+}
+
+#[rocket::async_test]
+async fn the_provisioning_budget_is_keyed_by_the_authenticated_organization_not_the_url() {
+    // The organization in the URL is attacker-controlled until the token has proved it. Keying by
+    // it would let anyone mint limiter entries for organizations that do not exist, and would put a
+    // forged request in a real tenant's bucket.
+    let server = TestServer::with_exclusive_settings().await;
+    let (org, token) = server.org("acme").await;
+    let unknown = crate::util::get_uuid();
+
+    server.reset_counters();
+
+    // A valid token against somebody else's path is an authentication failure: it never reaches
+    // the provisioning budget, so no key is created for the path organization.
+    server.get(&format!("/scim/v2/{unknown}/Users"), &token).await.assert_generic_bearer_challenge();
+    assert!(server.provisioning_keys().is_empty(), "a failed request creates no provisioning key");
+
+    // The one key that does get created names the organization on the key row, paired with the
+    // address the request came from.
+    assert_eq!(server.get(&users_url(&org), &token).await.status, Status::Ok);
+    let keys = server.provisioning_keys();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].0, org.uuid, "the key names the organization the token authenticated, not the URL");
+}
+
+// =============================================================================================
+// WWW-Authenticate (RFC 6750 / RFC 7235)
+// =============================================================================================
+
+#[rocket::async_test]
+async fn every_401_carries_the_same_generic_bearer_challenge() {
+    // `/ServiceProviderConfig` advertises `oauthbearertoken` and points at RFC 6750, so a 401 owes
+    // the client a challenge. It must be the *same* challenge every time: a `realm` naming the
+    // organization, or an `error_description` naming the cause, would turn the header into the
+    // tenant-existence oracle the response body carefully is not.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (org_b, token_b) = server.org("globex").await;
+    let key_id = token.split('.').nth(1).unwrap();
+    let secret = token.rsplit('.').next().unwrap();
+    let unknown_org = crate::util::get_uuid();
+
+    let replies = vec![
+        // Missing Authorization.
+        server.get_unauthenticated(&users_url(&org)).await,
+        // Malformed token.
+        server.get(&users_url(&org), "not-a-token").await,
+        server.get(&users_url(&org), &format!("scim_v1.{key_id}")).await,
+        // Unknown key id, well-formed secret.
+        server.get(&users_url(&org), &format!("scim_v1.{}.{secret}", crate::util::get_uuid())).await,
+        // Real key, wrong secret.
+        server.get(&users_url(&org), &format!("scim_v1.{key_id}.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")).await,
+        // A valid token for the wrong organization.
+        server.get(&users_url(&org), &token_b).await,
+        // ...and the same token against an organization that does not exist at all.
+        server.get(&format!("/scim/v2/{unknown_org}/Users"), &token_b).await,
+        // Discovery is no different.
+        server.get_unauthenticated(&format!("/scim/v2/{}/ServiceProviderConfig", org_b.uuid)).await,
+    ];
+
+    for reply in &replies {
+        reply.assert_generic_bearer_challenge();
+        reply.assert_scim_content_type();
+        assert_eq!(reply.body, replies[0].body, "the bodies stay byte-identical too");
+        assert_eq!(
+            reply.www_authenticate.as_deref(),
+            Some("Bearer"),
+            "no realm, no error, no error_description: {:?}",
+            reply.www_authenticate
+        );
+    }
+}
+
+#[rocket::async_test]
+async fn responses_that_are_not_401_carry_no_challenge() {
+    // The header belongs to an authentication failure and nothing else. On a 403 or a 404 it would
+    // invite a client to retry with different credentials, which is not the problem.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, owner) = server.member(&org, "owner@example.test", MembershipType::Owner, true).await;
+
+    let ok = server.get(&users_url(&org), &token).await;
+    assert_eq!(ok.status, Status::Ok);
+    assert!(ok.www_authenticate.is_none());
+
+    let forbidden = server.delete(&format!("{}/{}", users_url(&org), owner.uuid), &token).await;
+    forbidden.assert_error(Status::Forbidden, None);
+    assert!(forbidden.www_authenticate.is_none());
+
+    let missing = server.get(&format!("{}/nope", users_url(&org)), &token).await;
+    missing.assert_error(Status::NotFound, None);
+    assert!(missing.www_authenticate.is_none());
+}
+
+// =============================================================================================
+// emails value paths (RFC 7644 section 3.5.2, Microsoft Entra ID)
+// =============================================================================================
+//
+// Entra documents `emails[type eq "work" and primary eq true].value`. This server renders exactly
+// one virtual element -- `{"value": <account email>, "type": "work", "primary": true}` -- so the
+// selector has a definite answer, and the sub-attribute decides what the operation means.
+
+#[rocket::async_test]
+async fn the_entra_email_value_path_asserts_the_account_address() {
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, membership) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
+    let path = format!("{}/{}", users_url(&org), membership.uuid);
+
+    // The address that is already there: the no-op an identity provider sends on every sync.
+    for selector in [
+        r#"emails[type eq "work" and primary eq true].value"#,
+        r#"emails[type eq "work"].value"#,
+        "emails[primary eq true].value",
+        r#"emails[value eq "alice@example.test"].value"#,
+    ] {
+        let reply = server
+            .patch(
+                &path,
+                &token,
+                json!({"Operations": [{"op": "Replace", "path": selector, "value": "alice@example.test"}]}),
+            )
+            .await;
+        assert_eq!(reply.status, Status::Ok, "{selector} should be a no-op: {}", reply.body);
+    }
+
+    // A different address through the same path is still an account rename, and still refused.
+    server
+        .patch(
+            &path,
+            &token,
+            json!({"Operations": [{
+                "op": "Replace",
+                "path": r#"emails[type eq "work" and primary eq true].value"#,
+                "value": "attacker@evil.test",
+            }]}),
+        )
+        .await
+        .assert_error(Status::BadRequest, Some("mutability"));
+
+    assert!(User::find_by_mail("attacker@evil.test", &server.conn().await).await.is_none());
+}
+
+#[rocket::async_test]
+async fn an_email_selector_that_matches_nothing_is_a_no_target() {
+    // RFC 7644 sections 3.5.2.2 and 3.5.2.3. An earlier revision treated every path whose base was
+    // `emails` as the same assertion, so `emails[type eq "home"].value` quietly became a write to
+    // the work address -- the selector was parsed and then ignored.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, membership) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
+    let path = format!("{}/{}", users_url(&org), membership.uuid);
+
+    for selector in [
+        // Wrong type.
+        r#"emails[type eq "home"].value"#,
+        r#"emails[type eq "other"].value"#,
+        // Not the primary element.
+        "emails[primary eq false].value",
+        r#"emails[type eq "work" and primary eq false].value"#,
+        // A value that is not this account's address.
+        r#"emails[value eq "someone@else.test"].value"#,
+        // A conjunction where only one half matches.
+        r#"emails[type eq "home" and primary eq true].value"#,
+    ] {
+        for op in ["Replace", "Add", "Remove"] {
+            server
+                .patch(
+                    &path,
+                    &token,
+                    json!({"Operations": [{"op": op, "path": selector, "value": "alice@example.test"}]}),
+                )
+                .await
+                .assert_error(Status::BadRequest, Some("noTarget"));
+        }
+    }
+}
+
+#[rocket::async_test]
+async fn the_derived_parts_of_an_email_cannot_be_changed() {
+    // `type` and `primary` are published `readOnly` -- this server derives both as `"work"` and
+    // `true`. They follow the same three-outcome rule as the other unwritable attributes here:
+    // re-asserting the derived value is the no-op a client sending the whole element performs, and
+    // anything else is a `mutability` fault.
+    //
+    // Accepting a write to either as if it were `.value`, which is what ignoring the sub-attribute
+    // amounted to, turned `emails[...].type = "someone@else"` into an account rename attempt.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (user, membership) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
+    let path = format!("{}/{}", users_url(&org), membership.uuid);
+
+    for (selector, value) in [
+        (r#"emails[type eq "work" and primary eq true].type"#, json!("home")),
+        (r#"emails[type eq "work"].primary"#, json!(false)),
+        // ...including an address smuggled in through the read-only sub-attribute.
+        (r#"emails[type eq "work"].type"#, json!("attacker@evil.test")),
+        // ...and without a selector at all.
+        ("emails.type", json!("home")),
+        ("emails.primary", json!(false)),
+    ] {
+        server
+            .patch(&path, &token, json!({"Operations": [{"op": "Replace", "path": selector, "value": value}]}))
+            .await
+            .assert_error(Status::BadRequest, Some("mutability"));
+    }
+
+    // Re-asserting what the server already renders is accepted, so a client echoing the element
+    // back does not fail over an attribute it could not have sent differently.
+    for (selector, value) in [
+        (r#"emails[type eq "work" and primary eq true].type"#, json!("work")),
+        (r#"emails[type eq "work"].primary"#, json!(true)),
+        ("emails.type", json!("work")),
+    ] {
+        let reply = server
+            .patch(&path, &token, json!({"Operations": [{"op": "Replace", "path": selector, "value": value}]}))
+            .await;
+        assert_eq!(reply.status, Status::Ok, "{selector} should be a no-op: {}", reply.body);
+    }
+
+    let stored = User::find_by_uuid(&user.uuid, &server.conn().await).await.expect("account");
+    assert_eq!(stored.email, "alice@example.test", "nothing was renamed");
+    assert!(User::find_by_mail("attacker@evil.test", &server.conn().await).await.is_none());
+}
+
+#[rocket::async_test]
+async fn an_email_value_selection_must_be_a_single_value_path() {
+    // A PATCH path is split on the first `[` and the last `]`, so the selector text can carry
+    // brackets of its own. `emails[type eq "home"] or emails[type eq "work"].value` would otherwise
+    // parse into a disjunction and select the element through a clause the client never targeted.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, membership) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
+    let path = format!("{}/{}", users_url(&org), membership.uuid);
+
+    for selector in [
+        r#"emails[type eq "home"] or emails[type eq "work"].value"#,
+        r#"emails[type eq "home"] or userName eq "alice@example.test"].value"#,
+    ] {
+        server
+            .patch(
+                &path,
+                &token,
+                json!({"Operations": [{"op": "Replace", "path": selector, "value": "alice@example.test"}]}),
+            )
+            .await
+            .assert_error(Status::BadRequest, Some("invalidPath"));
+    }
+}
+
+#[rocket::async_test]
+async fn an_explicit_email_value_path_needs_an_address() {
+    // Skipping a `.value` write whose value carries no address would report success for a write
+    // that did nothing, which is how a broken attribute mapping goes unnoticed.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, membership) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
+    let path = format!("{}/{}", users_url(&org), membership.uuid);
+
+    for value in [json!(123), json!(true), Value::Null, json!({"type": "work"})] {
+        server
+            .patch(
+                &path,
+                &token,
+                json!({"Operations": [{
+                    "op": "Replace",
+                    "path": r#"emails[type eq "work"].value"#,
+                    "value": value,
+                }]}),
+            )
+            .await
+            .assert_error(Status::BadRequest, Some("invalidValue"));
+    }
+
+    // A bare `emails` path stays lenient: an element without a `value` asserts no identity at all.
+    let lenient = server
+        .patch(&path, &token, json!({"Operations": [{"op": "Replace", "path": "emails", "value": [{"type": "work"}]}]}))
+        .await;
+    assert_eq!(lenient.status, Status::Ok, "{}", lenient.body);
+}
+
+#[rocket::async_test]
+async fn an_unknown_email_sub_attribute_is_an_invalid_path() {
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, membership) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
+    let path = format!("{}/{}", users_url(&org), membership.uuid);
+
+    for selector in [r#"emails[type eq "work"].nonsense"#, "emails.nonsense", r#"emails[type eq "work"].value.extra"#] {
+        server
+            .patch(&path, &token, json!({"Operations": [{"op": "Replace", "path": selector, "value": "x"}]}))
+            .await
+            .assert_error(Status::BadRequest, Some("invalidPath"));
+    }
+}
+
+#[rocket::async_test]
+async fn a_malformed_or_arbitrary_email_selector_is_an_invalid_path() {
+    // `emails[whatever eq "x"]` must not be quietly treated as the real element. The selector goes
+    // through the validated filter parser, which knows this resource type's attributes, so an
+    // attribute that is not one of them is a client error rather than a silent match.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, membership) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
+    let path = format!("{}/{}", users_url(&org), membership.uuid);
+
+    for selector in [
+        r#"emails[whatever eq "x"].value"#,
+        r#"emails[userName eq "alice@example.test"].value"#,
+        "emails[type eq].value",
+        r#"emails[type "work"].value"#,
+        "emails[].value",
+        r#"emails[primary co "true"].value"#,
+    ] {
+        let reply = server
+            .patch(
+                &path,
+                &token,
+                json!({"Operations": [{"op": "Replace", "path": selector, "value": "alice@example.test"}]}),
+            )
+            .await;
+        assert_eq!(reply.status, Status::BadRequest, "{selector} should be refused: {}", reply.body);
+        assert_eq!(
+            reply.json()["scimType"],
+            json!("invalidPath"),
+            "{selector} must not be read as the real email element: {}",
+            reply.body
+        );
+    }
+}
+
+#[rocket::async_test]
+async fn an_extension_namespaced_email_path_is_ignored_not_applied() {
+    // The namespace rule and the value-path rule have to compose. An extension attribute whose last
+    // segment is `emails` is not this server's `emails`, brackets or no brackets, so it is ignored
+    // rather than evaluated -- and certainly not treated as an assertion about the account email.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (user, membership) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
+    let path = format!("{}/{}", users_url(&org), membership.uuid);
+
+    for selector in [
+        r#"urn:example:Custom:emails[type eq "work"].value"#,
+        "urn:example:Custom:emails.value",
+        r#"urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:emails[type eq "home"].value"#,
+    ] {
+        let reply = server
+            .patch(
+                &path,
+                &token,
+                json!({"Operations": [{"op": "Replace", "path": selector, "value": "attacker@evil.test"}]}),
+            )
+            .await;
+        assert_eq!(reply.status, Status::Ok, "{selector} should be ignored: {}", reply.body);
+    }
+
+    // The core-qualified spelling, by contrast, *is* the real attribute and follows the real rules.
+    server
+        .patch(
+            &path,
+            &token,
+            json!({"Operations": [{
+                "op": "Replace",
+                "path": r#"urn:ietf:params:scim:schemas:core:2.0:User:emails[type eq "work"].value"#,
+                "value": "attacker@evil.test",
+            }]}),
+        )
+        .await
+        .assert_error(Status::BadRequest, Some("mutability"));
+
+    let stored = User::find_by_uuid(&user.uuid, &server.conn().await).await.expect("account");
+    assert_eq!(stored.email, "alice@example.test");
+    assert!(User::find_by_mail("attacker@evil.test", &server.conn().await).await.is_none());
+}
+
+#[rocket::async_test]
+async fn a_simple_attribute_has_no_sub_attribute() {
+    // `active` is a boolean, not a complex attribute. Ignoring the sub-attribute and writing the
+    // parent would let `active.whatever` deprovision somebody through a path this schema does not
+    // define.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (_, membership) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
+    let path = format!("{}/{}", users_url(&org), membership.uuid);
+
+    for selector in ["active.whatever", "externalId.value", "userName.value", "displayName.formatted"] {
+        server
+            .patch(&path, &token, json!({"Operations": [{"op": "Replace", "path": selector, "value": false}]}))
+            .await
+            .assert_error(Status::BadRequest, Some("invalidPath"));
+    }
+
+    let stored = server.reload_membership(&membership.uuid, &org.uuid).await.expect("membership");
+    assert!(stored.status > MembershipStatus::Revoked as i32, "nothing was deprovisioned");
+}
+
+// =============================================================================================
+// name.* is input compatibility, not schema support
+// =============================================================================================
+
+#[rocket::async_test]
+async fn name_parts_name_a_new_account_and_nothing_else() {
+    // The deliberate policy: `POST` accepts `name.*` as a fallback so an identity provider that
+    // maps only `name` still creates a usefully named account, and no other operation looks at it.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+
+    let created = server
+        .post(
+            &users_url(&org),
+            &token,
+            json!({"userName": "formatted@example.test", "name": {"formatted": "Alice Example"}}),
+        )
+        .await;
+    assert_eq!(created.status, Status::Created, "{}", created.body);
+    assert_eq!(created.json()["displayName"], json!("Alice Example"));
+    assert_eq!(
+        User::find_by_mail("formatted@example.test", &server.conn().await).await.expect("account").name,
+        "Alice Example"
+    );
+
+    // givenName/familyName are joined when there is no `formatted`.
+    let joined = server
+        .post(
+            &users_url(&org),
+            &token,
+            json!({"userName": "joined@example.test", "name": {"givenName": "Bob", "familyName": "Builder"}}),
+        )
+        .await;
+    assert_eq!(joined.status, Status::Created, "{}", joined.body);
+    assert_eq!(joined.json()["displayName"], json!("Bob Builder"));
+
+    // `displayName` still wins over `name` when both are sent.
+    let both = server
+        .post(
+            &users_url(&org),
+            &token,
+            json!({
+                "userName": "both@example.test",
+                "displayName": "From displayName",
+                "name": {"formatted": "From name"},
+            }),
+        )
+        .await;
+    assert_eq!(both.status, Status::Created, "{}", both.body);
+    assert_eq!(both.json()["displayName"], json!("From displayName"));
+
+    // ...and `name` is never echoed back: it is not an attribute of this resource.
+    assert!(created.json().get("name").is_none(), "an unsupported attribute must not appear in the representation");
+}
+
+#[rocket::async_test]
+async fn name_parts_are_ignored_on_an_account_that_already_exists() {
+    // The inconsistency this fixes. `PUT` used to fall back from `displayName` to `name.formatted`
+    // and then assert the result against the stored account name, so an identity provider that
+    // mapped `name` -- and whose `name` differed from the account's -- got a `mutability` fault
+    // about `displayName`, an attribute it had never sent. `PATCH` had always ignored `name`. Now
+    // both ignore it.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let (user, membership) = server.member(&org, "alice@example.test", MembershipType::User, true).await;
+    let path = format!("{}/{}", users_url(&org), membership.uuid);
+
+    let put = server
+        .put(
+            &path,
+            &token,
+            json!({
+                "userName": "alice@example.test",
+                "name": {"formatted": "Someone Else", "givenName": "Someone", "familyName": "Else"},
+                "active": true,
+            }),
+        )
+        .await;
+    assert_eq!(put.status, Status::Ok, "an unsupported attribute must not fail the request: {}", put.body);
+
+    let patched = server
+        .patch(
+            &path,
+            &token,
+            json!({"Operations": [
+                {"op": "Replace", "path": "name.formatted", "value": "Someone Else"},
+                {"op": "Replace", "value": {"name": {"givenName": "Someone"}}},
+            ]}),
+        )
+        .await;
+    assert_eq!(patched.status, Status::Ok, "{}", patched.body);
+
+    let stored = User::find_by_uuid(&user.uuid, &server.conn().await).await.expect("account");
+    assert_eq!(stored.name, "alice@example.test", "the account name is untouched by either verb");
+
+    // `displayName` itself is still asserted, so the immutability rule has not been weakened.
+    server
+        .put(&path, &token, json!({"userName": "alice@example.test", "displayName": "Someone Else"}))
+        .await
+        .assert_error(Status::BadRequest, Some("mutability"));
+}
+
+#[rocket::async_test]
+async fn name_is_not_advertised_as_a_supported_attribute() {
+    // Discovery is the statement of the policy: `name` is not part of this resource, which is why
+    // no operation on an existing account reinterprets it.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+
+    let schema =
+        server.get(&format!("/scim/v2/{}/Schemas/urn:ietf:params:scim:schemas:core:2.0:User", org.uuid), &token).await;
+    let names: Vec<String> = schema.json()["attributes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["name"].as_str().unwrap().to_owned())
+        .collect();
+
+    assert!(!names.iter().any(|n| n == "name"), "published attributes were {names:?}");
+    assert!(names.iter().any(|n| n == "displayName"), "but displayName is published: {names:?}");
+}
+
+// =============================================================================================
+// Discovery: /Schemas completeness
+// =============================================================================================
+
+#[rocket::async_test]
+async fn schemas_publishes_every_schema_the_server_uses() {
+    // RFC 7643 section 7: "For every schema URI used in a resource object, there is a corresponding
+    // 'Schema' resource." The three discovery resources announce their own URNs, so they need their
+    // own definitions -- which RFC 7643 section 8.7.2 provides.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+
+    let listed = server.get(&format!("/scim/v2/{}/Schemas", org.uuid), &token).await;
+    listed.assert_scim_content_type();
+    let body = listed.json();
+
+    let ids: HashSet<String> =
+        body["Resources"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap().to_owned()).collect();
+
+    let expected: HashSet<String> = [
+        "urn:ietf:params:scim:schemas:core:2.0:User",
+        "urn:ietf:params:scim:schemas:core:2.0:Group",
+        "urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig",
+        "urn:ietf:params:scim:schemas:core:2.0:ResourceType",
+        "urn:ietf:params:scim:schemas:core:2.0:Schema",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+
+    assert_eq!(ids, expected);
+    assert_eq!(body["totalResults"], json!(5));
+    assert_eq!(body["itemsPerPage"], json!(5));
+
+    // Every one of them announces itself as a Schema resource and is fetchable at its own location.
+    for schema in body["Resources"].as_array().unwrap() {
+        assert_eq!(schema["schemas"], json!(["urn:ietf:params:scim:schemas:core:2.0:Schema"]), "{schema}");
+        assert_eq!(schema["meta"]["resourceType"], json!("Schema"), "{schema}");
+        assert!(schema["attributes"].as_array().is_some_and(|a| !a.is_empty()), "{schema}");
+    }
+}
+
+#[rocket::async_test]
+async fn every_published_schema_resolves_by_direct_lookup() {
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let base = format!("/scim/v2/{}", org.uuid);
+
+    let listed = server.get(&format!("{base}/Schemas"), &token).await.json();
+    for schema in listed["Resources"].as_array().unwrap() {
+        let id = schema["id"].as_str().unwrap();
+        let direct = server.get(&format!("{base}/Schemas/{id}"), &token).await;
+
+        assert_eq!(direct.status, Status::Ok, "{id}: {}", direct.body);
+        assert_eq!(direct.json(), *schema, "the listing and the direct lookup must agree for {id}");
+        direct.assert_content_location_matches_meta();
+
+        // URNs are case-insensitive, and the ResourceTypes lookup beside this one already is.
+        let upper = server.get(&format!("{base}/Schemas/{}", id.to_uppercase()), &token).await;
+        assert_eq!(upper.status, Status::Ok, "{id} should resolve however it is spelled: {}", upper.body);
+    }
+}
+
+#[rocket::async_test]
+async fn an_unknown_schema_is_a_404() {
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let base = format!("/scim/v2/{}", org.uuid);
+
+    for unknown in [
+        "urn:made:up",
+        // Real SCIM URNs this server does not publish, because they are protocol messages rather
+        // than resources.
+        "urn:ietf:params:scim:api:messages:2.0:ListResponse",
+        "urn:ietf:params:scim:api:messages:2.0:PatchOp",
+        "urn:ietf:params:scim:api:messages:2.0:Error",
+        // An extension this server does not implement.
+        "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User",
+    ] {
+        server.get(&format!("{base}/Schemas/{unknown}"), &token).await.assert_error(Status::NotFound, None);
+    }
+}
+
+#[rocket::async_test]
+async fn the_group_schema_disappears_with_groups() {
+    // A schema for an endpoint that answers 501 is an advertisement for something that does not
+    // work, exactly as the resource type would be.
+    let server = TestServer::with_exclusive_settings().await;
+    let (org, token) = server.org("acme").await;
+    let base = format!("/scim/v2/{}", org.uuid);
+
+    server.set_groups_enabled(false);
+
+    let listed = server.get(&format!("{base}/Schemas"), &token).await.json();
+    let ids: Vec<String> =
+        listed["Resources"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap().to_owned()).collect();
+
+    assert!(!ids.iter().any(|id| id == "urn:ietf:params:scim:schemas:core:2.0:Group"), "{ids:?}");
+    assert!(ids.iter().any(|id| id == "urn:ietf:params:scim:schemas:core:2.0:User"), "{ids:?}");
+    assert_eq!(listed["totalResults"], json!(4));
+
+    server
+        .get(&format!("{base}/Schemas/urn:ietf:params:scim:schemas:core:2.0:Group"), &token)
+        .await
+        .assert_error(Status::NotFound, None);
+
+    // The other four are unaffected.
+    for id in &ids {
+        assert_eq!(server.get(&format!("{base}/Schemas/{id}"), &token).await.status, Status::Ok, "{id}");
+    }
+}
+
+#[rocket::async_test]
+async fn the_group_member_reference_advertises_only_what_it_accepts() {
+    // Nested groups are not implemented: a Group id sent as a member is refused as a member that is
+    // not in the organization. `referenceTypes: ["User", "Group"]` -- the stock RFC value -- would
+    // invite exactly the request this server rejects.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+
+    let schema = server
+        .get(&format!("/scim/v2/{}/Schemas/urn:ietf:params:scim:schemas:core:2.0:Group", org.uuid), &token)
+        .await
+        .json();
+    let members = schema_attribute(&schema, "members");
+
+    let reference = sub_attribute(members, "$ref");
+    assert_eq!(reference["type"], json!("reference"));
+    assert_eq!(reference["referenceTypes"], json!(["User"]), "no nested groups: {reference}");
+    assert_eq!(sub_attribute(members, "type")["canonicalValues"], json!(["User"]));
+
+    // And the behaviour the advertisement describes: a group id is not a member.
+    let group = server.group(&org, "Eng", None).await;
+    let other = server.group(&org, "Other", None).await;
+    server
+        .patch(
+            &format!("{}/{}", groups_url(&org), group.uuid),
+            &token,
+            json!({"Operations": [{"op": "Add", "path": "members", "value": [{"value": other.uuid}]}]}),
+        )
+        .await
+        .assert_error(Status::BadRequest, Some("invalidValue"));
+}
+
+#[rocket::async_test]
+async fn the_discovery_schemas_describe_what_discovery_actually_emits() {
+    // A schema that does not match its own resource is worse than no schema: it tells a client to
+    // expect fields that are not there. These check the three definitions against the documents the
+    // very same server returns.
+    /// Every top-level attribute name a schema publishes.
+    fn published(schema: &Value) -> HashSet<String> {
+        schema["attributes"].as_array().unwrap().iter().map(|a| a["name"].as_str().unwrap().to_owned()).collect()
+    }
+
+    /// Every key a resource emits, minus the ones every resource has.
+    fn emitted(resource: &Value) -> HashSet<String> {
+        resource
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|k| !matches!(k.as_str(), "schemas" | "id" | "meta"))
+            .cloned()
+            .collect()
+    }
+
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+    let base = format!("/scim/v2/{}", org.uuid);
+
+    let config_schema = server
+        .get(&format!("{base}/Schemas/urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig"), &token)
+        .await
+        .json();
+    let config = server.get(&format!("{base}/ServiceProviderConfig"), &token).await.json();
+    assert!(
+        emitted(&config).is_subset(&published(&config_schema)),
+        "emitted {:?} vs published {:?}",
+        emitted(&config),
+        published(&config_schema)
+    );
+    assert!(published(&config_schema).contains("etag"), "the server emits `etag`, so the schema has to describe it");
+
+    let type_schema =
+        server.get(&format!("{base}/Schemas/urn:ietf:params:scim:schemas:core:2.0:ResourceType"), &token).await.json();
+    let types = server.get(&format!("{base}/ResourceTypes"), &token).await.json();
+    for resource_type in types["Resources"].as_array().unwrap() {
+        assert!(
+            emitted(resource_type).is_subset(&published(&type_schema)),
+            "emitted {:?} vs published {:?}",
+            emitted(resource_type),
+            published(&type_schema)
+        );
+    }
+
+    let schema_schema =
+        server.get(&format!("{base}/Schemas/urn:ietf:params:scim:schemas:core:2.0:Schema"), &token).await.json();
+    let published_here = published(&schema_schema);
+    for schema in server.get(&format!("{base}/Schemas"), &token).await.json()["Resources"].as_array().unwrap() {
+        assert!(
+            emitted(schema).is_subset(&published_here),
+            "emitted {:?} vs published {published_here:?}",
+            emitted(schema)
+        );
+    }
+}
+
+// =============================================================================================
+// Query parameters on writes
+// =============================================================================================
+
+#[rocket::async_test]
+async fn unknown_query_parameters_on_a_write_are_ignored_not_rejected() {
+    // Documenting Rocket 0.5's actual behaviour rather than an assumption about it. Query parsing
+    // is lenient: a field the handler's query type does not declare is skipped. RFC 7644 defines
+    // no error for an unrecognised query parameter either, and identity providers do append their
+    // own, so nothing here tries to be stricter -- but the comment next to `ProjectionQuery` used
+    // to claim these were rejected, which they never were.
+    let server = TestServer::new().await;
+    let (org, token) = server.org("acme").await;
+
+    let created = server
+        .post(
+            &format!("{}?filter=userName%20eq%20%22x%22&startIndex=5&count=99&unknown=1", users_url(&org)),
+            &token,
+            json!({"userName": "querystring@example.test"}),
+        )
+        .await;
+    assert_eq!(created.status, Status::Created, "unknown query parameters must not fail a write: {}", created.body);
+    assert_eq!(created.json()["userName"], json!("querystring@example.test"));
+
+    let path = format!("{}/{}", users_url(&org), created.json()["id"].as_str().unwrap());
+
+    // ...and the projection parameters that *are* declared still work alongside them.
+    let projected = server
+        .patch(
+            &format!("{path}?attributes=userName&filter=nonsense&count=abc"),
+            &token,
+            json!({"Operations": [{"op": "Replace", "path": "externalId", "value": "ext-1"}]}),
+        )
+        .await;
+    assert_eq!(projected.status, Status::Ok, "{}", projected.body);
+    assert_eq!(projected.json()["userName"], json!("querystring@example.test"));
+    assert!(projected.json().get("externalId").is_none(), "the declared projection was applied: {}", projected.body);
+
+    // On a *list* endpoint the same names are real parameters, and are still validated.
+    server
+        .get(&format!("{}?count=abc", users_url(&org)), &token)
+        .await
+        .assert_error(Status::BadRequest, Some("invalidValue"));
 }

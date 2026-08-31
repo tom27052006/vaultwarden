@@ -241,8 +241,15 @@ pub const MAX_PAGE_SIZE: usize = 500;
 /// The projection parameters, which RFC 7644 section 3.9 allows on **every** operation that
 /// returns a resource representation -- `POST` and `PUT` and `PATCH` as much as `GET`.
 ///
-/// Kept separate from [`ListQuery`] so a `POST` does not silently accept `filter`, `startIndex`
-/// or `count`, none of which mean anything there.
+/// Kept separate from [`ListQuery`] because `filter`, `startIndex` and `count` mean nothing on a
+/// write, so there is nothing for a write handler to read them into.
+///
+/// That is a statement about what the handler *uses*, not about what the server rejects. Rocket
+/// 0.5 parses query strings leniently: a field this struct does not declare is skipped, so
+/// `POST /Users?filter=x&count=99` is accepted and the two unknown parameters are ignored. That is
+/// also the RFC's position -- section 3.4.2 defines no error for an unrecognised query parameter,
+/// and identity providers do append their own -- so nothing here tries to be stricter. The
+/// behaviour is pinned by a route-level test in `e2e.rs` rather than left to be rediscovered.
 #[derive(FromForm)]
 pub struct ProjectionQuery {
     pub attributes: Option<String>,

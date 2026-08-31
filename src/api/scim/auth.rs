@@ -16,18 +16,25 @@
 //!
 //! # Rate limiting
 //!
-//! Two budgets, charged by *outcome* rather than by arrival:
+//! Three budgets. Two of them are charged by *outcome* rather than by arrival, and the third
+//! bounds the work a request may cost before its outcome is even known:
 //!
 //! 1. Anything that fails to authenticate -- no `Authorization` header, a non-Bearer scheme, a
 //!    token that is not the right shape, an unknown key id, a wrong secret -- is charged to the
 //!    strict unauthenticated limiter.
-//! 2. Only a request that actually authenticated is charged to the generous SCIM provisioning
-//!    limiter.
+//! 2. A token of the right *shape* is charged to the pre-verification limiter **before** the key
+//!    row is fetched. Shape alone cannot tell a real credential from a forged one, so recognising
+//!    a wrong secret costs one indexed lookup and a hash comparison; without this budget an
+//!    attacker who had already exhausted (1) could keep paying for that lookup on every request,
+//!    because the `429` would only be decided afterwards.
+//! 3. Only a request that actually authenticated is charged to the generous SCIM provisioning
+//!    limiter, keyed by the authenticated organization as well as the client address so one
+//!    tenant's burst cannot throttle another tenant syncing from the same address.
 //!
-//! That is what makes the two budgets independent: a flood of junk cannot consume the allowance a
+//! That is what makes the budgets independent: a flood of junk cannot consume the allowance a
 //! real directory sync needs, and a saturated provisioning budget does not stop the server from
 //! rejecting junk. The shape checks in [`parse_token`] mean most junk is rejected from the request
-//! headers alone, without a database lookup.
+//! headers alone, without touching a limiter that matters or a database lookup.
 
 use std::{net::IpAddr, sync::LazyLock};
 
@@ -71,13 +78,28 @@ struct ParsedToken {
     secret: String,
 }
 
-/// Is this the shape of a key id this server issues?
+/// Canonicalise a key id, or reject it as not the shape this server issues.
 ///
-/// Key ids come from `util::get_uuid()`, so a hyphenated lower-case UUID. Checking the shape does
-/// not make the key id trusted -- it is a lookup handle either way -- it just means a credential
-/// that cannot possibly match a row this server wrote is rejected without a database round trip.
-fn is_key_id_shape(raw: &str) -> bool {
-    uuid::Uuid::try_parse(raw).is_ok_and(|_| raw.len() == 36)
+/// Key ids come from `util::get_uuid()`, so the stored value is always a hyphenated lower-case
+/// UUID. Only the hyphenated form is accepted -- the braced, URN and unhyphenated spellings
+/// `Uuid::try_parse` also understands are not what this server hands out -- and a valid one is
+/// returned in canonical lower case.
+///
+/// The normalisation matters because the comparison is the database's, not Rust's: `TEXT`
+/// equality is case-sensitive on SQLite and PostgreSQL but case-insensitive under MySQL's default
+/// collation. Without it an upper-case UUID would authenticate on one backend and be a guaranteed
+/// miss on the others, from the same token. Normalising makes the answer the same everywhere and
+/// changes no token semantics: a UUID is the same identifier however it is capitalised.
+///
+/// Checking the shape does not make the key id trusted -- it is a lookup handle either way -- it
+/// just means a credential that cannot possibly match a row this server wrote is rejected without
+/// a database round trip.
+fn canonical_key_id(raw: &str) -> Option<String> {
+    if raw.len() != 36 {
+        return None;
+    }
+    let parsed = uuid::Uuid::try_parse(raw).ok()?;
+    Some(parsed.hyphenated().to_string())
 }
 
 /// Is this the shape of a secret this server issues?
@@ -108,12 +130,13 @@ fn parse_token(raw: &str) -> Option<ParsedToken> {
     if parts.next().is_some() {
         return None;
     }
-    if prefix != SCIM_TOKEN_PREFIX || !is_key_id_shape(key_id) || !is_secret_shape(secret) {
+    if prefix != SCIM_TOKEN_PREFIX || !is_secret_shape(secret) {
         return None;
     }
+    let key_id = canonical_key_id(key_id)?;
 
     Some(ParsedToken {
-        key_id: ScimKeyId::from(key_id.to_owned()),
+        key_id: ScimKeyId::from(key_id),
         secret: secret.to_owned(),
     })
 }
@@ -143,6 +166,14 @@ fn reject_unauthenticated(ip: &IpAddr) -> Outcome<ScimToken, ()> {
         return Outcome::Error((Status::TooManyRequests, ()));
     }
     Outcome::Error((Status::Unauthorized, ()))
+}
+
+/// Reject a request that is throttled, without charging it to any other budget.
+///
+/// A `429` is not an authentication failure and must not deplete the strict budget as well: doing
+/// so would let a client that is already being throttled push a second budget down with it.
+fn reject_throttled() -> Outcome<ScimToken, ()> {
+    Outcome::Error((Status::TooManyRequests, ()))
 }
 
 #[rocket::async_trait]
@@ -175,12 +206,22 @@ impl<'r> FromRequest<'r> for ScimToken {
             return reject_unauthenticated(&ip);
         };
 
+        // The token is the right shape, which is as far as the request headers can settle it: a
+        // forged credential of the right shape is indistinguishable from a real one until the row
+        // is fetched and the secret compared. This budget is what bounds that cost, so it is
+        // checked *before* the database is touched rather than after -- otherwise every request of
+        // a credential spray would still buy an indexed lookup on its way to a `429`.
+        if super::settings::check_pre_auth_rate_limit(&ip).is_err() {
+            return reject_throttled();
+        }
+
         let Outcome::Success(conn) = DbConn::from_request(request).await else {
             error!(target: "scim", "Could not get a database connection while authenticating a SCIM request");
             return Outcome::Error((Status::InternalServerError, ()));
         };
 
         let org_id: OrganizationId = path_org_id.to_owned().into();
+        super::settings::note_key_lookup();
         let key = OrganizationScimKey::find_by_uuid_and_org(&parsed.key_id, &org_id, &conn).await;
 
         let authenticated = if let Some(key) = &key {
@@ -199,10 +240,12 @@ impl<'r> FromRequest<'r> for ScimToken {
             return reject_unauthenticated(&ip);
         };
 
-        // Authenticated: only now may this request draw on the provisioning budget. Checked
-        // before `touch_last_used`, so a throttled request writes nothing.
-        if super::settings::check_rate_limit(&ip).is_err() {
-            return Outcome::Error((Status::TooManyRequests, ()));
+        // Authenticated: only now may this request draw on the provisioning budget. Keyed by the
+        // organization on the *key row* -- never the one in the URL, which is only as trustworthy
+        // as the token that just proved it. Checked before `touch_last_used`, so a throttled
+        // request writes nothing.
+        if super::settings::check_rate_limit(&key.org_uuid, &ip).is_err() {
+            return reject_throttled();
         }
 
         if key.last_used_at.is_none_or(|last| Utc::now().naive_utc() - last > LAST_USED_REFRESH) {
@@ -309,6 +352,48 @@ mod tests {
             "../../../etc/passwd",
         ] {
             assert!(parse_token(&format!("{SCIM_TOKEN_PREFIX}.{bad}.{SECRET}")).is_none(), "{bad} should be rejected");
+        }
+    }
+
+    // -- key-id canonicalisation ------------------------------------------------------------------
+    //
+    // The stored key id is always a hyphenated lower-case UUID, and the comparison that matters is
+    // the database's. `TEXT` equality is case-sensitive on SQLite and PostgreSQL and
+    // case-insensitive under MySQL's default collation, so an upper-case UUID that reached the
+    // query verbatim would authenticate on one backend and miss on the others -- from the same
+    // token. These tests pin the normalisation rather than any one backend's collation.
+
+    #[test]
+    fn a_key_id_is_normalised_to_the_form_the_database_holds() {
+        let parsed = parse_token(&format!("{SCIM_TOKEN_PREFIX}.{}.{SECRET}", KEY_ID.to_uppercase())).expect("parses");
+
+        assert_eq!(*parsed.key_id, KEY_ID, "an upper-case UUID queries as the lower-case one this server stored");
+    }
+
+    #[test]
+    fn a_mixed_case_key_id_is_the_same_identifier() {
+        let mixed = "6F0f9D1a-2b3C-4d5E-8f90-1A2b3C4d5E6f";
+        assert!(mixed.chars().any(|c| c.is_ascii_uppercase()));
+
+        let parsed = parse_token(&format!("{SCIM_TOKEN_PREFIX}.{mixed}.{SECRET}")).expect("parses");
+        assert_eq!(*parsed.key_id, KEY_ID);
+    }
+
+    #[test]
+    fn a_canonical_key_id_is_carried_through_unchanged() {
+        assert_eq!(canonical_key_id(KEY_ID).as_deref(), Some(KEY_ID));
+    }
+
+    #[test]
+    fn canonicalisation_never_widens_the_accepted_shape() {
+        // Normalising the case must not smuggle in the other spellings `Uuid::try_parse` accepts:
+        // this server issues the hyphenated form and nothing else.
+        for bad in [
+            "6F0F9D1A2B3C4D5E8F901A2B3C4D5E6F",
+            "{6F0F9D1A-2B3C-4D5E-8F90-1A2B3C4D5E6F}",
+            "URN:UUID:6F0F9D1A-2B3C-4D5E-8F90-1A2B3C4D5E6F",
+        ] {
+            assert!(canonical_key_id(bad).is_none(), "{bad} should be rejected");
         }
     }
 

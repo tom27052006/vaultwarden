@@ -39,15 +39,36 @@ Two related settings matter:
 | `ORG_GROUPS_ENABLED` | Required for group provisioning. While it is off, `/Groups` returns `501` and the `Group` resource type is left out of discovery. User provisioning works either way. |
 | `ORG_EVENTS_ENABLED` | Required for SCIM's changes to appear in the organization event log. Strongly recommended: SCIM changes membership unattended. Vaultwarden warns at startup if SCIM is on and this is off. |
 
-Two optional settings tune the rate limiter:
+Four optional settings tune the rate limiters:
 
 ```
-SCIM_RATELIMIT_PER_SECOND=20     # sustained requests per second, per IP
-SCIM_RATELIMIT_MAX_BURST=1000    # burst allowance on top of that
+SCIM_RATELIMIT_PER_SECOND=20        # sustained provisioning requests per second,
+SCIM_RATELIMIT_MAX_BURST=1000       #   per organization *and* source IP, once authenticated
+
+SCIM_AUTH_RATELIMIT_PER_SECOND=60   # sustained requests per second, per IP, carrying a
+SCIM_AUTH_RATELIMIT_MAX_BURST=3000  #   token of the right shape -- checked before the
+                                    #   database lookup
 ```
 
-The defaults suit a normal Entra ID sync cycle. Raise the burst if you provision a large directory
-and see `429` responses in the identity provider's logs.
+The defaults suit a normal Entra ID sync cycle. Raise `SCIM_RATELIMIT_MAX_BURST` if you provision a
+large directory and see `429` responses in the identity provider's logs.
+
+The two pairs do different jobs and are deliberately separate:
+
+* **`SCIM_RATELIMIT_*`** is the provisioning allowance, charged only to requests that
+  authenticated, and keyed by **organization and source address together**. Two organizations
+  syncing through the same NAT, corporate proxy or Microsoft egress address each get their own
+  allowance; one tenant's large sync cannot throttle another's.
+* **`SCIM_AUTH_RATELIMIT_*`** is a ceiling on the database work a wrong-but-well-formed token can
+  cause. A token of the right shape cannot be recognised as wrong without one indexed lookup, so
+  this budget is checked *before* that lookup. It is charged to every well-formed token, including
+  the ones that succeed, which is why it is set well above `SCIM_RATELIMIT_PER_SECOND` — it should
+  never be the limit a legitimate sync hits first. If you raise `SCIM_RATELIMIT_*` substantially,
+  or run many organizations behind one address, raise this alongside it.
+
+Requests that fail to authenticate — no token, a malformed one, or a wrong one — are charged to
+`UNAUTHENTICATED_RATELIMIT_*` instead, so a flood of junk cannot consume a real sync's allowance
+and a busy sync cannot stop the server rejecting junk.
 
 ## Generating a token
 
@@ -77,6 +98,32 @@ Authentication is a bearer token:
 ```
 Authorization: Bearer scim_v1.<key-id>.<secret>
 ```
+
+Every rejected request answers `401` with the same generic challenge and the same body,
+whatever went wrong:
+
+```
+WWW-Authenticate: Bearer
+```
+
+No `realm`, no `error`, no `error_description`: a missing header, a malformed token, an unknown
+key, a wrong secret and a valid token for the wrong organization are deliberately
+indistinguishable, so the endpoint cannot be used to discover which organizations exist. If SCIM
+is switched off entirely the answer is `404`, not `401`.
+
+The standard discovery endpoints are served under the same base URL and require the same token:
+
+```
+GET /scim/v2/<organization_uuid>/ServiceProviderConfig
+GET /scim/v2/<organization_uuid>/ResourceTypes
+GET /scim/v2/<organization_uuid>/Schemas
+GET /scim/v2/<organization_uuid>/Schemas/<schema-uri>
+```
+
+`/Schemas` publishes the `User` and `Group` resource schemas plus the three schemas the discovery
+resources themselves use (`ServiceProviderConfig`, `ResourceType` and `Schema`), which is what
+RFC 7643 asks for. With `ORG_GROUPS_ENABLED` off, the `Group` schema disappears from both the
+listing and the direct lookup.
 
 ## Microsoft Entra ID setup
 
@@ -209,7 +256,9 @@ your identity provider to deprovision with `active: false`.
 
 SCIM **cannot modify the `User` resource of a member whose role is Owner, Admin or Manager**. Such
 memberships are visible on `GET` (so the identity provider does not create a duplicate) but every
-`PUT`, `PATCH` and `DELETE` against `/Users/<id>` is refused with `403`.
+`PUT`, `PATCH` and `DELETE` against `/Users/<id>` is refused with a plain `403` — no `scimType`,
+because no attribute value would make the request work. (Earlier builds returned `403` with
+`scimType: "mutability"`; if you match on that, match on the status code instead.)
 
 This protection covers the membership itself — its role, its active state and its existence. It
 does **not** cover group association: SCIM may add a privileged member to a group and remove them
@@ -243,6 +292,28 @@ and provision the new one.
 Similarly, an account's display name is only ever set when Vaultwarden creates the account. An
 existing account keeps its own name, because that name is visible in every organization it belongs
 to.
+
+The `emails` attribute follows exactly the same rule, including through the value-path form Entra
+sends: `emails[type eq "work" and primary eq true].value` asserts the address and is a no-op when
+it matches. Vaultwarden publishes exactly one email element per user, so there is nothing else for
+a selector to find:
+
+* a selector that matches nothing — `emails[type eq "home"]`, `emails[primary eq false]` — returns
+  `400` with `scimType: "noTarget"`, as RFC 7644 requires, rather than quietly writing the work
+  address instead;
+* `emails[...].type` and `emails[...].primary` are derived by the server (`"work"` and `true`).
+  Sending those exact values is an accepted no-op; sending anything else returns `400` with
+  `scimType: "mutability"`, so a mapping that puts an address in `.type` fails loudly instead of
+  being ignored.
+
+### Names
+
+`name`, `name.formatted`, `name.givenName` and `name.familyName` are **not** attributes of
+Vaultwarden's SCIM `User` resource — `/Schemas` does not list them. They are accepted on `POST` as
+a convenience: if you map `name` but not `displayName`, a brand-new account gets a useful name
+instead of being displayed by its own email address. On `PUT` and `PATCH` they are ignored
+entirely, so mapping `name` cannot fail an update. If you want a name to be set, map `displayName`
+and map it at creation.
 
 ## Group lifecycle
 
@@ -394,6 +465,19 @@ These are deliberate. Each is explained in [`design.md`](design.md).
     *email* that was already sent cannot be recalled, so someone may receive a mail for a
     membership that ended up revoked again; the link resolves to a revoked membership and grants
     nothing.
+
+    If the invitation fails, **every** change that request made is rolled back — including an
+    `externalId` set by the same `PATCH`, which an earlier build deliberately kept. RFC 7644
+    requires a failed `PATCH` to leave the resource exactly as it was, and the identity provider
+    re-sends the whole document on its retry anyway.
+13. **`name` is accepted but not published.** `name.formatted` / `givenName` / `familyName` are
+    read on `POST` as a fallback for naming an account Vaultwarden is creating, and ignored on
+    `PUT` and `PATCH`. `/Schemas` does not list `name`, because Vaultwarden has one name column
+    rather than a structured name (see *Names* above).
+14. **Unknown query parameters are ignored, not rejected.** `POST /Users?filter=...` succeeds and
+    the parameter has no effect; RFC 7644 defines no error for one, and identity providers append
+    their own. On the list endpoints `filter`, `startIndex` and `count` are real parameters and
+    are validated.
 
 ## Troubleshooting
 

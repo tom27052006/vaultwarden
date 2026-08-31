@@ -82,8 +82,17 @@ warning and carried on, it now maps the shared function's `Err` to the same warn
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `SCIM_ENABLED` | `false` | Master switch. When false the SCIM routes return `404` and the `/admin` token controls are unavailable. |
-| `SCIM_RATELIMIT_PER_SECOND` | `20` | Sustained SCIM requests per second from one IP. |
+| `SCIM_RATELIMIT_PER_SECOND` | `20` | Sustained provisioning requests per second, per `(organization, IP)`, charged only once a request has authenticated. |
 | `SCIM_RATELIMIT_MAX_BURST` | `1000` | Burst allowance on top of that. |
+| `SCIM_AUTH_RATELIMIT_PER_SECOND` | `60` | Sustained requests per second, per IP, carrying a token of the right *shape* — charged before the key lookup, so it bounds the database work a credential spray can cause. |
+| `SCIM_AUTH_RATELIMIT_MAX_BURST` | `3000` | Burst allowance on top of that. |
+
+`SCIM_AUTH_RATELIMIT_*` is deliberately larger than `SCIM_RATELIMIT_*`. Every request with a
+well-formed token is charged to it, including the ones that go on to authenticate, so it
+must never be the constraint a legitimate sync hits first — and the provisioning budget is
+per tenant while this one is per address, so several organizations behind one NAT share it.
+The defaults leave room for that; they are not a fairness mechanism, they are a ceiling on
+database work.
 
 SCIM is disabled by default because it is a network surface that grants
 organization-membership mutation rights to whoever holds a bearer token.
@@ -166,15 +175,33 @@ from the fact that the row is fetched with the path organization id already boun
 4. Split into exactly three `.`-separated parts and check their shape without touching the
    database: part 0 must equal `scim_v1`, part 1 must be a hyphenated UUID, part 2 must be
    43 characters of base64url (`SCIM_SECRET_ENCODED_LEN`, derived from the 32 random bytes
-   the generator produces). Anything else is `401`.
-5. Fetch the row `WHERE uuid = <part 1> AND org_uuid = <organization from the URL>`.
-6. Compare `sha256_hex(part 2)` against the stored hash with `crypto::ct_eq`.
-7. Charge the request to a rate limiter, chosen by outcome — see below.
+   the generator produces). Anything else is `401`. A valid UUID is **normalised to
+   canonical lower case** here — see below.
+5. Charge the request to `SCIM_AUTH_RATELIMIT_*`, **before** any database work.
+6. Fetch the row `WHERE uuid = <part 1> AND org_uuid = <organization from the URL>`.
+7. Compare `sha256_hex(part 2)` against the stored hash with `crypto::ct_eq`.
+8. Charge the request to a rate limiter, chosen by outcome — see below.
 
 The shape checks in step 4 are a **filter, not an authorization decision**. Everything they
 reject could not have matched a stored row anyway; rejecting it from the headers alone is
 what keeps junk traffic from costing a database round trip. Nothing they accept is trusted:
-authorization still comes entirely from step 6.
+authorization still comes entirely from step 7.
+
+#### Key-id canonicalisation
+
+Key ids come from `util::get_uuid()`, so the stored value is always a hyphenated lower-case
+UUID. Only that spelling is accepted — the braced, URN and unhyphenated forms
+`Uuid::try_parse` also understands are not what this server issues — and a valid one is
+**normalised to lower case** before it is used in the query.
+
+The normalisation matters because the comparison that decides the lookup is the database's,
+not Rust's. `TEXT` equality is case-sensitive on SQLite and PostgreSQL and case-insensitive
+under MySQL's default collation, so an upper-case UUID that reached the query verbatim would
+have authenticated on one backend and been a guaranteed miss on the others — from the same
+token. Normalising makes the answer the same on every backend and changes no token
+semantics: a UUID is the same identifier however it is capitalised, and the secret still has
+to survive the constant-time comparison either way. The unit tests assert the normalisation
+directly rather than relying on any one backend's collation.
 
 Every failure in steps 3-6 returns the *same* SCIM `401` body with no detail that
 distinguishes "no such organization" from "no such key" from "wrong secret". When no row is
@@ -193,44 +220,108 @@ cross-tenant bug.
 
 ### Which limiter a request is charged to
 
-There are two per-IP budgets and a request draws on exactly one of them, **decided by the
-outcome of authentication rather than by the request's arrival**:
+There are three per-IP-or-better budgets. Two are decided **by the outcome of
+authentication** rather than by the request's arrival; the third bounds the work a request
+may cost before its outcome is known.
 
-| Outcome | Budget |
-| --- | --- |
-| No `Authorization` header, non-Bearer scheme, wrong token shape | `UNAUTHENTICATED_RATELIMIT_*` |
-| Well-formed token, unknown key id or wrong secret | `UNAUTHENTICATED_RATELIMIT_*` |
-| Authenticated | `SCIM_RATELIMIT_*` |
+| Outcome | Budget | Key |
+| --- | --- | --- |
+| No `Authorization` header, non-Bearer scheme, wrong token shape | `UNAUTHENTICATED_RATELIMIT_*` | IP |
+| Well-formed token, whatever it turns out to be | `SCIM_AUTH_RATELIMIT_*` (before the lookup) | IP |
+| Well-formed token, unknown key id or wrong secret | `UNAUTHENTICATED_RATELIMIT_*` (after the lookup) | IP |
+| Authenticated | `SCIM_RATELIMIT_*` | `(organization, IP)` |
 
 The provisioning budget is generous because a directory sync is high-volume by nature, and
-that is precisely why nothing unauthenticated may draw on it. An earlier revision checked
-the SCIM limiter *first*, before parsing the token at all, which meant a flood of junk
-consumed a real sync's allowance before additionally being charged to the strict budget —
-contradicting what this document and `.env.template` claimed. The order is now:
+that is precisely why nothing unauthenticated may draw on it. The order is:
 
 1. client IP
 2. `SCIM_ENABLED`
 3. parse and shape-check the bearer token
 4. on anything that is not a well-formed token: charge the strict budget, return `401`
-   (or `429` if that budget is exhausted)
-5. verify the secret against the stored hash
-6. on failure: charge the strict budget, return `401` (or `429`)
-7. on success: charge the provisioning budget, return `429` if it is exhausted, otherwise
-   run the handler
+   (or `429` if that budget is exhausted) — **no database work at all**
+5. on a well-formed token: charge `SCIM_AUTH_RATELIMIT_*`; if it is exhausted, return `429`
+   **without** touching the database and without charging any other budget
+6. fetch the key row and verify the secret against the stored hash
+7. on failure: charge the strict budget, return `401` (or `429`)
+8. on success: charge `SCIM_RATELIMIT_*` for `(organization, IP)`, return `429` if it is
+   exhausted, otherwise run the handler
 
-The two budgets are therefore independent in both directions: exhausting the strict one
-does not throttle a real sync, and exhausting the provisioning one does not stop the server
-from rejecting junk with a plain `401`. A disabled server answers `404` without touching
-either, because that is not an authentication failure.
+#### Why the pre-verification budget exists
 
-Note what this does *not* claim. A structurally valid token with a wrong secret still costs
-one indexed single-row `SELECT` before it can be recognised as wrong, because recognising it
-is what the lookup is for. That cost is bounded per IP only after the fact — the strict
-budget throttles the *next* attempt, not the current one. Gating the lookup on the strict
-budget instead would mean charging successful requests to it as well, which is exactly the
-starvation this section exists to prevent. Shape-checking first removes the cheap bulk of
-junk from that path; the residual is one primary-key lookup, which is the least expensive
-thing the database does.
+Steps 1-4 alone left a gap. A credential of the *right shape* cannot be told apart from a
+real one without one indexed row fetch and a hash comparison — recognising it is what the
+lookup is for. So an attacker who had already exhausted the strict budget could keep sending
+
+```
+scim_v1.<any valid uuid>.<43 valid base64url characters>
+```
+
+and every request still bought a database round trip on its way to the `429`, because the
+strict budget was only consulted *after* the verification failed. The strict budget throttled
+the next attempt, never the current one.
+
+Gating the lookup on the strict budget instead would have meant charging successful requests
+to it as well, which is exactly the starvation the split exists to prevent. A third budget,
+checked before the lookup and charged to every well-formed token, closes the gap without
+that: the failed-authentication budget stays untouched by real traffic, and the provisioning
+budget stays untouched by junk.
+
+A `429` from this budget consumes nothing else. Charging a throttled request to the strict
+budget as well would let a client that is already being throttled push a second budget down
+with it.
+
+#### What the split does and does not reveal
+
+Once the pre-verification budget is exhausted, a *well-formed* token gets `429` while a
+*malformed* one still gets `401`. That is a distinction, and it is deliberately not a problem:
+the shape of a token is decided entirely from the token's own text, with no reference to any
+stored key, so it tells a client only what it already knew about what it sent.
+
+What stays indistinguishable is everything that depends on server state. An unknown key id, a
+wrong secret, a valid token for another organization and a valid token for an organization that
+does not exist all produce the same `401`, the same body and the same `WWW-Authenticate: Bearer`
+— and, once the budget is exhausted, the same `429` that a *valid* token gets. There is no
+key-existence oracle and no organization-existence oracle, which is the property that matters.
+
+#### Why the provisioning budget is keyed by tenant
+
+Two organizations syncing through the same NAT, corporate proxy or Microsoft egress address
+is a normal deployment. Keyed by address alone, organization A's burst throttled organization
+B, and B's operator had no way to see why. The key is `(OrganizationId, IpAddr)`:
+
+* one organization's burst cannot throttle another on the same address;
+* one organization is still bounded, and so is one address for a given organization — the
+  address stays in the key, so a token shared across many clients does not get one global
+  allowance;
+* the organization id comes from the **key row that was just authenticated**, never from the
+  URL. Keying by the URL's organization would let anyone mint limiter entries for
+  organizations that do not exist, and would put a forged request in a real tenant's bucket.
+
+The pre-verification budget is keyed by address alone, and has to be: at that point the
+organization is still whatever the URL said, so keying by it would be an unbounded,
+attacker-chosen key.
+
+#### Keyed state growth
+
+`governor`'s `DashMapStateStore` keeps one small entry per key until it is asked to let go.
+That is a pre-existing property of every Vaultwarden limiter, and the SCIM keys do not make
+it worse in kind:
+
+* the **provisioning** limiter's `(organization, IP)` entries can only be created by a
+  request that authenticated, so an attacker cannot mint them at all. The live set is bounded
+  by real organizations times the addresses their identity providers sync from.
+* the **pre-verification** limiter's IP entries can be created by anyone — but only by
+  traffic that would also reach `LIMITER_UNAUTHENTICATED`, which has always been reachable
+  from every unauthenticated endpoint in Vaultwarden. It at most doubles a pre-existing
+  per-IP entry count.
+
+Both SCIM limiters nevertheless prune themselves (`ratelimit::prune_if_stale`): when a store
+holds more than 10,000 live keys, and at most once a minute, `retain_recent()` drops every
+key whose bucket has fully replenished — i.e. every key indistinguishable from one that was
+never seen. Pruning never hands out a fresh budget, because a key that is still drawn down is
+by definition retained. The two guards together mean the O(n) walk cannot run per request.
+The shared login/admin/unauthenticated limiters are left exactly as upstream has them; this
+pass does not rewrite them.
 
 ### Why SHA-256 and not Argon2/PBKDF2
 
@@ -283,6 +374,56 @@ Group endpoints require `ORG_GROUPS_ENABLED`. When groups are disabled the `/Gro
 endpoints return `501` and the `Group` resource type and schema are omitted from
 `/ResourceTypes` and `/Schemas`, so discovery stays truthful.
 
+### Discovery
+
+`/ServiceProviderConfig`, `/ResourceTypes` and `/Schemas` (RFC 7644 section 4) are all served,
+tenant-scoped, and require the same bearer token as everything else. RFC 7644 permits them to
+be anonymous; they are not, because identity providers always send the token and opening them
+up would only add a surface that answers questions about an organization to an unauthenticated
+caller.
+
+RFC 7643 section 7: *"For every schema URI used in a resource object, there is a corresponding
+'Schema' resource."* `/Schemas` therefore publishes **five** documents, not two:
+
+| Schema | Why |
+| --- | --- |
+| `...core:2.0:User` | the `/Users` resource |
+| `...core:2.0:Group` | the `/Groups` resource — omitted with `ORG_GROUPS_ENABLED` |
+| `...core:2.0:ServiceProviderConfig` | `/ServiceProviderConfig` is a resource and announces this URN |
+| `...core:2.0:ResourceType` | every `/ResourceTypes` entry announces this URN |
+| `...core:2.0:Schema` | every document `/Schemas` itself returns announces this URN |
+
+The last three come verbatim in intent from RFC 7643 section 8.7.2, which gives their
+definitions; nothing proprietary is invented. Three deliberate deviations from the printed
+text, each in the direction of describing the document beside it:
+
+* `ServiceProviderConfig.etag` is described. It is defined in RFC 7643 section 5 and this
+  server emits it, though section 8.7.2's listing omits it.
+* `ResourceType.schemaExtensions` is declared `multiValued: true` where section 8.7.2 prints
+  `false`. That is a slip in the RFC text — its own ResourceType examples in section 8.6 show
+  an array, and so does every entry `/ResourceTypes` returns here.
+* Only the attributes this server actually emits are listed. A test walks every published schema against the document the same
+server returns and asserts the emitted keys are a subset of the published attributes, so the
+two cannot drift apart.
+
+The `urn:ietf:params:scim:api:messages:2.0:*` URNs — `ListResponse`, `Error`, `PatchOp` — are
+deliberately **absent**. Those are protocol *messages* defined by RFC 7644, not resources, and
+RFC 7643 publishes no schema for any of them; `GET /Schemas/<one of them>` is a `404`, as is
+the EnterpriseUser extension this server recognises but does not implement.
+
+`GET /Schemas/<uri>` resolves case-insensitively, as URNs are and as the `/ResourceTypes`
+lookup beside it already was, and returns exactly the document the listing carries.
+
+#### `members.$ref`
+
+`Group.members.$ref` is declared `type: "reference"` with `referenceTypes: ["User"]`, and
+`members.type` narrows its `canonicalValues` to `["User"]`. RFC 7643's stock definition says
+`["User", "Group"]`, because SCIM allows nested groups — this implementation does not. A
+`Group` id sent as a member is refused as a member that is not in the organization, so
+advertising `Group` would invite exactly the request the server rejects. RFC 7643 section 7
+makes `referenceTypes` applicable to every `reference` attribute; the earlier definition
+declared the type and omitted the list entirely.
+
 ## 7. User lifecycle semantics
 
 ### Provisioning (`POST /Users`)
@@ -333,9 +474,27 @@ organization admin completes confirmation, exactly as for any other invite.
 ### Privileged memberships
 
 SCIM refuses **every mutating operation** (`PUT`, `PATCH`, `DELETE`) on a membership whose
-`atype` is not `User` — that is, on Owners, Admins and Managers/Custom. The response is
-`403` with `scimType: "mutability"` and a detail explaining that the member must be demoted
+`atype` is not `User` — that is, on Owners, Admins and Managers/Custom. The response is a
+plain `403` with **no `scimType`**, and a detail explaining that the member must be demoted
 in the web vault first.
+
+The absence of `scimType` is deliberate, and it is a correction. An earlier revision returned
+`403` + `scimType: "mutability"`, which conflated two different faults:
+
+* `mutability` is a statement about **one attribute** violating its declared changeability.
+  It tells a client "that attribute cannot take that value", which implies a different value
+  would work.
+* A privileged membership is a **resource** that Vaultwarden's provisioning policy does not
+  hand to SCIM at all. There is no `active`, no `externalId` and no anything else that would
+  be accepted on it, so `mutability` names the wrong problem and points at a fix that does
+  not exist.
+
+RFC 7644 section 3.12 defines `scimType` values for protocol faults; "this server's security
+policy will not let an identity provider touch that member" is not one of them, and an
+unlabelled `403` is the accurate answer. The genuine attribute-level faults — changing
+`userName`, `displayName` or the `emails` identity — keep the RFC's pairing of `400` with
+`scimType: "mutability"`, which is what `ScimError::immutable` produces. `ScimError::forbidden`
+is now the only 403 constructor in the module.
 
 This single rule is what makes the privilege-escalation requirements hold, and it holds by
 construction rather than by a checklist of special cases:
@@ -388,11 +547,57 @@ never created would tell the IdP the change succeeded while the user has no usab
 organization, and nothing downstream would ever notice. The membership is put back to revoked and
 the request returns `500`, which is a status IdPs retry.
 
-The rollback is deliberately honest about what it can and cannot undo:
+#### What the rollback restores
 
-* Re-revoking the membership is a single row write on a row already loaded, and is reliable. If
-  even that write fails, the failure is logged at `error` level naming the membership — an
-  operator has something concrete to act on rather than a silent inconsistency.
+**Everything the request changed**, from a snapshot taken before the first mutation:
+
+```rust
+struct ScimMembershipSnapshot {
+    status: i32,             // the raw column, not the derived `active` flag
+    external_id: Option<String>,
+}
+```
+
+The snapshot is captured in `apply_user_changes` after the last check that can refuse the
+request and before the first mutation, so it always holds the state a client would see if the
+request had never arrived. On failure it is written back field by field and the row is saved.
+
+An explicit struct rather than a handful of local variables, so that adding a SCIM-writable
+membership field is a compile-time prompt to include it: the type is built and restored field
+by field in one place, and a new field that is not listed is visible in this file rather than
+absent from a rollback nobody re-reads.
+
+`status` is captured raw rather than as "was it active". `Membership::restore()` returns a
+membership to its *previous* status — Invited, Accepted or Confirmed, encoded as
+`status - 128` while revoked — so a rollback that only knew "it was inactive" could put a
+Confirmed member back as Invited and silently deprovision their access.
+
+An earlier revision restored only the status and **deliberately kept a new `externalId`**, on
+the grounds that directory metadata is "correct anyway". That is what this pass corrects.
+RFC 7644 section 3.5.2 is explicit — "if any operation fails, the service provider SHALL
+return the resource to its original state" — and a `PATCH` carrying
+
+```json
+{"Operations": [
+  {"op": "replace", "path": "externalId", "value": "new"},
+  {"op": "replace", "path": "active", "value": true}
+]}
+```
+
+used to return `500` while leaving half of itself applied, with nothing in the response saying
+so. `PUT` shares the same code path and therefore the same rollback, even though RFC 7644 puts
+the atomicity requirement only on `PATCH`.
+
+**No event is logged for a rolled-back request.** The rollback returns before any `log_event`
+call, so there is no `OrganizationUserRestored` entry recording a change that did not survive.
+
+The rollback stays honest about what it cannot undo:
+
+* Restoring the membership is a single row write on a row already loaded, and is reliable. If
+  even that write fails, the failure is logged at `error` level naming the membership and
+  saying what may be left behind — an operator has something concrete to act on rather than a
+  silent inconsistency. The request still returns an error; a failed rollback is never
+  reported as success.
 * An invitation **email** already handed to the MTA cannot be recalled. Someone may therefore
   receive an invitation for a membership that is revoked again. That is the same harmless state as
   any revoked invitee: the invitation link resolves to a membership with no access.
@@ -478,6 +683,41 @@ will see the server's value in the `POST` response and may follow up with a `PUT
 now fails with `mutability` until the mapping is corrected or `displayName` is unmapped. That is
 the honest outcome: the previous behaviour hid the same disagreement instead of surfacing it.
 
+### `name.*` is input compatibility, not schema support
+
+`name` and its sub-attributes are **not** part of this server's `User` resource. `/Schemas`
+does not publish the attribute, and that absence is the whole statement of the policy. The
+behaviour is now the same everywhere it was previously inconsistent:
+
+| Operation | `name.*` |
+| --- | --- |
+| `POST` | read as a fallback for the name of an account this request **creates**, after `displayName`: `name.formatted`, then `givenName` + `familyName`. |
+| `PUT` | ignored. |
+| `PATCH` | ignored (path, pathless and qualified alike). |
+| Any response | never emitted. |
+
+The `POST` fallback stays because it is genuinely useful and costs nothing: an identity
+provider that maps only `name` — a common Entra configuration — otherwise fills an
+organization with members displayed by their own email address. Nobody has a competing claim
+on an account that did not exist a moment ago.
+
+What was removed is the `PUT` path. `ScimUserRequest::asserted_display_name` used to fall back
+through `name.*` and then feed the result into the `displayName` immutability check, so an
+identity provider that sent only `name` — and whose `name` differed from the stored account
+name, which is exactly when a fallback would matter — got `400` + `scimType: "mutability"`
+about `displayName`, an attribute it had never sent. `PATCH` had always ignored `name`
+outright, so the same directory data succeeded or failed depending on which verb the client
+happened to use.
+
+Reinterpreting an unsupported attribute as a *different, supported* one is the underlying
+mistake. It is now confined to the one operation where there is no existing value to
+contradict. `resolve_display_name` (creation) consults `name.*`; `asserted_display_name`
+(update) reads `displayName` and nothing else.
+
+The alternative — publishing `name` as a supported attribute with real `name.*` storage — was
+rejected as scope: Vaultwarden has one `users.name` column, not a structured name, so a
+faithful `name` would be a lossy invention, and Entra works without it.
+
 ### `emails` and why it is immutable rather than read-only
 
 `POST /Users` accepts `emails[].value` as the resource's identity when `userName` is absent, which
@@ -515,6 +755,80 @@ rather than an `invalidValue` about the JSON.
 **not** all share one mutability, because they do not all behave the same way; describing them
 uniformly would be the same kind of approximation this section removes.
 
+#### `emails[...]` value paths
+
+Microsoft Entra ID documents value-path forms such as
+
+```
+emails[type eq "work" and primary eq true].value
+```
+
+so they have to work. They now work *properly*: the selector is evaluated and the
+sub-attribute is honoured.
+
+This server renders exactly one, entirely server-derived `emails` element —
+`{"value": <account email>, "type": "work", "primary": true}` — so every selector has a
+definite answer. `PatchPath` splits the bracketed text off first (a colon inside a filter
+literal must never be read as a namespace separator), and the selector then goes through the
+**same validated filter parser the query filters use**, with `USER_ATTRS` and the User core
+schema. It is evaluated against that one element.
+
+| Path | Result |
+| --- | --- |
+| `emails[type eq "work" and primary eq true].value` | selects the element; asserts the account address |
+| `emails[type eq "work"].value`, `emails[primary eq true].value`, `emails[value eq "<the address>"].value` | the same |
+| `emails[type eq "home"].value`, `emails[primary eq false].value`, `emails[value eq "someone@else"].value` | `400` `noTarget` |
+| `emails[...].type` = `"work"`, `emails[...].primary` = `true` | accepted no-op |
+| `emails[...].type` = anything else, `emails[...].primary` = anything else | `400` `mutability` |
+| `emails[...].value` with a value carrying no address | `400` `invalidValue` |
+| `emails[...].nonsense`, `emails.nonsense`, `emails.display` | `400` `invalidPath` |
+| `emails[whatever eq "x"].value`, `emails[type eq].value` | `400` `invalidPath` |
+| `emails[type eq "home"] or emails[type eq "work"].value` | `400` `invalidPath` |
+| `urn:example:Custom:emails[...]...` | ignored, as any extension attribute is |
+
+`type` and `primary` are `readOnly`, and they get the same three outcomes every other unwritable
+attribute in this module gets: re-asserting the value the server already renders is the no-op a
+client echoing the whole element performs, and anything else is a `mutability` fault. Refusing the
+matching value would fail a sync over an attribute the client could not have sent differently;
+accepting a *different* one is what let `emails[...].type` carry a smuggled address.
+
+`PatchPath` splits a path on the first `[` and the last `]`, so the selector text can contain
+brackets of its own. The parse result is therefore required to be a single value path *on `emails`*
+— RFC 7644's `valuePath` grammar is one `attrPath[valFilter]` — because otherwise
+`emails[type eq "home"] or emails[type eq "work"].value` parses into a disjunction and selects the
+element through a clause the client never targeted. `members[value eq "..."]` has always been held
+to the same shape.
+
+An earlier revision recognised the bracket syntax and then treated *every* path whose base was
+`emails` as the same assertion: the selector was parsed and discarded, and the sub-attribute was
+never looked at. Three things followed, all of them wrong:
+
+* `emails[type eq "home"].value` — a selector matching nothing — quietly became a write to the
+  work address. RFC 7644 sections 3.5.2.2 and 3.5.2.3 require `noTarget` there, and returning
+  success for a target that does not exist is how a mapping mistake becomes silent data drift.
+* `emails[type eq "work"].type` was indistinguishable from `.value`, so
+  `{"path": "emails[...].type", "value": "someone@else.test"}` was an account-rename attempt
+  wearing a read-only attribute's name. Conversely `emails[...].primary` with a boolean value
+  was silently accepted and did nothing, because a boolean carries no address to extract — an
+  operation reported as successful that could never have had any effect.
+* `emails[whatever eq "x"].value` was accepted as if it named the real element, which is the
+  same aliasing problem the namespace rules exist to prevent, one level further down.
+
+`noTarget` is returned for `add` as well as `replace` and `remove`. RFC 7644 only names the
+error for the latter two, but this server publishes exactly one server-derived element and can
+create no others, so "the thing you targeted is not here" is the honest answer to all three.
+
+Ordering inside `apply_email_operation` matters and is deliberate: the **target is resolved
+first**, then the attribute rule applies. `remove` on `emails[type eq "home"]` is `noTarget`
+(nothing was selected), while `remove` on `emails[type eq "work"]` is `mutability` (something
+was selected, and it cannot be removed). The two errors answer different questions.
+
+A path with a sub-attribute but no selector — `emails.value`, `emails.type` — goes through the
+same sub-attribute check, so the two spellings agree. And because SCIM's simple attributes have
+no sub-attributes at all, `active.whatever`, `externalId.value`, `userName.value` and
+`displayName.formatted` are now `invalidPath` rather than being silently read as their parents;
+`active.whatever` used to deprovision somebody through a path this schema does not define.
+
 ## 8. Groups
 
 Group membership entries must resolve to a membership **in the same organization**. This is
@@ -539,6 +853,34 @@ The same rule applies to `active` and `externalId` on `PUT /Users`. This is a de
 documented deviation, chosen for blast-radius reasons; an IdP that wants to clear a
 collection can always say so explicitly. Entra does not `PUT` group members at all — it
 uses `PATCH` — so this costs nothing in practice.
+
+### User PATCH atomicity
+
+RFC 7644 section 3.5.2: "if any operation fails, the service provider SHALL return the
+resource to its original state". For `PATCH /Users/<id>` that is achieved in two layers.
+
+**Everything that can be decided before a write, is.** `plan_user_patch` turns the whole
+document into a typed `UserChanges` before anything is touched, and `apply_user_changes` then
+runs every refusal — privileged membership, `userName` assertion, `displayName` assertion,
+`externalId` uniqueness — before the first mutation. A document whose *planning* fails
+therefore never reaches the database at all, which covers unsupported paths, bad values,
+immutable assertions and over-long documents, in a combined document as much as in a
+single-operation one. The change-set is a plan rather than a replay, so a document that
+touches one attribute twice resolves to one value and one write.
+
+**The one thing that can fail after a write is rolled back.** Only the invitation a
+reactivation issues runs after `member.save()`, and it is undone from
+`ScimMembershipSnapshot` — status *and* `externalId`, not just the field the side effect
+belonged to. See section 7 for the snapshot and for why a partial keep was wrong.
+
+`PUT` shares `apply_user_changes`, so it gets the same treatment even though RFC 7644 puts the
+atomicity requirement only on `PATCH`.
+
+What is *not* claimed: two concurrent SCIM requests against the same membership are not
+serialised against each other, and a rollback restores only the fields this request could have
+changed rather than the whole row — restoring everything would also undo whatever another
+request did in between, which is a wider promise than the RFC asks for. Section 12 covers the
+concurrency story.
 
 ### Atomicity
 
@@ -777,8 +1119,19 @@ that returns a resource representation, which is all ten of them:
 | list | `GET /Users` | `GET /Groups` |
 
 The write verbs take a `ProjectionQuery` — just the two parameters — rather than the list
-endpoints' `ListQuery`, so a `POST` does not silently accept a `filter`, a `startIndex` or a
-`count`, none of which mean anything there.
+endpoints' `ListQuery`, because `filter`, `startIndex` and `count` mean nothing on a write, so
+there is nothing for a write handler to read them into.
+
+That is a statement about what the handler *uses*, not about what the server rejects, and an
+earlier revision's comment overstated it. Rocket 0.5 parses query strings **leniently**: a
+field the query type does not declare is skipped, so `POST /Users?filter=x&count=99` is
+accepted and the two unknown parameters are ignored. That is also the RFC's position — section
+3.4.2 defines no error for an unrecognised query parameter, and identity providers do append
+their own — so nothing here tries to be stricter, and no strict query parser was added for a
+problem that does not exist. The behaviour is pinned by a route-level test
+(`unknown_query_parameters_on_a_write_are_ignored_not_rejected`) so a future maintainer reads
+it from a test rather than from a comment. On the *list* endpoints the same names are real
+parameters and are still validated: `?count=abc` is a `400` with `scimType: "invalidValue"`.
 
 The two parameters are mutually exclusive; a request supplying both is a `400`, because reconciling
 them would mean guessing at the client's intent. On the write verbs that check runs **before** the
@@ -860,8 +1213,9 @@ Error bodies follow `urn:ietf:params:scim:api:messages:2.0:Error` with `status`,
 | unsupported PATCH path | 400 | `invalidPath` |
 | bad value for a known attribute | 400 | `invalidValue` |
 | immutable attribute written | 400 | `mutability` |
-| bad or absent credentials | 401 | — |
-| writing a privileged membership (read-only resource) | 403 | `mutability` |
+| PATCH value-path selector matched nothing | 400 | `noTarget` |
+| bad or absent credentials | 401 | — (plus `WWW-Authenticate: Bearer`) |
+| writing a privileged membership | 403 | — |
 | authorization or policy refusal | 403 | — |
 | unknown resource, or resource in another organization | 404 | — |
 | duplicate user/group | 409 | `uniqueness` |
@@ -870,13 +1224,39 @@ Error bodies follow `urn:ietf:params:scim:api:messages:2.0:Error` with `status`,
 | rate limited | 429 | — |
 | groups disabled server-side | 501 | — |
 
-The two `403`s are deliberately different. `scimType` values are defined by RFC 7644 section 3.12
-for specific *protocol* faults, and `mutability` means "you tried to change something that cannot
-be changed". A refusal because `INVITATIONS_ALLOWED` is off, or because an organization policy
-declines a reactivation, is not a protocol fault at all -- the request was perfectly well formed
-and the server declined it. Labelling those `mutability` would send a client looking for a defect
-in its own document. `ScimError::read_only` produces the former and `ScimError::forbidden` the
-latter, and every call site was classified individually.
+**No `403` carries a `scimType`.** `scimType` values are defined by RFC 7644 section 3.12 for
+specific *protocol* faults, and `mutability` means "one attribute cannot take that value" — which
+implies some other value would work. Neither "`INVITATIONS_ALLOWED` is off", nor "an organization
+policy declines this reactivation", nor "this server's provisioning policy does not hand privileged
+memberships to SCIM" is that kind of fault: the request was perfectly well formed and there is no
+attribute value that would make it succeed. Labelling any of them `mutability` sends a client
+looking for a defect in its own document.
+
+Genuine attribute mutability faults — an attempt to change `userName`, `displayName` or the
+`emails` identity, or to write the server-derived `emails.type` / `emails.primary` — keep the
+pairing RFC 7644 gives them: `400` with `scimType: "mutability"`. `ScimError::immutable` produces
+those and `ScimError::forbidden` produces every `403`; the earlier `ScimError::read_only`
+(`403` + `mutability`), which straddled the two, is gone, and every call site was reclassified.
+
+### `WWW-Authenticate` on 401
+
+Every SCIM `401` carries `WWW-Authenticate: Bearer`, added by `ScimError`'s responder for that
+status alone. RFC 7235 section 3.1 requires a challenge on a `401`, and
+`/ServiceProviderConfig` already advertises `oauthbearertoken` pointing at RFC 6750, so the
+response owed the client one.
+
+The challenge is a bare `Bearer`, identical for every cause, and that is the whole design:
+
+* **no `realm`** — a realm naming the organization would turn the header into the
+  tenant-existence oracle the body carefully is not;
+* **no `error` / `error_description`** — those vary with *why* a request failed, which is
+  exactly the distinction the uniform `401` exists to hide;
+* **no key ids, no organization information, nothing derived from the credential.**
+
+The bodies stay byte-identical too, so a missing header, a malformed token, an unknown key, a
+wrong secret and a valid token for the wrong organization remain indistinguishable. Nothing but
+`401` gets the header: on a `403` or `404` it would invite a client to retry with different
+credentials, which is not the problem.
 
 Responses that carry a single resource also set `Content-Location` to the same URL as the body's
 `meta.location`. A `ListResponse` describes many resources, so it gets none: there is no one
@@ -975,13 +1355,18 @@ contains the token secret.**
 
 ## 15. Abuse protection
 
-* Every SCIM request is charged to one of two per-IP rate limiters, chosen by whether it
-  authenticated (section 5). Failed authentication — including a request with no credential at
-  all — draws on the strict `UNAUTHENTICATED_RATELIMIT_*` budget and never on the generous
-  `SCIM_RATELIMIT_*` one, so junk traffic cannot consume a real sync's allowance and a saturated
-  sync cannot stop the server rejecting junk.
+* Every SCIM request is charged to one of three budgets, chosen by how far it gets (section 5).
+  Failed authentication — including a request with no credential at all — draws on the strict
+  `UNAUTHENTICATED_RATELIMIT_*` budget and never on the generous `SCIM_RATELIMIT_*` one, so junk
+  traffic cannot consume a real sync's allowance and a saturated sync cannot stop the server
+  rejecting junk.
 * A bearer token is shape-checked against the format this server issues before any database
   lookup, so malformed credentials cost nothing but the header parse.
+* A token that *is* the right shape is charged to `SCIM_AUTH_RATELIMIT_*` **before** the key
+  lookup, so a credential spray of valid-looking tokens is bounded before it costs any database
+  work at all.
+* The authenticated provisioning budget is keyed by `(organization, IP)`, so two tenants
+  syncing through one NAT or proxy do not share an allowance.
 * SCIM request bodies are capped at **1 MiB**, independently of Rocket's 20 MB global JSON
   limit, and over-sized bodies return `413`.
 * `members` arrays are capped at **5000** entries per request.
@@ -1024,6 +1409,36 @@ a running server:
 Vaultwarden has no `src/lib.rs`, so there is no library target for a `tests/` directory to link
 against; tests live in `#[cfg(test)]` modules, which is the existing convention throughout the
 codebase.
+
+### Test seams
+
+Four things the SCIM module reaches for go through `settings.rs`, whose non-test implementations
+are plain calls and are the whole production behaviour:
+
+* `scim_enabled()` / `groups_enabled()` — `CONFIG` reads. The indirection exists because
+  `std::env::set_var` is `unsafe` and this crate forbids unsafe code, and `Config::update_config`
+  would persist a `config.json` into the operator's data folder.
+* `check_rate_limit` / `check_auth_rate_limit` / `check_pre_auth_rate_limit` — the three budgets.
+  The test implementations also *count* their calls and record the keys they were charged
+  against, which is how a test asserts **which** budget a request drew on rather than inferring it
+  from a status code, and how it shows that two organizations on one address produce two
+  different provisioning keys.
+* `note_key_lookup()` — a no-op in production, a counter in tests. It marks the exact point at
+  which a request costs a key lookup, so a test can assert that a request refused by the
+  pre-verification budget reached the database **zero** times rather than merely getting a `429`.
+* `ensure_invitation()` — a straight call to `ensure_invitation_for`. Routing it through here is
+  the only way to reach the rollback in `apply_user_changes` from a test: every real cause of
+  failure is a database state SQLite's foreign keys will not let a test construct (deleting the
+  account or the organization cascades the membership away first). The test implementation still
+  calls the real helper unless a test has explicitly asked for a failure, so the ordinary
+  invitation tests exercise production behaviour.
+
+Tests that change a setting or read a counter take the exclusive settings lock, so they cannot be
+disturbed by — or disturb — the tests running in parallel.
+
+The two most important fixes in this pass were mutation-checked: reverting the rollback to its
+previous "keep the new `externalId`" behaviour fails three tests, and reverting the `emails`
+value-path handling to "ignore the selector and the sub-attribute" fails twelve.
 
 The suite runs on SQLite. The MySQL and PostgreSQL paths are covered by the fact that the SCIM code
 contains no backend-specific branches beyond the `db_run!` arms in
@@ -1090,5 +1505,16 @@ Two findings came out of this pass and were fixed:
 11. **Reactivation is not atomic with invitation delivery.** An `Invitation` row that cannot be
     written rolls the reactivation back; an email already handed to the MTA cannot be recalled
     (section 7).
-12. A structurally valid but wrong bearer token costs one indexed lookup before the strict rate
-    limiter is charged; the limiter throttles the next attempt, not that one (section 5).
+12. A structurally valid but wrong bearer token still costs **one** indexed lookup and one hash
+    comparison — recognising it is what the lookup is for. It is now bounded before the fact by
+    `SCIM_AUTH_RATELIMIT_*` rather than only throttling the next attempt (section 5).
+13. `name` and its sub-attributes are accepted on `POST` as a fallback for naming a brand-new
+    account, but are not a published attribute of the `User` resource and are ignored everywhere
+    else (section 7).
+14. Unknown query parameters on a write are ignored rather than rejected, which is Rocket's
+    lenient form parsing and is what RFC 7644 leaves unspecified (section 10).
+15. A rolled-back `PATCH` emits no event — but with `ORG_EVENTS_ENABLED` off, which is the
+    default, no SCIM operation emits one either. The absence is verified by construction (the
+    rollback returns before any `log_event` call) rather than by a test asserting on event rows,
+    because `CONFIG` is read from the process environment and a crate that forbids `unsafe`
+    cannot change it from a test.
