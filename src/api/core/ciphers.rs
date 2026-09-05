@@ -173,7 +173,7 @@ async fn sync(data: SyncData, headers: Headers, client_version: Option<ClientVer
         api::core::get_eq_domains(&headers, true).into_inner()
     };
 
-    // This is very similar to the the userDecryptionOptions sent in connect/token,
+    // This is very similar to the userDecryptionOptions sent in connect/token,
     // but as of 2025-12-19 they're both using different casing conventions.
     let has_master_password = !headers.user.password_hash.is_empty();
     let master_password_unlock = if has_master_password {
@@ -560,16 +560,8 @@ pub async fn update_cipher_from_data(
                 (_, _) => EventType::CipherUpdated,
             };
 
-            log_event(
-                event_type as i32,
-                &cipher.uuid,
-                org_id,
-                &headers.user.uuid,
-                headers.device.atype,
-                &headers.ip.ip,
-                conn,
-            )
-            .await;
+            log_event(event_type, &cipher.uuid, org_id, &headers.user.uuid, headers.device.atype, &headers.ip.ip, conn)
+                .await;
         }
         nt.send_cipher_update(
             ut,
@@ -857,7 +849,7 @@ async fn post_collections_update(
     .await;
 
     log_event(
-        EventType::CipherUpdatedCollections as i32,
+        EventType::CipherUpdatedCollections,
         &cipher.uuid,
         org_uuid,
         &headers.user.uuid,
@@ -937,7 +929,7 @@ async fn post_collections_admin(
     .await;
 
     log_event(
-        EventType::CipherUpdatedCollections as i32,
+        EventType::CipherUpdatedCollections,
         &cipher.uuid,
         org_uuid,
         &headers.user.uuid,
@@ -1342,7 +1334,7 @@ async fn save_attachment(
 
     if let Some(org_id) = &cipher.organization_uuid {
         log_event(
-            EventType::CipherAttachmentCreated as i32,
+            EventType::CipherAttachmentCreated,
             &cipher.uuid,
             org_id,
             &headers.user.uuid,
@@ -1703,7 +1695,7 @@ async fn purge_org_vault(
             nt.send_user_update(UpdateType::SyncVault, &user, headers.device.push_uuid.as_ref(), &conn).await;
 
             log_event(
-                EventType::OrganizationPurgedVault as i32,
+                EventType::OrganizationPurgedVault,
                 &organization.org_id,
                 &organization.org_id,
                 &user.uuid,
@@ -1831,9 +1823,9 @@ async fn delete_cipher_by_uuid(
         let event_type = if *delete_options == CipherDeleteOptions::SoftSingle
             || *delete_options == CipherDeleteOptions::SoftMulti
         {
-            EventType::CipherSoftDeleted as i32
+            EventType::CipherSoftDeleted
         } else {
-            EventType::CipherDeleted as i32
+            EventType::CipherDeleted
         };
 
         log_event(event_type, &cipher.uuid, &org_id, &headers.user.uuid, headers.device.atype, &headers.ip.ip, conn)
@@ -1902,7 +1894,7 @@ async fn restore_cipher_by_uuid(
 
     if let Some(org_id) = &cipher.organization_uuid {
         log_event(
-            EventType::CipherRestored as i32,
+            EventType::CipherRestored,
             &cipher.uuid.clone(),
             org_id,
             &headers.user.uuid,
@@ -1979,7 +1971,7 @@ async fn delete_cipher_attachment_by_id(
 
     if let Some(ref org_id) = cipher.organization_uuid {
         log_event(
-            EventType::CipherAttachmentDeleted as i32,
+            EventType::CipherAttachmentDeleted,
             &cipher.uuid,
             org_id,
             &headers.user.uuid,
