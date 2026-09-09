@@ -910,10 +910,10 @@ impl Membership {
     /// nor group `access_all` may manufacture one.
     ///
     /// There is deliberately no live exception for legacy Managers whose authority came from an
-    /// organization-local `access_all` group: deriving one from the membership's shape would also match
-    /// every newly created flagless Custom member, so joining one to an ordinary `access_all` group would
-    /// hand out organization-wide edit and delete. The migration writes that authority into the visible
-    /// `edit_any_collection` / `delete_any_collection` columns instead.
+    /// organization-local `access_all` group. That legacy management authority is intentionally not
+    /// materialized into Custom membership permissions during migration. The group continues to grant
+    /// collection access dynamically, while any desired Custom collection-management permissions must
+    /// be assigned explicitly after the upgrade.
     pub async fn has_explicit_collection_manage_access(&self, collection_uuid: &CollectionId, conn: &DbConn) -> bool {
         let membership_uuid = self.uuid.clone();
         let user_uuid = self.user_uuid.clone();
