@@ -30,6 +30,8 @@ pub use self::favorite::Favorite;
 pub use self::folder::{Folder, FolderCipher, FolderId};
 pub use self::group::{CollectionGroup, Group, GroupId, GroupUser};
 pub use self::org_policy::{OrgPolicy, OrgPolicyId, OrgPolicyType};
+#[cfg(test)]
+pub(crate) use self::organization::test_membership;
 pub use self::organization::{
     Membership, MembershipId, MembershipStatus, MembershipType, OrgApiKeyId, Organization, OrganizationApiKey,
     OrganizationId,

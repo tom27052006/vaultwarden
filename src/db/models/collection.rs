@@ -1013,30 +1013,29 @@ mod tests {
     use super::{assignment_manage_for_member, stored_assignment_manage};
     use crate::db::models::MembershipType;
 
-    // A stored `users_collections.manage` row must survive being listed in the admin console and
-    // written back unchanged. Reporting `false` for a plain User made an unrelated save strip the
-    // grant, which also revoked the cipher write access the row still confers.
+    /// The two questions a `users_collections.manage` row is asked, side by side, because the whole
+    /// point is that they differ for a plain User.
+    ///
+    /// `stored_assignment_manage` echoes the *persisted* bit for the admin-console access lists: the
+    /// client writes the same value back when the dialog is saved, so reporting `false` for a plain User
+    /// made an unrelated save strip the grant -- which also revoked the cipher write access the row still
+    /// confers. `assignment_manage_for_member` reports what the member may actually *do*, and there a
+    /// plain User's stored row is not management authority. An unknown role is never either.
     #[test]
-    fn stored_assignment_manage_echoes_the_persisted_grant() {
-        for role in [MembershipType::Owner, MembershipType::Admin] {
-            assert!(stored_assignment_manage(role as i32, false));
+    fn assignment_manage_reporting_differs_from_effective_manage() {
+        // (stored bit, stored/reported, effective)
+        for (role, stored_manage, reported, effective) in [
+            (MembershipType::Owner as i32, false, true, true),
+            (MembershipType::Admin as i32, false, true, true),
+            (MembershipType::Custom as i32, true, true, true),
+            (MembershipType::Custom as i32, false, false, false),
+            // The divergence: the row is reported back unchanged, but confers no management authority.
+            (MembershipType::User as i32, true, true, false),
+            (MembershipType::User as i32, false, false, false),
+            (i32::MAX, true, true, false),
+        ] {
+            assert_eq!(stored_assignment_manage(role, stored_manage), reported, "stored: role={role}");
+            assert_eq!(assignment_manage_for_member(role, stored_manage), effective, "effective: role={role}");
         }
-
-        for role in [MembershipType::Custom, MembershipType::User] {
-            assert!(stored_assignment_manage(role as i32, true));
-            assert!(!stored_assignment_manage(role as i32, false));
-        }
-    }
-
-    #[test]
-    fn assignment_manage_matches_collection_guard_role_boundaries() {
-        for role in [MembershipType::Owner, MembershipType::Admin] {
-            assert!(assignment_manage_for_member(role as i32, false));
-        }
-
-        assert!(assignment_manage_for_member(MembershipType::Custom as i32, true));
-        assert!(!assignment_manage_for_member(MembershipType::Custom as i32, false));
-        assert!(!assignment_manage_for_member(MembershipType::User as i32, true));
-        assert!(!assignment_manage_for_member(i32::MAX, true));
     }
 }

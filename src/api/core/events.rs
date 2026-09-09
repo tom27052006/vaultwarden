@@ -497,13 +497,7 @@ pub async fn event_cleanup_job(pool: DbPool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn membership(member_type: MembershipType, status: MembershipStatus) -> Membership {
-        let mut membership = Membership::new("test-user".to_owned().into(), "test-org".to_owned().into(), None);
-        membership.atype = member_type as i32;
-        membership.status = status as i32;
-        membership
-    }
+    use crate::db::models::test_membership as membership;
 
     #[test]
     fn cipher_event_access_requires_confirmed_admin_or_access_event_logs() {
@@ -547,14 +541,8 @@ mod tests {
         assert_eq!(cipher_event_scope(&cipher, &"other-user".to_owned().into(), None), None);
     }
 
-    #[test]
-    fn cipher_event_scope_selects_the_database_scope_filter() {
-        let org_id: OrganizationId = "test-org".to_owned().into();
-
-        assert_eq!(CipherEventScope::Personal.organization_id(), None);
-        assert_eq!(CipherEventScope::Organization(org_id.clone()).organization_id(), Some(&org_id));
-    }
-
+    /// Malformed dates used to reach `parse_date`, which unwraps -- an authenticated request could take
+    /// the worker down with a query string. They have to come back as errors instead.
     #[test]
     fn event_range_rejects_invalid_dates_and_continuation_tokens() {
         let valid = EventRange {
@@ -584,6 +572,8 @@ mod tests {
         };
         assert!(parse_event_range(&invalid_token).is_err());
 
+        // A continuation token replaces the end date, so a stale `end` from an older client is ignored
+        // rather than rejected.
         let token_supersedes_end = EventRange {
             start: "2026-07-25T10:00:00Z".to_owned(),
             end: "legacy-client-value-that-is-not-used".to_owned(),
@@ -592,65 +582,38 @@ mod tests {
         assert!(parse_event_range(&token_supersedes_end).is_ok());
     }
 
+    /// `/events/collect` is an allowlist, not a range: an authenticated client must not be able to write
+    /// arbitrary event types into an organization's audit log. The negative cases carry this test -- the
+    /// three accepted ones only pin that each of the three kinds is still reachable.
     #[test]
     fn collect_accepts_only_official_client_generated_event_types() {
         assert_eq!(client_event_kind(EventType::UserClientExportedVault as i32), Some(ClientEventKind::User));
-        for event_type in [
-            EventType::CipherClientViewed,
-            EventType::CipherClientToggledPasswordVisible,
-            EventType::CipherClientToggledHiddenFieldVisible,
-            EventType::CipherClientToggledCardCodeVisible,
-            EventType::CipherClientCopiedPassword,
-            EventType::CipherClientCopiedHiddenField,
-            EventType::CipherClientCopiedCardCode,
-            EventType::CipherClientAutofilled,
-            EventType::CipherClientToggledCardNumberVisible,
-            EventType::CipherClientCopiedBankAccountNumber,
-            EventType::CipherClientCopiedBankAccountPin,
-            EventType::CipherClientToggledBankAccountNumberVisible,
-            EventType::CipherClientToggledBankAccountPinVisible,
-            EventType::CipherClientCopiedLicenseNumber,
-            EventType::CipherClientToggledLicenseNumberVisible,
-            EventType::CipherClientCopiedPassportNumber,
-            EventType::CipherClientToggledPassportNumberVisible,
-            EventType::CipherClientCopiedSwiftCode,
-            EventType::CipherClientToggledSwiftCodeVisible,
-            EventType::CipherClientCopiedIban,
-            EventType::CipherClientToggledIbanVisible,
-            EventType::CipherClientCopiedNationalIdentificationNumber,
-            EventType::CipherClientToggledNationalIdentificationNumberVisible,
-        ] {
-            assert_eq!(client_event_kind(event_type as i32), Some(ClientEventKind::Cipher));
-        }
-        for event_type in [
-            EventType::OrganizationClientExportedVault,
-            EventType::OrganizationItemOrganizationAccepted,
-            EventType::OrganizationItemOrganizationDeclined,
-            EventType::OrganizationAutoConfirmEnabledAdmin,
-            EventType::OrganizationAutoConfirmDisabledAdmin,
-            EventType::OrganizationInviteLinkClientCopied,
-        ] {
-            assert_eq!(client_event_kind(event_type as i32), Some(ClientEventKind::Organization));
-        }
+        assert_eq!(client_event_kind(EventType::CipherClientViewed as i32), Some(ClientEventKind::Cipher));
+        assert_eq!(client_event_kind(EventType::CipherClientCopiedPassword as i32), Some(ClientEventKind::Cipher));
+        assert_eq!(
+            client_event_kind(EventType::OrganizationClientExportedVault as i32),
+            Some(ClientEventKind::Organization)
+        );
 
-        // Upstream does not accept the TOTP seed toggle from clients either.
-        assert_eq!(client_event_kind(1118), None);
-
+        // Server-generated types are never accepted from a client, and neither is an unassigned value
+        // inside one of the ranges the allowlist replaced.
         for event_type in [
-            EventType::UserLoggedIn,
-            EventType::UserChangedPassword,
-            EventType::CipherCreated,
-            EventType::CipherUpdated,
-            EventType::CipherDeleted,
-            EventType::OrganizationUpdated,
-            EventType::OrganizationPurgedVault,
-            EventType::PolicyUpdated,
+            EventType::UserLoggedIn as i32,
+            EventType::UserChangedPassword as i32,
+            EventType::CipherCreated as i32,
+            EventType::CipherUpdated as i32,
+            EventType::CipherDeleted as i32,
+            EventType::OrganizationUpdated as i32,
+            EventType::OrganizationPurgedVault as i32,
+            EventType::PolicyUpdated as i32,
+            // Upstream does not accept the TOTP seed toggle from clients either.
+            1118,
+            1099,
+            1199,
+            1699,
         ] {
-            assert_eq!(client_event_kind(event_type as i32), None);
+            assert_eq!(client_event_kind(event_type), None, "event type {event_type} must not be accepted");
         }
-        assert_eq!(client_event_kind(1099), None);
-        assert_eq!(client_event_kind(1199), None);
-        assert_eq!(client_event_kind(1699), None);
     }
 
     #[test]

@@ -1680,29 +1680,39 @@ pub async fn refresh_tokens(
 #[cfg(test)]
 mod tests {
     use super::{CollectionManageAccess, collection_delete_access, collection_edit_access, collection_read_access};
-    use crate::db::models::{Membership, MembershipStatus, MembershipType};
+    use crate::db::models::{Membership, MembershipStatus, MembershipType, test_membership};
 
     fn membership(member_type: MembershipType) -> Membership {
-        let mut membership = Membership::new("test-user".to_owned().into(), "test-org".to_owned().into(), None);
-        membership.atype = member_type as i32;
-        membership.status = MembershipStatus::Confirmed as i32;
-        membership
+        test_membership(member_type, MembershipStatus::Confirmed)
     }
 
+    /// A flagless Custom member gets no blanket collection authority from its role -- which is also what a
+    /// migrated legacy Manager looks like when its authority came from a group rather than the membership
+    /// (the repair migration writes that reach into the permission columns instead, so nothing is derived
+    /// from group shape at runtime).
+    ///
+    /// Edit and read are answered per collection by `has_explicit_collection_manage_access`, which accepts
+    /// a real manage grant and nothing else -- a group's `access_all` is not one. Delete has no
+    /// per-collection fallback at all, hence Denied rather than ExplicitManage.
     #[test]
     fn flagless_custom_requires_explicit_manage_for_edit_and_read_and_cannot_delete() {
-        // A flagless Custom member gets no blanket collection authority from its role. Edit and read are
-        // answered per collection by `has_explicit_collection_manage_access`, which accepts a real manage
-        // grant and nothing else -- a group's `access_all` is not one. Delete has no per-collection fallback
-        // at all, hence Denied rather than ExplicitManage; see `collection_delete_access`.
         let custom = membership(MembershipType::Custom);
         assert_eq!(collection_edit_access(&custom), CollectionManageAccess::ExplicitManage);
         assert_eq!(collection_read_access(&custom), CollectionManageAccess::ExplicitManage);
         assert_eq!(collection_delete_access(&custom), CollectionManageAccess::Denied);
+
+        // An unconfirmed membership reaches nothing at all, however many columns are set.
+        let mut unconfirmed = test_membership(MembershipType::Custom, MembershipStatus::Accepted);
+        unconfirmed.edit_any_collection = true;
+        unconfirmed.delete_any_collection = true;
+        assert_eq!(collection_edit_access(&unconfirmed), CollectionManageAccess::Denied);
+        assert_eq!(collection_read_access(&unconfirmed), CollectionManageAccess::Denied);
+        assert_eq!(collection_delete_access(&unconfirmed), CollectionManageAccess::Denied);
     }
 
+    /// Each `any` permission answers exactly its own question, and Admin/User bracket the range.
     #[test]
-    fn custom_any_permissions_remain_independent() {
+    fn collection_access_roles_are_independent() {
         let mut edit_any = membership(MembershipType::Custom);
         edit_any.edit_any_collection = true;
         assert_eq!(collection_edit_access(&edit_any), CollectionManageAccess::Any);
@@ -1723,6 +1733,19 @@ mod tests {
         create_only.create_new_collections = true;
         assert_eq!(collection_edit_access(&create_only), CollectionManageAccess::ExplicitManage);
         assert_eq!(collection_delete_access(&create_only), CollectionManageAccess::Denied);
+
+        // A migrated legacy Manager that did reach every collection carries it in the columns, and
+        // is then an ordinary Edit/Delete any collection holder.
+        let mut migrated = membership(MembershipType::Custom);
+        migrated.edit_any_collection = true;
+        migrated.delete_any_collection = true;
+        assert_eq!(collection_edit_access(&migrated), CollectionManageAccess::Any);
+        assert_eq!(collection_delete_access(&migrated), CollectionManageAccess::Any);
+
+        for access in [collection_edit_access, collection_read_access, collection_delete_access] {
+            assert_eq!(access(&membership(MembershipType::Admin)), CollectionManageAccess::Any);
+            assert_eq!(access(&membership(MembershipType::User)), CollectionManageAccess::Denied);
+        }
     }
 
     /// A stored `atype` that is not one of the four known roles must never be treated as one, in
@@ -1744,43 +1767,5 @@ mod tests {
             assert_eq!(collection_read_access(&unknown), CollectionManageAccess::Denied, "atype {atype}");
             assert_eq!(collection_delete_access(&unknown), CollectionManageAccess::Denied, "atype {atype}");
         }
-    }
-
-    #[test]
-    fn admin_and_user_collection_access_roles() {
-        let admin = membership(MembershipType::Admin);
-        assert_eq!(collection_edit_access(&admin), CollectionManageAccess::Any);
-        assert_eq!(collection_read_access(&admin), CollectionManageAccess::Any);
-        assert_eq!(collection_delete_access(&admin), CollectionManageAccess::Any);
-
-        let user = membership(MembershipType::User);
-        assert_eq!(collection_edit_access(&user), CollectionManageAccess::Denied);
-        assert_eq!(collection_read_access(&user), CollectionManageAccess::Denied);
-        assert_eq!(collection_delete_access(&user), CollectionManageAccess::Denied);
-    }
-
-    #[test]
-    fn a_migrated_legacy_manager_carries_its_authority_in_the_permission_columns() {
-        // A legacy Manager who managed every collection through a group with access_all is not
-        // recognized by its shape at runtime -- that shape is indistinguishable from a newly created
-        // flagless Custom member. The repair migration writes the authority into the permission
-        // columns instead, so the guard sees an ordinary Edit/Delete any collection holder.
-        let mut migrated_group_manager = membership(MembershipType::Custom);
-        migrated_group_manager.edit_any_collection = true;
-        migrated_group_manager.delete_any_collection = true;
-        assert_eq!(collection_edit_access(&migrated_group_manager), CollectionManageAccess::Any);
-        assert_eq!(collection_delete_access(&migrated_group_manager), CollectionManageAccess::Any);
-
-        // Without those columns nothing is derived, no matter which groups the member belongs to.
-        let flagless = membership(MembershipType::Custom);
-        assert_eq!(collection_edit_access(&flagless), CollectionManageAccess::ExplicitManage);
-        assert_eq!(collection_delete_access(&flagless), CollectionManageAccess::Denied);
-
-        let mut unconfirmed = membership(MembershipType::Custom);
-        unconfirmed.status = MembershipStatus::Accepted as i32;
-        unconfirmed.edit_any_collection = true;
-        unconfirmed.delete_any_collection = true;
-        assert_eq!(collection_edit_access(&unconfirmed), CollectionManageAccess::Denied);
-        assert_eq!(collection_delete_access(&unconfirmed), CollectionManageAccess::Denied);
     }
 }
