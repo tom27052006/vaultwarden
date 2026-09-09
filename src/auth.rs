@@ -1696,15 +1696,65 @@ mod tests {
     }
 
     #[test]
-    fn flagless_custom_requires_explicit_manage_for_edit_and_read_and_cannot_delete() {
-        // A flagless Custom member gets no blanket collection authority from its role. Edit and read are
-        // answered per collection by `has_explicit_collection_manage_access`, which accepts a real manage
-        // grant and nothing else -- a group's `access_all` is not one. Delete has no per-collection fallback
-        // at all, hence Denied rather than ExplicitManage; see `collection_delete_access`.
-        let custom = membership(MembershipType::Custom);
-        assert_eq!(collection_edit_access(&custom), CollectionManageAccess::ExplicitManage);
-        assert_eq!(collection_read_access(&custom), CollectionManageAccess::ExplicitManage);
-        assert_eq!(collection_delete_access(&custom), CollectionManageAccess::Denied);
+    fn collection_access_role_status_and_unknown_role_boundaries() {
+        let assert_access = |name: &str,
+                             membership: &Membership,
+                             edit: CollectionManageAccess,
+                             read: CollectionManageAccess,
+                             delete: CollectionManageAccess| {
+            assert_eq!(collection_edit_access(membership), edit, "{name}: edit");
+            assert_eq!(collection_read_access(membership), read, "{name}: read");
+            assert_eq!(collection_delete_access(membership), delete, "{name}: delete");
+        };
+
+        assert_access(
+            "flagless Custom",
+            &membership(MembershipType::Custom),
+            CollectionManageAccess::ExplicitManage,
+            CollectionManageAccess::ExplicitManage,
+            CollectionManageAccess::Denied,
+        );
+        assert_access(
+            "Admin",
+            &membership(MembershipType::Admin),
+            CollectionManageAccess::Any,
+            CollectionManageAccess::Any,
+            CollectionManageAccess::Any,
+        );
+        assert_access(
+            "User",
+            &membership(MembershipType::User),
+            CollectionManageAccess::Denied,
+            CollectionManageAccess::Denied,
+            CollectionManageAccess::Denied,
+        );
+
+        let mut unconfirmed = membership(MembershipType::Custom);
+        unconfirmed.status = MembershipStatus::Accepted as i32;
+        unconfirmed.edit_any_collection = true;
+        unconfirmed.delete_any_collection = true;
+        assert_access(
+            "unconfirmed Custom",
+            &unconfirmed,
+            CollectionManageAccess::Denied,
+            CollectionManageAccess::Denied,
+            CollectionManageAccess::Denied,
+        );
+
+        for atype in [-1, 3, 5, i32::MAX, i32::MIN] {
+            let mut unknown = membership(MembershipType::Custom);
+            unknown.atype = atype;
+            unknown.create_new_collections = true;
+            unknown.edit_any_collection = true;
+            unknown.delete_any_collection = true;
+            assert_access(
+                &format!("unknown atype {atype}"),
+                &unknown,
+                CollectionManageAccess::Denied,
+                CollectionManageAccess::Denied,
+                CollectionManageAccess::Denied,
+            );
+        }
     }
 
     #[test]
@@ -1729,64 +1779,5 @@ mod tests {
         create_only.create_new_collections = true;
         assert_eq!(collection_edit_access(&create_only), CollectionManageAccess::ExplicitManage);
         assert_eq!(collection_delete_access(&create_only), CollectionManageAccess::Denied);
-    }
-
-    /// A stored `atype` that is not one of the four known roles must never be treated as one, in
-    /// either direction. 3 is the retired Manager discriminant, and a negative value is what a
-    /// corrupt row or a hand-written UPDATE could leave behind -- it would satisfy a numeric
-    /// `atype <= Admin` SQL predicate, which is why the queries enumerate the two admin values
-    /// instead (`ORG_ADMIN_ATYPES`).
-    #[test]
-    fn unknown_stored_role_values_fail_closed() {
-        for atype in [-1, 3, 5, i32::MAX, i32::MIN] {
-            let mut unknown = membership(MembershipType::Custom);
-            unknown.atype = atype;
-            // Even with every permission set, an unrecognized role grants nothing.
-            unknown.edit_any_collection = true;
-            unknown.delete_any_collection = true;
-            unknown.create_new_collections = true;
-
-            assert_eq!(collection_edit_access(&unknown), CollectionManageAccess::Denied, "atype {atype}");
-            assert_eq!(collection_read_access(&unknown), CollectionManageAccess::Denied, "atype {atype}");
-            assert_eq!(collection_delete_access(&unknown), CollectionManageAccess::Denied, "atype {atype}");
-        }
-    }
-
-    #[test]
-    fn admin_and_user_collection_access_roles() {
-        let admin = membership(MembershipType::Admin);
-        assert_eq!(collection_edit_access(&admin), CollectionManageAccess::Any);
-        assert_eq!(collection_read_access(&admin), CollectionManageAccess::Any);
-        assert_eq!(collection_delete_access(&admin), CollectionManageAccess::Any);
-
-        let user = membership(MembershipType::User);
-        assert_eq!(collection_edit_access(&user), CollectionManageAccess::Denied);
-        assert_eq!(collection_read_access(&user), CollectionManageAccess::Denied);
-        assert_eq!(collection_delete_access(&user), CollectionManageAccess::Denied);
-    }
-
-    #[test]
-    fn a_migrated_legacy_manager_carries_its_authority_in_the_permission_columns() {
-        // A legacy Manager who managed every collection through a group with access_all is not
-        // recognized by its shape at runtime -- that shape is indistinguishable from a newly created
-        // flagless Custom member. The repair migration writes the authority into the permission
-        // columns instead, so the guard sees an ordinary Edit/Delete any collection holder.
-        let mut migrated_group_manager = membership(MembershipType::Custom);
-        migrated_group_manager.edit_any_collection = true;
-        migrated_group_manager.delete_any_collection = true;
-        assert_eq!(collection_edit_access(&migrated_group_manager), CollectionManageAccess::Any);
-        assert_eq!(collection_delete_access(&migrated_group_manager), CollectionManageAccess::Any);
-
-        // Without those columns nothing is derived, no matter which groups the member belongs to.
-        let flagless = membership(MembershipType::Custom);
-        assert_eq!(collection_edit_access(&flagless), CollectionManageAccess::ExplicitManage);
-        assert_eq!(collection_delete_access(&flagless), CollectionManageAccess::Denied);
-
-        let mut unconfirmed = membership(MembershipType::Custom);
-        unconfirmed.status = MembershipStatus::Accepted as i32;
-        unconfirmed.edit_any_collection = true;
-        unconfirmed.delete_any_collection = true;
-        assert_eq!(collection_edit_access(&unconfirmed), CollectionManageAccess::Denied);
-        assert_eq!(collection_delete_access(&unconfirmed), CollectionManageAccess::Denied);
     }
 }

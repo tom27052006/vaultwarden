@@ -4513,51 +4513,6 @@ mod tests {
         assert!(!may_grant_access_all_group(MembershipType::User));
     }
 
-    /// No Custom permission opens this, and in particular not the two that come closest:
-    /// `editAnyCollection` satisfies `has_full_access()` (which gates every other group operation) and
-    /// `deleteAnyCollection` is accepted for a per-collection `manage` row.
-    #[test]
-    fn no_custom_permission_grants_access_all_group_authority() {
-        let mut edit_any = confirmed_member(MembershipType::Custom);
-        edit_any.edit_any_collection = true;
-        assert!(edit_any.has_full_access(), "the escalation starts from a member who has full access");
-
-        let mut delete_any = confirmed_member(MembershipType::Custom);
-        delete_any.delete_any_collection = true;
-        assert_eq!(
-            caller_manage_grant_role_check(&delete_any),
-            Some(true),
-            "delete-any may still confer a per-collection manage grant"
-        );
-
-        // Neither, nor any combination, is organization-wide group authority.
-        assert!(!may_grant_access_all_group(MembershipType::Custom));
-    }
-
-    /// The invite path's group gate is `caller_can_manage_collections`, which `editAnyCollection`
-    /// satisfies, so this caller clears every precondition checked before the access-all rule.
-    #[test]
-    fn inviting_into_an_access_all_group_is_admin_only() {
-        let mut inviter = confirmed_member(MembershipType::Custom);
-        inviter.manage_users = true;
-        inviter.manage_groups = true;
-        inviter.edit_any_collection = true;
-
-        // Everything `send_invite` checks before the access-all rule passes for this caller ...
-        assert!(inviter.has_manage_users(), "reaches send_invite at all");
-        assert!(inviter.has_manage_groups(), "satisfies caller_can_manage_groups");
-        assert!(inviter.has_full_access(), "satisfies caller_can_manage_collections");
-        assert!(
-            may_provision_member_type(MembershipType::Custom, MembershipType::User),
-            "and may invite the one role a Custom member can provision"
-        );
-
-        // ... and the organization-wide group is still out of reach.
-        assert!(!may_grant_access_all_group(MembershipType::Custom));
-        assert!(may_grant_access_all_group(MembershipType::Admin));
-        assert!(may_grant_access_all_group(MembershipType::Owner));
-    }
-
     /// Only *adding* to an access-all group is restricted; removals and an unchanged set are allowed.
     #[test]
     fn only_additions_to_an_access_all_group_are_restricted() {
@@ -4575,14 +4530,6 @@ mod tests {
         assert!(adds_group_member(&HashSet::from([&a, &b, &c]), &current));
         assert!(adds_group_member(&HashSet::from([&c]), &current));
         assert!(adds_group_member(&HashSet::from([&a, &c]), &current));
-    }
-
-    /// The collection-bearing rule still admits any caller who can manage collections.
-    #[test]
-    fn the_collection_bearing_group_rule_is_unchanged() {
-        assert!(may_change_group_membership(true, true));
-        assert!(!may_change_group_membership(false, true));
-        assert!(may_change_group_membership(false, false));
     }
 
     /// An unparsable stored role holds no authority but still has to be removable: an Owner may delete
@@ -4613,37 +4560,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// For a role this build knows, delete keeps the provisioning matrix and revoke the looser
-    /// management one.
-    #[test]
-    fn known_roles_keep_their_existing_delete_and_revoke_matrices() {
-        for caller in [MembershipType::Owner, MembershipType::Admin, MembershipType::Custom, MembershipType::User] {
-            for target in [MembershipType::Owner, MembershipType::Admin, MembershipType::Custom, MembershipType::User] {
-                assert_eq!(
-                    may_delete_stored_member_type(caller, target as i32),
-                    may_provision_member_type(caller, target),
-                    "delete: caller={} target={}",
-                    caller as i32,
-                    target as i32
-                );
-                assert_eq!(
-                    may_revoke_stored_member_type(caller, target as i32),
-                    may_manage_member_type(caller, target),
-                    "revoke: caller={} target={}",
-                    caller as i32,
-                    target as i32
-                );
-            }
-        }
-
-        // The place the two matrices differ, kept intact: an Admin may revoke a peer Admin but may
-        // not delete one, while an Owner may do both.
-        assert!(may_revoke_stored_member_type(MembershipType::Admin, MembershipType::Admin as i32));
-        assert!(!may_delete_stored_member_type(MembershipType::Admin, MembershipType::Admin as i32));
-        assert!(may_revoke_stored_member_type(MembershipType::Owner, MembershipType::Admin as i32));
-        assert!(may_delete_stored_member_type(MembershipType::Owner, MembershipType::Admin as i32));
     }
 
     #[test]
@@ -4861,15 +4777,12 @@ mod tests {
         assert!(may_change_member_type(MembershipType::Owner, user, MembershipType::Custom));
         assert!(may_change_member_type(MembershipType::Admin, user, MembershipType::Custom));
 
-        // A below-Admin caller (Custom-with-manage_users) may only submit an unchanged role, so the
-        // regular edit dialog keeps working.
-        assert!(may_change_member_type(MembershipType::Custom, user, MembershipType::User));
-        assert!(may_change_member_type(MembershipType::Custom, custom, MembershipType::Custom));
+        // A below-Admin caller may submit an unchanged role so the regular edit dialog keeps working.
+        for target in [MembershipType::Owner, MembershipType::Admin, MembershipType::Custom, MembershipType::User] {
+            assert!(may_change_member_type(MembershipType::Custom, target as i32, target));
+        }
 
-        // REGRESSION (privilege escalation, PR #7397 / finding F1): a caller below Admin must NOT
-        // be able to change a member's role. Promoting User -> Custom can activate explicit
-        // collection-Manage assignments and Custom-only authorization paths; demoting revokes
-        // them. A manage_users caller is not entitled to either authority change.
+        // A caller below Admin cannot activate or revoke Custom-only authority by changing roles.
         assert!(!may_change_member_type(MembershipType::Custom, user, MembershipType::Custom));
         assert!(!may_change_member_type(MembershipType::Custom, custom, MembershipType::User));
     }
@@ -4877,77 +4790,60 @@ mod tests {
     #[test]
     fn member_lifecycle_permissions_follow_the_role_hierarchy() {
         let roles = [MembershipType::Owner, MembershipType::Admin, MembershipType::Custom, MembershipType::User];
+        let manage = [
+            [true, true, true, true],
+            [false, true, true, true],
+            [false, false, false, true],
+            [false, false, false, false],
+        ];
+        let provision = [
+            [true, true, true, true],
+            [false, false, true, true],
+            [false, false, false, true],
+            [false, false, false, false],
+        ];
 
-        for target in roles {
-            assert!(may_manage_member_type(MembershipType::Owner, target));
+        for (caller_index, caller) in roles.into_iter().enumerate() {
+            for (target_index, target) in roles.into_iter().enumerate() {
+                let label = format!("caller={} target={}", caller as i32, target as i32);
+                assert_eq!(may_manage_member_type(caller, target), manage[caller_index][target_index], "{label}");
+                assert_eq!(may_provision_member_type(caller, target), provision[caller_index][target_index], "{label}");
+                assert_eq!(
+                    may_revoke_stored_member_type(caller, target as i32),
+                    manage[caller_index][target_index],
+                    "revoke {label}"
+                );
+                assert_eq!(
+                    may_delete_stored_member_type(caller, target as i32),
+                    provision[caller_index][target_index],
+                    "delete {label}"
+                );
+                assert_eq!(
+                    may_manage_stored_member_type(caller, target as i32),
+                    manage[caller_index][target_index],
+                    "stored manage {label}"
+                );
+                assert_eq!(
+                    may_provision_stored_member_type(caller, target as i32),
+                    provision[caller_index][target_index],
+                    "stored provision {label}"
+                );
+            }
         }
-
-        assert!(!may_manage_member_type(MembershipType::Admin, MembershipType::Owner));
-        assert!(may_manage_member_type(MembershipType::Admin, MembershipType::Admin));
-        assert!(may_manage_member_type(MembershipType::Admin, MembershipType::Custom));
-        assert!(may_manage_member_type(MembershipType::Admin, MembershipType::User));
-
-        assert!(!may_manage_member_type(MembershipType::Custom, MembershipType::Owner));
-        assert!(!may_manage_member_type(MembershipType::Custom, MembershipType::Admin));
-        assert!(!may_manage_member_type(MembershipType::Custom, MembershipType::Custom));
-        assert!(may_manage_member_type(MembershipType::Custom, MembershipType::User));
-
-        for target in roles {
-            assert!(!may_manage_member_type(MembershipType::User, target));
-        }
-
-        assert!(may_manage_stored_member_type(MembershipType::Admin, MembershipType::Custom as i32));
-        assert!(!may_manage_stored_member_type(MembershipType::Owner, i32::MAX));
-
-        // edit_member applies the same matrix as reinvite/confirm/revoke/restore/delete, so a
-        // Custom caller cannot target an Admin or a fellow Custom member even when the requested
-        // role equals the stored one.
-        for target in [MembershipType::Owner, MembershipType::Admin, MembershipType::Custom] {
-            assert!(may_change_member_type(MembershipType::Custom, target as i32, target));
-            assert!(!may_manage_stored_member_type(MembershipType::Custom, target as i32));
-        }
-        assert!(may_manage_stored_member_type(MembershipType::Custom, MembershipType::User as i32));
     }
 
     #[test]
-    fn only_owners_provision_admin_memberships() {
-        // REGRESSION: bringing an Admin (or Owner) membership into or out of existence stays
-        // Owner-only, exactly as before this feature ("Only Owners can invite Managers, Admins or
-        // Owners" / "Only Owners can delete Admins or Owners"). Otherwise an Admin could route around
-        // the Owner-only role-change guard in `edit_member` by inviting a fresh Admin instead.
-        for target in [MembershipType::Owner, MembershipType::Admin, MembershipType::Custom, MembershipType::User] {
-            assert!(may_provision_member_type(MembershipType::Owner, target));
+    fn group_membership_changes_cannot_confer_collection_authority() {
+        for (can_manage_collections, group_has_collection_access, expected) in
+            [(true, true, true), (true, false, true), (false, false, true), (false, true, false)]
+        {
+            assert_eq!(
+                may_change_group_membership(can_manage_collections, group_has_collection_access),
+                expected,
+                "can_manage_collections={can_manage_collections} group_has_collection_access={group_has_collection_access}"
+            );
         }
 
-        assert!(!may_provision_member_type(MembershipType::Admin, MembershipType::Owner));
-        assert!(!may_provision_member_type(MembershipType::Admin, MembershipType::Admin));
-        assert!(may_provision_member_type(MembershipType::Admin, MembershipType::Custom));
-        assert!(may_provision_member_type(MembershipType::Admin, MembershipType::User));
-
-        // A Custom member with manage_users stays limited to ordinary Users, as for every other
-        // lifecycle action.
-        assert!(may_provision_member_type(MembershipType::Custom, MembershipType::User));
-        for target in [MembershipType::Owner, MembershipType::Admin, MembershipType::Custom] {
-            assert!(!may_provision_member_type(MembershipType::Custom, target));
-        }
-        for target in [MembershipType::Owner, MembershipType::Admin, MembershipType::Custom, MembershipType::User] {
-            assert!(!may_provision_member_type(MembershipType::User, target));
-        }
-
-        // Provisioning is strictly narrower than the state-change matrix: an Admin may still revoke,
-        // restore or edit a peer Admin (which Vaultwarden allowed before), but no longer create,
-        // confirm or delete one.
-        assert!(may_manage_member_type(MembershipType::Admin, MembershipType::Admin));
-        assert!(!may_provision_member_type(MembershipType::Admin, MembershipType::Admin));
-
-        assert!(may_provision_stored_member_type(MembershipType::Admin, MembershipType::User as i32));
-        assert!(!may_provision_stored_member_type(MembershipType::Admin, MembershipType::Admin as i32));
-        // An unknown stored role never qualifies.
-        assert!(!may_provision_stored_member_type(MembershipType::Owner, i32::MAX));
-    }
-
-    #[test]
-    fn only_collection_bearing_group_changes_are_rejected() {
         let plain: GroupId = "plain".to_owned().into();
         let bearing: GroupId = "bearing".to_owned().into();
         let collection_bearing = HashSet::from([bearing.clone()]);
@@ -4965,24 +4861,6 @@ mod tests {
         for (requested, current) in [(set(&[&bearing]), set(&[])), (set(&[&plain]), set(&[&plain, &bearing]))] {
             assert!(!collection_bearing_membership_unchanged(&requested, &current, &collection_bearing));
         }
-    }
-
-    #[test]
-    fn manage_groups_caller_cannot_grant_collection_access_via_groups() {
-        // A caller who can manage collections may change membership of any group.
-        assert!(may_change_group_membership(true, true));
-        assert!(may_change_group_membership(true, false));
-
-        // A caller who cannot manage collections may change membership of groups that confer no
-        // collection access (plain groups).
-        assert!(may_change_group_membership(false, false));
-
-        // REGRESSION (privilege escalation, PR #7397): a caller who cannot manage collections must
-        // NOT be able to change membership of a collection-bearing / access_all group. This is the
-        // vector that let a Custom user with manage_users + manage_groups add themselves to an
-        // access_all group and read all collection contents via edit_member / send_invite. Adding
-        // AND removing such memberships must be denied.
-        assert!(!may_change_group_membership(false, true));
     }
 
     #[test]

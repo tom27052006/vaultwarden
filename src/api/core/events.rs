@@ -532,7 +532,9 @@ mod tests {
         cipher.organization_uuid = Some(org_id.clone());
 
         let admin = membership(MembershipType::Admin, MembershipStatus::Confirmed);
-        assert_eq!(cipher_event_scope(&cipher, &user_id, Some(&admin)), Some(CipherEventScope::Organization(org_id)));
+        let scope = cipher_event_scope(&cipher, &user_id, Some(&admin)).unwrap();
+        assert_eq!(scope.organization_id(), Some(&org_id));
+        assert_eq!(scope, CipherEventScope::Organization(org_id));
 
         let accepted_admin = membership(MembershipType::Admin, MembershipStatus::Accepted);
         assert_eq!(cipher_event_scope(&cipher, &user_id, Some(&accepted_admin)), None);
@@ -543,16 +545,10 @@ mod tests {
 
         cipher.organization_uuid = None;
         cipher.user_uuid = Some(user_id.clone());
-        assert_eq!(cipher_event_scope(&cipher, &user_id, None), Some(CipherEventScope::Personal));
+        let scope = cipher_event_scope(&cipher, &user_id, None).unwrap();
+        assert_eq!(scope.organization_id(), None);
+        assert_eq!(scope, CipherEventScope::Personal);
         assert_eq!(cipher_event_scope(&cipher, &"other-user".to_owned().into(), None), None);
-    }
-
-    #[test]
-    fn cipher_event_scope_selects_the_database_scope_filter() {
-        let org_id: OrganizationId = "test-org".to_owned().into();
-
-        assert_eq!(CipherEventScope::Personal.organization_id(), None);
-        assert_eq!(CipherEventScope::Organization(org_id.clone()).organization_id(), Some(&org_id));
     }
 
     #[test]

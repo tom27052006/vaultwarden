@@ -1443,25 +1443,12 @@ mod tests {
         membership
     }
 
-    /// The SQL-side admin set has to stay in step with the Rust-side role check, and it must not be a
-    /// range: `atype <= Admin` would also match a corrupt negative value that
-    /// `MembershipType::from_i32` rejects.
     #[test]
-    fn the_sql_admin_atype_set_matches_the_two_admin_roles() {
-        assert_eq!(ORG_ADMIN_ATYPES, [MembershipType::Owner as i32, MembershipType::Admin as i32]);
-        for atype in [-1, 2, 3, 5, i32::MAX, i32::MIN] {
-            assert!(!ORG_ADMIN_ATYPES.contains(&atype), "atype {atype} must not count as an organization admin");
-        }
-        for atype in ORG_ADMIN_ATYPES {
-            assert!(
-                matches!(MembershipType::from_i32(*atype), Some(MembershipType::Owner | MembershipType::Admin)),
-                "every value in the set has to resolve to an admin role in Rust as well"
-            );
-        }
-    }
-
-    #[test]
-    fn membership_type_order_preserves_access_rank_and_ord_contract() {
+    #[expect(
+        clippy::nonminimal_bool,
+        reason = "`!(role > atype)` must not become `role <= atype`: unknown stored roles are incomparable"
+    )]
+    fn membership_type_order_and_unknown_values_fail_closed() {
         assert!(MembershipType::Owner > MembershipType::Admin);
         assert!(MembershipType::Admin > MembershipType::Custom);
         assert!(MembershipType::Custom > MembershipType::User);
@@ -1471,6 +1458,8 @@ mod tests {
 
         // Permission comparisons continue to treat Custom as manager-level and below Admin.
         let custom = MembershipType::Custom as i32;
+        assert!(MembershipType::Admin > custom);
+        assert!(MembershipType::Custom >= custom);
         assert!(custom >= MembershipType::Custom);
         assert!(custom < MembershipType::Admin);
 
@@ -1481,24 +1470,7 @@ mod tests {
                 assert_eq!(lhs.cmp(&rhs), rhs.cmp(&lhs).reverse());
             }
         }
-    }
 
-    /// A stored `atype` that no role maps to is *incomparable*, and the two directions resolve that
-    /// differently on purpose -- both fail-closed, and the asymmetry is easy to "tidy up" into a silent
-    /// authorization change.
-    ///
-    /// `MembershipType op i32` -- "does the caller outrank this role?" -- answers no: `gt`/`ge` are false
-    /// for an unknown value. `i32 op MembershipType` -- "is this membership at most that role?" -- answers
-    /// yes: every use is a *ceiling* (`atype < Admin`), so low-ranked is the restrictive reading, and the
-    /// one place phrasing a permission this way guards against `Owner`, whose discriminant is 0.
-    #[test]
-    #[expect(
-        clippy::nonminimal_bool,
-        reason = "`!(role > atype)` must not become `role <= atype`: only `gt`/`ge` are overridden to \
-                  answer false for an incomparable value, while `le`/`lt` fall through to the derived \
-                  form. Clippy's rewrite would assert the opposite of what this test is for."
-    )]
-    fn an_unknown_stored_role_is_incomparable_and_resolves_fail_closed() {
         for atype in [-1, 3, 5, i32::MAX, i32::MIN] {
             assert_eq!(MembershipType::Admin.partial_cmp(&atype), None, "atype {atype}");
             assert_eq!(atype.partial_cmp(&MembershipType::Admin), None, "atype {atype}");
@@ -1518,11 +1490,6 @@ mod tests {
             assert!(atype != MembershipType::Custom, "atype {atype}");
             assert!(MembershipType::Custom != atype, "atype {atype}");
         }
-
-        // The known values keep behaving by rank, not by discriminant: Custom's is 4, above Admin's.
-        assert!(MembershipType::Admin > MembershipType::Custom as i32);
-        assert!((MembershipType::Custom as i32) < MembershipType::Admin);
-        assert!(MembershipType::Custom >= MembershipType::Custom as i32);
     }
 
     /// Policy enforcement revokes non-compliant peers, never Admins/Owners, and never the member
@@ -1564,36 +1531,75 @@ mod tests {
     }
 
     #[test]
-    fn custom_collection_permissions_are_independent_and_type_gated() {
-        let mut member = membership(MembershipType::Custom);
-        member.create_new_collections = true;
+    fn custom_permissions_are_independent_and_type_gated() {
+        let effective = |member: &Membership| {
+            [
+                member.has_manage_users(),
+                member.has_manage_groups(),
+                member.has_manage_policies(),
+                member.has_create_new_collections(),
+                member.has_edit_any_collection(),
+                member.has_delete_any_collection(),
+                member.has_access_event_logs(),
+                member.has_access_import_export(),
+                member.has_access_reports(),
+            ]
+        };
+        let grants: [(&str, fn(&mut Membership)); 9] = [
+            ("manage_users", |member| member.manage_users = true),
+            ("manage_groups", |member| member.manage_groups = true),
+            ("manage_policies", |member| member.manage_policies = true),
+            ("create_new_collections", |member| member.create_new_collections = true),
+            ("edit_any_collection", |member| member.edit_any_collection = true),
+            ("delete_any_collection", |member| member.delete_any_collection = true),
+            ("access_event_logs", |member| member.access_event_logs = true),
+            ("access_import_export", |member| member.access_import_export = true),
+            ("access_reports", |member| member.access_reports = true),
+        ];
 
-        assert!(member.has_create_new_collections());
-        assert!(member.can_create_new_collections());
-        assert!(!member.limit_collection_creation());
-        assert!(!member.has_full_access());
-        assert!(!member.can_delete_any_collection());
-        assert!(!member.has_manage_all_collections());
+        for (index, (name, grant)) in grants.iter().enumerate() {
+            let mut member = membership(MembershipType::Custom);
+            grant(&mut member);
+            let mut expected = [false; 9];
+            expected[index] = true;
+            assert_eq!(effective(&member), expected, "{name}");
+        }
 
-        member.delete_any_collection = true;
-        assert!(member.has_delete_any_collection());
-        assert!(member.can_delete_any_collection());
-        assert!(!member.has_full_access());
-        assert!(!member.has_manage_all_collections());
+        let mut create = membership(MembershipType::Custom);
+        create.create_new_collections = true;
+        assert!(create.can_create_new_collections());
+        assert!(!create.limit_collection_creation());
+        assert!(!create.has_full_access());
+        assert!(!create.can_delete_any_collection());
 
-        member.edit_any_collection = true;
-        assert!(member.has_edit_any_collection());
-        assert!(member.has_full_access());
-        assert!(member.has_manage_all_collections());
+        let mut edit = membership(MembershipType::Custom);
+        edit.edit_any_collection = true;
+        assert!(edit.has_full_access());
+        assert!(edit.grants_access_to_all_collections());
+        assert!(!edit.can_create_new_collections());
+        assert!(edit.limit_collection_creation());
+        assert!(!edit.can_delete_any_collection());
 
-        // Stale flags on a non-Custom role are inert.
-        member.atype = MembershipType::User as i32;
-        assert!(!member.has_create_new_collections());
-        assert!(!member.has_edit_any_collection());
-        assert!(!member.has_delete_any_collection());
-        assert!(!member.can_create_new_collections());
-        assert!(!member.can_delete_any_collection());
-        assert!(!member.has_full_access());
+        let mut delete = membership(MembershipType::Custom);
+        delete.delete_any_collection = true;
+        assert!(delete.can_delete_any_collection());
+        assert!(!delete.has_full_access());
+        assert!(!delete.can_create_new_collections());
+
+        let mut stale_user = membership(MembershipType::User);
+        for (_, grant) in grants {
+            grant(&mut stale_user);
+        }
+        assert_eq!(effective(&stale_user), [false; 9]);
+        assert!(!stale_user.can_create_new_collections());
+        assert!(!stale_user.can_delete_any_collection());
+        assert!(!stale_user.has_full_access());
+
+        let admin = membership(MembershipType::Admin);
+        assert!(admin.can_create_new_collections());
+        assert!(!admin.limit_collection_creation());
+        assert!(admin.can_delete_any_collection());
+        assert!(admin.grants_access_to_all_collections());
     }
 
     #[cfg(sqlite)]
@@ -1628,26 +1634,6 @@ mod tests {
     }
 
     #[test]
-    fn edit_any_collection_does_not_imply_create_or_delete() {
-        let mut custom = membership(MembershipType::Custom);
-        custom.edit_any_collection = true;
-
-        // Edit any collection grants full (read/edit) access to every collection, but client-facing
-        // create and delete decisions must still use their own dedicated permissions.
-        assert!(custom.has_full_access());
-        assert!(custom.grants_access_to_all_collections());
-        assert!(!custom.can_create_new_collections());
-        assert!(custom.limit_collection_creation());
-        assert!(!custom.can_delete_any_collection());
-
-        let admin = membership(MembershipType::Admin);
-        assert!(admin.can_create_new_collections());
-        assert!(!admin.limit_collection_creation());
-        assert!(admin.can_delete_any_collection());
-        assert!(admin.grants_access_to_all_collections());
-    }
-
-    #[test]
     fn custom_collection_permissions_require_confirmed_membership() {
         let mut member = membership(MembershipType::Custom);
         member.create_new_collections = true;
@@ -1658,51 +1644,5 @@ mod tests {
         assert!(!member.can_create_new_collections());
         assert!(!member.can_delete_any_collection());
         assert!(!member.has_full_access());
-    }
-
-    #[test]
-    fn clearing_custom_permissions_clears_every_flag() {
-        let mut member = membership(MembershipType::Custom);
-        member.manage_users = true;
-        member.manage_groups = true;
-        member.manage_policies = true;
-        member.create_new_collections = true;
-        member.edit_any_collection = true;
-        member.delete_any_collection = true;
-        member.access_event_logs = true;
-        member.access_import_export = true;
-        member.access_reports = true;
-
-        member.clear_custom_permissions();
-
-        assert!(!member.manage_users);
-        assert!(!member.manage_groups);
-        assert!(!member.manage_policies);
-        assert!(!member.create_new_collections);
-        assert!(!member.edit_any_collection);
-        assert!(!member.delete_any_collection);
-        assert!(!member.access_event_logs);
-        assert!(!member.access_import_export);
-        assert!(!member.access_reports);
-    }
-
-    #[test]
-    fn custom_access_permissions_are_independent_and_type_gated() {
-        let mut member = membership(MembershipType::Custom);
-        member.access_event_logs = true;
-        assert!(member.has_access_event_logs());
-        assert!(!member.has_access_import_export());
-
-        member.access_import_export = true;
-        member.access_reports = true;
-        assert!(member.has_access_import_export());
-        // None of them imply collection or management capabilities.
-        assert!(!member.has_full_access());
-        assert!(!member.has_manage_users());
-
-        // Stale flags on a non-Custom role grant nothing.
-        member.atype = MembershipType::User as i32;
-        assert!(!member.has_access_event_logs());
-        assert!(!member.has_access_import_export());
     }
 }

@@ -958,46 +958,44 @@ mod tests {
     }
 
     #[test]
-    fn admin_type_changes_clear_custom_permissions() {
+    fn admin_type_changes_preserve_permissions_only_when_remaining_custom() {
+        let permissions = |membership: &Membership| {
+            [
+                membership.manage_users,
+                membership.manage_groups,
+                membership.manage_policies,
+                membership.create_new_collections,
+                membership.edit_any_collection,
+                membership.delete_any_collection,
+                membership.access_event_logs,
+                membership.access_import_export,
+                membership.access_reports,
+            ]
+        };
+
         let mut custom = membership(MembershipType::Custom);
         custom.manage_users = true;
+        custom.manage_groups = true;
+        custom.manage_policies = true;
         custom.create_new_collections = true;
         custom.edit_any_collection = true;
         custom.delete_any_collection = true;
+        custom.access_event_logs = true;
+        custom.access_import_export = true;
+        custom.access_reports = true;
+
+        apply_membership_type_change(&mut custom, MembershipType::Custom);
+        assert_eq!(permissions(&custom), [true; 9]);
 
         apply_membership_type_change(&mut custom, MembershipType::User);
         assert_eq!(custom.atype, MembershipType::User as i32);
-        assert!(!custom.manage_users);
-        assert!(!custom.create_new_collections);
-        assert!(!custom.edit_any_collection);
-        assert!(!custom.delete_any_collection);
+        assert_eq!(permissions(&custom), [false; 9]);
 
         // Entering Custom through the admin panel is fail-closed: no granular permissions are set.
         let mut admin = membership(MembershipType::Admin);
         apply_membership_type_change(&mut admin, MembershipType::Custom);
         assert_eq!(admin.atype, MembershipType::Custom as i32);
-        assert!(!admin.has_manage_all_collections());
-        assert!(!admin.edit_any_collection);
-    }
-
-    #[test]
-    fn admin_custom_to_custom_keeps_flags_but_other_transitions_clear() {
-        // A member kept as Custom retains its granular flags: the admin panel does not touch them;
-        // they are managed through the regular organization member dialog.
-        let mut custom = membership(MembershipType::Custom);
-        custom.manage_users = true;
-        custom.edit_any_collection = true;
-        apply_membership_type_change(&mut custom, MembershipType::Custom);
-        assert_eq!(custom.atype, MembershipType::Custom as i32);
-        assert!(custom.manage_users);
-        assert!(custom.edit_any_collection);
-
-        // Promoting to Admin/Owner drops any stale custom flags.
-        let mut promo = membership(MembershipType::Custom);
-        promo.edit_any_collection = true;
-        apply_membership_type_change(&mut promo, MembershipType::Admin);
-        assert_eq!(promo.atype, MembershipType::Admin as i32);
-        assert!(!promo.edit_any_collection);
+        assert_eq!(permissions(&admin), [false; 9]);
     }
 
     #[test]

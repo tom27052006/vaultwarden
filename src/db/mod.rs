@@ -2449,6 +2449,18 @@ mod custom_role_migration_preflight_tests {
             assert_eq!(decide(facts), expected, "{name}");
         }
         assert_eq!(decide_atomic(ready()), CustomRolePreflightDecision::Proceed);
+
+        let mut broken_with_legacy_flag = missing_access_all;
+        broken_with_legacy_flag.legacy_user_access_all_count = 3;
+        for policy in
+            [LegacyUserAccessAllPolicy::Refuse, LegacyUserAccessAllPolicy::Drop, LegacyUserAccessAllPolicy::Materialize]
+        {
+            assert_eq!(
+                custom_role_preflight_decision(broken_with_legacy_flag, policy, true),
+                CustomRolePreflightDecision::RefuseMissingAccessAll,
+                "{policy:?} must not override the schema refusal"
+            );
+        }
     }
 
     /// The legacy `User + access_all` question still comes first on an interrupted database — and
@@ -2681,25 +2693,6 @@ mod custom_role_migration_preflight_tests {
             "materialize",
         ] {
             assert!(text.contains(expected), "{expected} missing from {text}");
-        }
-    }
-
-    /// A damaged schema still outranks the flag, whatever the policy says: the resolution statements
-    /// read `access_all`, so they cannot run once the column is gone.
-    #[test]
-    fn the_policy_never_overrides_a_refusal_about_the_schema() {
-        let mut broken = ready();
-        broken.access_all_column_exists = false;
-        broken.legacy_user_access_all_count = 3;
-
-        for policy in
-            [LegacyUserAccessAllPolicy::Refuse, LegacyUserAccessAllPolicy::Drop, LegacyUserAccessAllPolicy::Materialize]
-        {
-            assert_eq!(
-                custom_role_preflight_decision(broken, policy, true),
-                CustomRolePreflightDecision::RefuseMissingAccessAll,
-                "{policy:?}"
-            );
         }
     }
 }
