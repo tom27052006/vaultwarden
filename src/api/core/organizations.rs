@@ -411,7 +411,7 @@ async fn get_org_collections(org_id: OrganizationId, headers: ManagerHeadersLoos
         explicitly_managed
     };
     if !can_read_collection_list && collections.is_empty() {
-        err_code!("Resource not found.", "User does not have full access", rocket::http::Status::NotFound.code);
+        err_code!("Resource not found.", "User does not have full access", Status::NotFound.code);
     }
 
     Ok(Json(json!({
@@ -1063,11 +1063,7 @@ fn filter_ciphers_for_organization(ciphers: Vec<Cipher>, org_id: &OrganizationId
 #[get("/ciphers/organization-details/assigned?<data..>")]
 async fn get_assigned_org_details(data: OrgIdData, headers: Headers, conn: DbConn) -> JsonResult {
     if Membership::find_confirmed_by_user_and_org(&headers.user.uuid, &data.organization_id, &conn).await.is_none() {
-        err_code!(
-            "Resource not found.",
-            "User is not a confirmed member of the organization",
-            rocket::http::Status::NotFound.code
-        );
+        err_code!("Resource not found.", "User is not a confirmed member of the organization", Status::NotFound.code);
     }
 
     Ok(Json(json!({
@@ -1121,7 +1117,7 @@ async fn get_org_details(data: OrgIdData, headers: ManagerHeadersLoose, conn: Db
             err_code!(
                 "Resource not found.",
                 "User does not have permission to read the organization ciphers",
-                rocket::http::Status::NotFound.code
+                Status::NotFound.code
             );
         }
     };
@@ -3790,7 +3786,7 @@ async fn get_group_details(
         err!("Group support is disabled");
     }
     if !can_read_group_details(&org_id, &headers.membership, &conn).await {
-        err_code!("Resource not found.", "User does not have access", rocket::http::Status::NotFound.code);
+        err_code!("Resource not found.", "User does not have access", Status::NotFound.code);
     }
 
     let Some(group) = Group::find_by_uuid_and_org(&group_id, &org_id, &conn).await else {
