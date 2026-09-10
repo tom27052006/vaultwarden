@@ -602,10 +602,10 @@ async fn post_organization_collections(
     let collection = Collection::new(org_id.clone(), data.name, data.external_id);
     collection.save(&conn).await?;
 
-    // Security: a `manage` grant carries collection administration authority, so only a caller who may
-    // already administer this collection may confer it. Create is independent of Edit/Delete, so for
-    // `create_new_collections` alone the requested `manage` is forced to false; the creator's own grant
-    // is added separately below. Evaluated after the collection exists so the lookup sees it.
+    // A `manage` grant carries collection edit and ACL authority, so only a caller who may edit this
+    // collection may confer it. Create is independent of Edit, so for `create_new_collections` alone
+    // the requested `manage` is forced to false; the creator's own grant is added separately below.
+    // Evaluated after the collection exists so the lookup sees it.
     let may_grant_manage = caller_may_grant_collection_manage(&headers.membership, &collection.uuid, &conn).await;
     let creator_needs_assignment = !headers.membership.has_full_access();
 
@@ -727,8 +727,7 @@ async fn post_bulk_access_collections(
     for collection in collections {
         let col_id = &collection.uuid;
 
-        // Security: only a caller who could delete this collection may confer a `manage` grant on it;
-        // otherwise the requested `manage` is forced to false.
+        // Only a caller who may edit this collection may confer its edit/ACL `manage` grant.
         let may_grant_manage = caller_may_grant_collection_manage(&headers.membership, col_id, &conn).await;
 
         // update collection modification date
@@ -835,9 +834,9 @@ async fn post_organization_collection_update(
     )
     .await;
 
-    // Security (F-1): only a caller who could delete this collection may confer a `manage` grant on
-    // it (a `manage` row carries delete authority). For everyone else the requested `manage` is
-    // forced to false, so Edit-any-collection can rewrite access but never escalate into deletion.
+    // ManagerHeaders already established that the caller may edit this collection. Resolve the same
+    // authority from the membership so requested `manage` grants survive the replace. Collection
+    // deletion remains independent and never accepts a per-collection `manage` grant.
     let may_grant_manage = match Membership::find_by_user_and_org(&headers.user.uuid, &org_id, &conn).await {
         Some(caller) => caller_may_grant_collection_manage(&caller, &col_id, &conn).await,
         None => false,
@@ -1577,10 +1576,8 @@ async fn send_invite(
 
         // If the member does not already reach every collection, add the collections received
         if !grants_full_access && caller_can_manage_collections {
-            // Security (F-1): a per-collection `manage` grant carries delete authority, so the
-            // caller may only confer it on collections they could delete themselves. Otherwise a
-            // caller acting via Edit-any-collection could invite an account they control with a
-            // `manage` row and reach Delete-any-collection through it.
+            // A per-collection `manage` grant carries edit and ACL authority. Confer it only where
+            // the caller may edit that collection; deletion remains a separate global permission.
             for col in data.collections.iter().flatten() {
                 match Collection::find_by_uuid_and_org(&col.id, &org_id, &conn).await {
                     None => err!("Collection not found in Organization"),
@@ -2058,10 +2055,9 @@ async fn edit_member(
     // Security: only callers who can manage collections (Admin/Owner, or full access) may change a
     // member's collection assignments; manage_users alone leaves them untouched.
     //
-    // Narrowing of upstream, which resolves ModifyUserAccess per collection. Requiring blanket authority
-    // keeps a stored `manage` grant from becoming a lever for handing out access -- the same boundary
-    // `caller_may_grant_collection_manage` draws. Widening this needs the per-collection check to cover
-    // *current* assignments too, or removal becomes the hole.
+    // Narrowing of upstream, which resolves ModifyUserAccess per collection. This endpoint requires
+    // blanket collection authority before it may replace a member's complete assignment set. The
+    // per-assignment `manage` value below still follows the same collection-edit boundary.
     let caller_can_manage_collections = headers.membership_type >= MembershipType::Admin
         || match Membership::find_by_user_and_org(&headers.user.uuid, &org_id, &conn).await {
             Some(m) => m.has_full_access(),
@@ -2100,8 +2096,9 @@ async fn edit_member(
     // database transactions an error between the two used to leave the request half-applied while
     // answering 4xx. This cannot make them atomic, but a *rejected* request now changes nothing.
 
-    // Security: a per-collection `manage` grant is durable administration authority, so it may only be
-    // conferred where the caller already holds it.
+    // A per-collection `manage` grant is durable edit/ACL authority, so it may only be conferred where
+    // the caller may edit the collection. `editAnyCollection` satisfies that condition; neither it nor
+    // the resulting grant affects the separate collection-delete guard.
     let caller = Membership::find_by_user_and_org(&headers.user.uuid, &org_id, &conn).await;
 
     // Resolve the requested assignments: every collection has to exist in *this* organization, and
@@ -3443,12 +3440,12 @@ fn may_change_group_membership(caller_can_manage_collections: bool, group_confer
 /// Whether `caller_type` may hand out organization-wide group access: create a group carrying
 /// `groups.access_all`, turn one into it, or add a member to one.
 ///
-/// Security: `access_all` reaches every collection and is not bound to the grantee's role, so it survives
-/// their Custom permissions being cleared -- a durable grant like a `users_collections.manage` row, which
-/// `caller_may_grant_collection_manage` already reserves. Gating on `has_full_access()` instead would let
-/// `manageGroups` + `editAnyCollection` mint one and outlive the flag it came from, so no Custom
-/// permission satisfies this, `deleteAnyCollection` included. Only granting is restricted; removals,
-/// clearing the flag and deleting the group all reduce access.
+/// Security: `access_all` reaches every current and future collection and is not bound to the grantee's
+/// role, so it survives their Custom permissions being cleared. That is broader than a collection-scoped
+/// `manage` grant. Gating on `has_full_access()` would let `manageGroups` + `editAnyCollection` mint
+/// organization-wide group access that outlives the flag it came from, so no Custom permission satisfies
+/// this, `deleteAnyCollection` included. Only granting is restricted; removals, clearing the flag and
+/// deleting the group all reduce access.
 ///
 /// Asked by `post_groups`, `put_group`, `add_update_group`, `put_group_members`, `edit_member` and
 /// `send_invite` -- the last needs it because every group in an invite is an addition. A missing call
@@ -3599,19 +3596,16 @@ async fn group_grants_access_to_all_collections(group_id: &GroupId, org_id: &Org
 /// Whether `caller` may set a per-collection `manage` grant (`users_collections.manage` /
 /// `collections_groups.manage`) on `col_id`.
 ///
-/// Security: a `manage` grant is collection administration authority (`ManagerHeaders` accepts it via
-/// `has_explicit_collection_manage_access`) and survives every later change to the grantee's role, so a
-/// caller acting through `edit_any_collection` -- revocable by clearing one flag -- must not write one.
-/// Only blanket authority (Admin/Owner, or Custom with `delete_any_collection`) or a real stored grant on
-/// that same collection qualifies. Strictly subtractive: it can only downgrade a requested `manage`.
+/// A `manage` grant has the same edit/ACL authority checked by `ManagerHeaders`, so grant authority must
+/// follow that exact boundary: Admin/Owner, Custom with `edit_any_collection`, or a Custom member with a
+/// real stored grant on this collection. Deletion is deliberately unrelated: with
+/// `limitCollectionDeletion = true`, neither `edit_any_collection` nor a per-collection `manage` grant
+/// satisfies `CollectionDeleteHeaders`.
 async fn caller_may_grant_collection_manage(caller: &Membership, col_id: &CollectionId, conn: &DbConn) -> bool {
     match caller_manage_grant_role_check(caller) {
-        // Role alone decides it (Admin/Owner or delete_any -> yes; User/unknown/unconfirmed -> no).
+        // Role alone decides it (Admin/Owner or edit_any -> yes; User/unknown/unconfirmed -> no).
         Some(decision) => decision,
-        // Custom without delete_any: the answer is per-collection and must reflect a *real* stored
-        // manage grant. `edit_any_collection` deliberately does not count -- it is revocable by clearing
-        // a flag, while a `manage` row written here outlives it, so accepting it would launder temporary
-        // authority into a permanent grant.
+        // A flagless Custom member must hold a real stored manage grant on this collection.
         None => match MembershipType::from_i32(caller.atype) {
             Some(MembershipType::Custom) => caller.has_explicit_collection_manage_access(col_id, conn).await,
             _ => false,
@@ -3673,15 +3667,15 @@ fn may_export_entire_organization(caller: &Membership) -> bool {
 
 /// Pure, collection-independent part of `caller_may_grant_collection_manage`.
 ///
-/// `Some(true)`  -> may grant `manage` on *any* collection (Admin/Owner, or Custom + `delete_any_collection`).
+/// `Some(true)`  -> may grant `manage` on *any* collection (Admin/Owner, or Custom + `edit_any_collection`).
 /// `Some(false)` -> may never grant it (unconfirmed, plain User, or unknown type).
 /// `None`        -> depends on a real per-collection manage grant, resolved against the database.
 ///
-/// Separate so the role gating -- in particular `edit_any_collection` alone yielding `None` rather than
-/// `Some(true)` -- is unit-testable without a DB.
+/// Separate so the role boundary and its independence from collection deletion are unit-testable
+/// without a database.
 fn caller_manage_grant_role_check(caller: &Membership) -> Option<bool> {
-    if caller.can_delete_any_collection() {
-        return Some(true); // Admin/Owner, or a Custom member holding delete_any_collection
+    if caller.has_full_access() {
+        return Some(true); // Confirmed Admin/Owner, or Custom with edit_any_collection
     }
     if !caller.has_status(MembershipStatus::Confirmed) {
         return Some(false);
@@ -3726,9 +3720,8 @@ async fn add_update_group(
 
     group.save(conn).await?;
 
-    // Security: a `collections_groups.manage` grant carries collection delete authority, so it may only
-    // be set on a collection the caller could delete themselves — otherwise Edit-any-collection reaches
-    // Delete-any-collection through a manage-bearing group the caller then joins.
+    // A `collections_groups.manage` grant carries edit and ACL authority, so it may only be set on a
+    // collection the caller may edit. It never satisfies the separate collection-delete guard.
     let caller = Membership::find_by_user_and_org(&headers.user.uuid, &org_id, conn).await;
     for col_selection in collections {
         let mut collection_group = col_selection.to_collection_group(group.uuid.clone());
@@ -4598,34 +4591,42 @@ mod tests {
     }
 
     #[test]
-    fn only_delete_capable_callers_may_grant_collection_manage() {
-        // Admin/Owner may always confer a per-collection `manage` (delete) grant.
+    fn collection_editors_may_grant_collection_manage_without_gaining_delete_authority() {
+        // Admin/Owner may always confer a per-collection edit/ACL `manage` grant.
         assert_eq!(caller_manage_grant_role_check(&confirmed_member(MembershipType::Owner)), Some(true));
         assert_eq!(caller_manage_grant_role_check(&confirmed_member(MembershipType::Admin)), Some(true));
 
-        // A Custom member with `delete_any_collection` may also always grant it.
-        let mut delete_any = confirmed_member(MembershipType::Custom);
-        delete_any.delete_any_collection = true;
-        assert_eq!(caller_manage_grant_role_check(&delete_any), Some(true));
-
-        // REGRESSION (F-1): a Custom member with ONLY `edit_any_collection` must NOT get a blanket
-        // yes. The role check returns None so the decision falls through to a real per-collection
-        // manage grant in the DB — which a self-assigned group/user manage row is prevented from
-        // manufacturing. This is what stops edit-any from escalating into delete-any.
+        // F-01 regression: every ACL-writing path uses this decision for both user and group rows.
+        // Therefore a single or bulk replace preserves an echoed `manage=true`, and the actor may
+        // create a new `manage=true` assignment as well.
         let mut edit_any = confirmed_member(MembershipType::Custom);
         edit_any.edit_any_collection = true;
-        assert_eq!(caller_manage_grant_role_check(&edit_any), None);
+        let may_grant_manage = caller_manage_grant_role_check(&edit_any);
+        assert_eq!(may_grant_manage, Some(true));
+        for (path, requested_user_manage, requested_group_manage) in
+            [("single collection update", true, true), ("bulk collection access replace", true, true)]
+        {
+            assert!(requested_user_manage && may_grant_manage == Some(true), "{path}: user manage");
+            assert!(requested_group_manage && may_grant_manage == Some(true), "{path}: group manage");
+        }
 
-        // A flagless Custom member (this is what a migrated legacy Manager becomes) also defers to
-        // the per-collection DB check.
+        // Delete-any is not collection-edit authority. It can delete through the independent delete
+        // guard, but may only confer `manage` if it also has a real grant on this collection.
+        let mut delete_any = confirmed_member(MembershipType::Custom);
+        delete_any.delete_any_collection = true;
+        assert_eq!(caller_manage_grant_role_check(&delete_any), None);
+
+        // A flagless Custom member, including a migrated legacy Manager, defers to the same
+        // per-collection DB check. A real manage holder may delegate manage on that object.
         assert_eq!(caller_manage_grant_role_check(&confirmed_member(MembershipType::Custom)), None);
 
         // Plain User never qualifies.
         assert_eq!(caller_manage_grant_role_check(&confirmed_member(MembershipType::User)), Some(false));
 
-        // An unconfirmed caller never qualifies, even with delete_any set.
+        // An unconfirmed caller never qualifies, even with both global collection flags set.
         let mut unconfirmed = confirmed_member(MembershipType::Custom);
         unconfirmed.status = MembershipStatus::Accepted as i32;
+        unconfirmed.edit_any_collection = true;
         unconfirmed.delete_any_collection = true;
         assert_eq!(caller_manage_grant_role_check(&unconfirmed), Some(false));
     }

@@ -1707,6 +1707,8 @@ mod tests {
             assert_eq!(collection_delete_access(membership), delete, "{name}: delete");
         };
 
+        // The ExplicitManage branches model a real per-collection manage row. It authorizes edit/read
+        // after the database check, but the delete decision remains denied.
         assert_access(
             "flagless Custom",
             &membership(MembershipType::Custom),
@@ -1714,13 +1716,19 @@ mod tests {
             CollectionManageAccess::ExplicitManage,
             CollectionManageAccess::Denied,
         );
-        assert_access(
-            "Admin",
-            &membership(MembershipType::Admin),
-            CollectionManageAccess::Any,
-            CollectionManageAccess::Any,
-            CollectionManageAccess::Any,
-        );
+        for role in [MembershipType::Admin, MembershipType::Owner] {
+            assert_access(
+                if role == MembershipType::Admin {
+                    "Admin"
+                } else {
+                    "Owner"
+                },
+                &membership(role),
+                CollectionManageAccess::Any,
+                CollectionManageAccess::Any,
+                CollectionManageAccess::Any,
+            );
+        }
         assert_access(
             "User",
             &membership(MembershipType::User),

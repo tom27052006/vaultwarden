@@ -474,6 +474,9 @@ impl<'r> FromRequest<'r> for DbConn {
 /// file refuses them itself as a backstop, but Diesel surfaces only the driver-level duplicate-key error
 /// that produces; the preflight evaluates the same predicates first and offers the way out.
 const CUSTOM_ROLE_PERMISSIONS_MIGRATION: &str = "20260630120000";
+// Upgrade compatibility covers official Vaultwarden database states. Intermediate, unreleased
+// revisions of the Custom-role PR are development artifacts and must be reset or restored from a
+// pre-PR backup instead of growing another migration-reconciliation state machine here.
 
 /// The nine permission columns the migration adds.
 const CUSTOM_ROLE_PERMISSION_COLUMNS: [&str; 9] = [
@@ -1934,7 +1937,7 @@ mod custom_role_migration_sql_tests {
     /// The real migration covers every legacy membership shape, the rebuilt schema, and preservation
     /// of the separate group grants in one database.
     #[test]
-    fn migration_maps_memberships_and_preserves_schema_and_groups() {
+    fn migration_maps_memberships_without_materializing_group_access_all() {
         let mut connection = connect(LEGACY_MEMBERSHIPS);
         migrate(&mut connection).unwrap();
 
@@ -1956,7 +1959,8 @@ mod custom_role_migration_sql_tests {
                 // A groups_users row pointing at another organization's accessAll group grants
                 // nothing -- the migration requires the group to belong to the membership's own org.
                 "m_mgr_foreign atype=4 000 000000",
-                // Group-derived authority remains on the group and is not persisted on the membership.
+                // The group keeps its dynamic access_all grant, but none of the legacy Manager's
+                // collection-management authority becomes a permanent global membership permission.
                 "m_mgr_group atype=4 000 000000",
                 // Invited is converted like any other membership.
                 "m_mgr_invited atype=4 000 000000",
