@@ -4477,13 +4477,13 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        CollectionDetailsResponseScope, CustomRolePermissions, OrganizationImportTarget, OrganizationReportScope,
-        adds_group_member, caller_manage_grant_role_check, collection_bearing_membership_unchanged,
-        collection_details_response_scope, filter_ciphers_for_organization, may_change_group_membership,
-        may_change_member_type, may_delete_group, may_delete_stored_member_type, may_export_entire_organization,
-        may_grant_access_all_group, may_import_to_collection, may_manage_member_type, may_manage_stored_member_type,
-        may_provision_member_type, may_provision_stored_member_type, may_read_complete_collection_list,
-        may_revoke_stored_member_type, organization_report_scope,
+        CollectionDetailsResponseScope, CustomRolePermissions, ImportData, OrganizationImportTarget,
+        OrganizationReportScope, adds_group_member, caller_manage_grant_role_check,
+        collection_bearing_membership_unchanged, collection_details_response_scope, filter_ciphers_for_organization,
+        may_change_group_membership, may_change_member_type, may_delete_group, may_delete_stored_member_type,
+        may_export_entire_organization, may_grant_access_all_group, may_import_to_collection, may_manage_member_type,
+        may_manage_stored_member_type, may_provision_member_type, may_provision_stored_member_type,
+        may_read_complete_collection_list, may_revoke_stored_member_type, organization_report_scope,
     };
     use crate::db::models::{
         Cipher, GroupId, Membership, MembershipId, MembershipStatus, MembershipType, OrganizationId,
@@ -4706,6 +4706,21 @@ mod tests {
                 writable: true
             }
         ));
+    }
+
+    #[test]
+    fn organization_import_accepts_missing_or_empty_collection_groups() {
+        for collection in [json!({ "name": "missing groups" }), json!({ "name": "empty groups", "groups": [] })] {
+            let import: ImportData = serde_json::from_value(json!({
+                "ciphers": [],
+                "collections": [collection],
+                "collectionRelationships": [],
+            }))
+            .expect("organization import collection groups are optional and ignored");
+
+            assert_eq!(import.collections.len(), 1);
+            assert!(import.collections[0].id.is_none());
+        }
     }
 
     #[test]
