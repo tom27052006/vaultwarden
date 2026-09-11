@@ -13,8 +13,9 @@ use crate::{
     },
     auth::{
         AccessImportExportHeaders, AdminHeaders, CollectionDeleteHeaders, CollectionReadHeaders, Headers,
-        ManageGroupsHeaders, ManagePoliciesHeaders, ManageUsersHeaders, ManagerHeaders, ManagerHeadersLoose,
-        OrgMemberHeaders, OwnerHeaders, can_read_collection_access, can_read_collection_with_access, decode_invite,
+        ManageGroupsHeaders, ManagePoliciesHeaders, ManageUsersHeaders, ManageUsersOrGroupsHeaders, ManagerHeaders,
+        ManagerHeadersLoose, OrgMemberHeaders, OwnerHeaders, can_read_collection_access,
+        can_read_collection_with_access, decode_invite,
     },
     db::{
         DbConn,
@@ -631,10 +632,22 @@ async fn post_bulk_access_collections(
     // deliberately does not satisfy it (the previous `is_manageable_by_user` check accepted it, and
     // disagreed with the single-edit endpoint).
 
+    // Upstream loads the collections with `GetManyByManyIdsAsync()` and compares the number of rows it
+    // got back with the number of requested ids, so a repeated id fails the request; an empty list is
+    // rejected by `BulkAddCollectionAccessCommand` ("No collections were provided.") and by the bulk
+    // authorization handler, which fails on an empty resource set. Both are checked before anything is
+    // read or written, so a rejected request mutates nothing and logs no event.
+    if data.collection_ids.is_empty() {
+        err!("No collections were provided")
+    }
+    if data.collection_ids.iter().collect::<HashSet<&CollectionId>>().len() != data.collection_ids.len() {
+        err!("One or more collections not found", "The request contains duplicate collection ids")
+    }
+
     // Security and atomicity: validate the whole request against this organization before mutating
     // anything — every collection, group and user must belong to it and be manageable by the caller.
-    // Only then does the destructive delete/replace begin, so a foreign-tenant group can never be linked
-    // and a later invalid element cannot leave earlier collections already wiped.
+    // Only then does the first write happen, so a foreign-tenant group can never be linked and a later
+    // invalid element cannot leave earlier collections already changed.
     let org_groups = Group::find_by_organization(&org_id, &conn).await;
     let org_group_ids: HashSet<&GroupId> = org_groups.iter().map(|g| &g.uuid).collect();
     if let Some(g) = data.groups.iter().find(|g| !org_group_ids.contains(&g.id)) {
@@ -675,14 +688,16 @@ async fn post_bulk_access_collections(
         )
         .await;
 
-        CollectionGroup::delete_all_by_collection(col_id, &org_id, &conn).await?;
+        // Add/update, never replace: upstream's `CreateOrUpdateAccessForManyAsync` updates an existing
+        // row, inserts a missing one and leaves every assignment the request does not mention alone.
+        // `CollectionGroup::save` and `CollectionUser::save` are upserts, so the loops do exactly that.
+        // (The single-collection update route stays a replace — upstream calls `ReplaceAsync` there.)
         for group in &data.groups {
             CollectionGroup::new(col_id.clone(), group.id.clone(), group.read_only, group.hide_passwords, group.manage)
                 .save(&org_id, &conn)
                 .await?;
         }
 
-        CollectionUser::delete_all_by_collection(col_id, &conn).await?;
         for user in &data.users {
             let Some(member) = Membership::find_by_uuid_and_org(&user.id, &org_id, &conn).await else {
                 err!("User is not part of organization")
@@ -829,6 +844,15 @@ struct BulkCollectionIds {
     ids: Vec<CollectionId>,
 }
 
+/// Upstream resolves a bulk delete through `GetManyByManyIdsAsync(model.Ids)`, so a repeated id yields
+/// a single entity that is authorized, deleted and logged once. Reproducing that here keeps a duplicate
+/// from failing the request after the collection was already gone. Request order is preserved so the
+/// event log stays deterministic. Unlike `/collections/bulk-access`, a duplicate is not an error.
+fn deduplicate_collection_ids(ids: Vec<CollectionId>) -> Vec<CollectionId> {
+    let mut seen = HashSet::new();
+    ids.into_iter().filter(|id| seen.insert(id.clone())).collect()
+}
+
 #[delete("/organizations/<org_id>/collections", data = "<data>")]
 async fn bulk_delete_organization_collections(
     org_id: OrganizationId,
@@ -841,8 +865,10 @@ async fn bulk_delete_organization_collections(
     }
     let data: BulkCollectionIds = data.into_inner();
 
-    let collections = data.ids;
+    let collections = deduplicate_collection_ids(data.ids);
 
+    // Full prevalidation (org scope and delete permission for every id) happens here, before the first
+    // deletion: one foreign or unknown collection in the request means nothing is deleted at all.
     let headers = CollectionDeleteHeaders::from_loose(headers, &collections, &conn).await?;
 
     for col_id in collections {
@@ -1524,6 +1550,10 @@ async fn reinvite_member(
     reinvite_member_impl(&org_id, &member_id, &headers, &conn).await
 }
 
+/// Reinvite and confirm are guarded by `ManageUsersRequirement` alone upstream — neither
+/// `ResendOrganizationInviteCommand` nor `ConfirmOrganizationUserCommand` consults the acting member's
+/// role against the target's. Neither action can change a role, so the actor/target matrix that
+/// update, remove, revoke and restore still enforce does not apply here.
 async fn reinvite_member_impl(
     org_id: &OrganizationId,
     member_id: &MembershipId,
@@ -1533,10 +1563,6 @@ async fn reinvite_member_impl(
     let Some(member) = Membership::find_by_uuid_and_org(member_id, org_id, conn).await else {
         err!("The user hasn't been invited to the organization.")
     };
-
-    if !may_manage_stored_member_type(headers.membership_type, member.atype) {
-        err!("You don't have permission to reinvite this user")
-    }
 
     if member.status != MembershipStatus::Invited as i32 {
         err!("The user is already accepted or confirmed to the organization")
@@ -1734,10 +1760,6 @@ async fn confirm_invite_impl(
         err!("The specified user isn't a member of the organization")
     };
 
-    if !may_provision_stored_member_type(headers.membership_type, member_to_confirm.atype) {
-        err!("You don't have permission to confirm this user")
-    }
-
     if member_to_confirm.status != MembershipStatus::Accepted as i32 {
         err!("User in invalid state")
     }
@@ -1782,6 +1804,10 @@ async fn confirm_invite_impl(
     save_result
 }
 
+// Organization user mini-details are available to every confirmed organization member, matching
+// upstream's `MemberOrProvider` authorization for this route. That broadens metadata visibility (id,
+// user id, name, email, membership type, status) compared with Vaultwarden's previous Manager-only
+// behaviour, and is intentional: a broad range of client flows depends on basic member lookups.
 #[get("/organizations/<org_id>/users/mini-details", rank = 1)]
 async fn get_org_user_mini_details(org_id: OrganizationId, headers: ManagerHeadersLoose, conn: DbConn) -> JsonResult {
     if org_id != headers.membership.org_uuid {
@@ -2332,24 +2358,17 @@ async fn post_bulk_collections(data: Json<BulkCollectionsData>, headers: Headers
     Ok(())
 }
 
+// `ManagePoliciesRequirement` upstream, exactly as the single-policy route below: a member without the
+// permission is refused rather than served an empty list. Policy *enforcement* is unaffected — holding
+// `managePolicies` does not make a Custom member exempt from any policy.
 #[get("/organizations/<org_id>/policies")]
-async fn list_policies(org_id: OrganizationId, headers: ManagerHeadersLoose, conn: DbConn) -> JsonResult {
-    if org_id != headers.membership.org_uuid {
+async fn list_policies(org_id: OrganizationId, headers: ManagePoliciesHeaders, conn: DbConn) -> JsonResult {
+    if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
 
-    // Security: only Admins/Owners, or Custom members holding the manage_policies permission,
-    // may see the actual policy configuration. Other Managers/Custom members (e.g. manage_users
-    // or manage_groups only) are still allowed to call this endpoint so the Admin Console can
-    // load, but they receive an empty list instead of the policy contents.
-    let can_view_policies =
-        headers.membership.atype >= MembershipType::Admin || headers.membership.has_manage_policies();
-
-    let policies_json: Vec<Value> = if can_view_policies {
-        OrgPolicy::find_by_org(&org_id, &conn).await.iter().map(OrgPolicy::to_json).collect()
-    } else {
-        Vec::new()
-    };
+    let policies_json: Vec<Value> =
+        OrgPolicy::find_by_org(&org_id, &conn).await.iter().map(OrgPolicy::to_json).collect();
 
     Ok(Json(json!({
         "data": policies_json,
@@ -2832,19 +2851,6 @@ async fn restore_member_impl(
     Ok(())
 }
 
-/// Whether `membership` may read group->collection/user mappings.
-///
-/// Two independent routes to the same data: the Manage Users / Manage Groups permissions, which is what
-/// Bitwarden gates ReadAll on, and organization-wide collection reach, which is what released Vaultwarden
-/// gated it on. Both are kept so a legacy Manager with "Manage all collections" still reads these
-/// mappings after the migration. The single-group view returns exactly this data and asks the same.
-async fn can_read_group_details(org_id: &OrganizationId, membership: &Membership, conn: &DbConn) -> bool {
-    membership.has_manage_users()
-        || membership.has_manage_groups()
-        || membership.has_full_access()
-        || (CONFIG.org_groups_enabled() && GroupUser::has_full_access_by_member(org_id, &membership.uuid, conn).await)
-}
-
 fn may_read_basic_directory(membership: &Membership) -> bool {
     membership.has_full_access()
         || membership.has_manage_users()
@@ -2859,19 +2865,7 @@ async fn can_read_basic_directory(org_id: &OrganizationId, membership: &Membersh
         || Collection::has_manageable_collection_by_user(org_id, &membership.user_uuid, conn).await
 }
 
-async fn get_groups_data(details: bool, org_id: OrganizationId, membership: &Membership, conn: DbConn) -> JsonResult {
-    let can_read_details = can_read_group_details(&org_id, membership, &conn).await;
-    // The plain list carries no access mappings. Collection creators/managers and report users need
-    // this basic directory data in the corresponding web-vault flows.
-    let allowed = if details {
-        can_read_details
-    } else {
-        can_read_basic_directory(&org_id, membership, &conn).await
-    };
-    if !allowed {
-        err_code!("Resource not found.", "User does not have access", Status::NotFound.code);
-    }
-
+async fn get_groups_data(details: bool, org_id: OrganizationId, conn: DbConn) -> JsonResult {
     let groups: Vec<Value> = if CONFIG.org_groups_enabled() {
         let groups = Group::find_by_organization(&org_id, &conn).await;
         let mut groups_json = Vec::with_capacity(groups.len());
@@ -2899,26 +2893,30 @@ async fn get_groups_data(details: bool, org_id: OrganizationId, membership: &Mem
     })))
 }
 
-// The plain group list (id, name, externalId) exposes no access mappings, so it stays readable for
-// members who have a reason to see it — the web vault needs it to render group names. The exact
-// condition is enforced in `get_groups_data`.
+// The plain group list (id, name, externalId) exposes no access mappings. Upstream guards it with
+// `OrganizationCollectionManagementAccessRequirement`, so it stays readable for members who have a
+// reason to see it — the web vault needs it to render group names.
 #[get("/organizations/<org_id>/groups")]
 async fn get_groups(org_id: OrganizationId, headers: ManagerHeadersLoose, conn: DbConn) -> JsonResult {
     if org_id != headers.membership.org_uuid {
         err!("Organization not found", "Organization id's do not match");
     }
-    get_groups_data(false, org_id, &headers.membership, conn).await
+    if !can_read_basic_directory(&org_id, &headers.membership, &conn).await {
+        err_code!("Resource not found.", "User does not have access", Status::NotFound.code);
+    }
+    get_groups_data(false, org_id, conn).await
 }
 
-// Group *details* expose accessAll, external IDs and collection mappings. The condition is
-// `can_read_group_details`, enforced in `get_groups_data`; keeping the guard loose and the condition
-// in one place is what stops the list and single-group views from drifting apart, as they had.
+// Group *details* expose accessAll, external IDs and collection mappings. Upstream guards the details
+// *list* with `ManageUsersOrGroupsRequirement` and the *single* group below with the narrower
+// `ManageGroupsRequirement`, so the two are authorized separately. Neither accepts organization-wide
+// collection reach or a legacy `groups.access_all` membership as a substitute.
 #[get("/organizations/<org_id>/groups/details", rank = 1)]
-async fn get_groups_details(org_id: OrganizationId, headers: ManagerHeadersLoose, conn: DbConn) -> JsonResult {
-    if org_id != headers.membership.org_uuid {
+async fn get_groups_details(org_id: OrganizationId, headers: ManageUsersOrGroupsHeaders, conn: DbConn) -> JsonResult {
+    if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
-    get_groups_data(true, org_id, &headers.membership, conn).await
+    get_groups_data(true, org_id, conn).await
 }
 
 #[derive(Deserialize)]
@@ -3117,18 +3115,13 @@ fn may_provision_member_type(caller_type: MembershipType, target_type: Membershi
     may_manage_member_type(caller_type, target_type)
 }
 
-fn may_provision_stored_member_type(caller_type: MembershipType, target_atype: i32) -> bool {
-    MembershipType::from_i32(target_atype)
-        .is_some_and(|target_type| may_provision_member_type(caller_type, target_type))
-}
-
 /// Whether a caller may act on a membership whose stored `atype` this build cannot interpret.
 ///
 /// Such a row (a future build, a partial rollback, a hand edit) holds no authority -- `OrgHeaders`
 /// refuses it and every permission flag on it is inert -- but the helpers above fail closed on the
 /// unknown value, which left nobody able to remove it either, unlike Vaultwarden. So: an Owner only, and
-/// only for the two actions that reduce what the row can become. Editing, confirming, restoring and
-/// reinviting keep refusing, because they preserve or reactivate a role the server cannot reason about.
+/// only for the two actions that reduce what the row can become. Editing and restoring keep refusing,
+/// because they preserve or reactivate a role the server cannot reason about.
 fn may_act_on_unknown_stored_member_type(caller_type: MembershipType) -> bool {
     caller_type == MembershipType::Owner
 }
@@ -3247,25 +3240,20 @@ async fn add_update_group(
     })))
 }
 
-// Reads a single group's details (accessAll, externalId, collection mappings). This is the same data
-// the `/groups/details` list endpoint returns, so it asks the same question — `can_read_group_details`.
-// Any divergence would let a member read every group's details in bulk but be denied the single-group
-// view of the same data, or the reverse.
+// Upstream guards this with `ManageGroupsRequirement` — deliberately narrower than the details *list*
+// above, which also admits `Manage users`.
 #[get("/organizations/<org_id>/groups/<group_id>/details")]
 async fn get_group_details(
     org_id: OrganizationId,
     group_id: GroupId,
-    headers: ManagerHeadersLoose,
+    headers: ManageGroupsHeaders,
     conn: DbConn,
 ) -> JsonResult {
-    if org_id != headers.membership.org_uuid {
+    if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
     if !CONFIG.org_groups_enabled() {
         err!("Group support is disabled");
-    }
-    if !can_read_group_details(&org_id, &headers.membership, &conn).await {
-        err_code!("Resource not found.", "User does not have access", Status::NotFound.code);
     }
 
     let Some(group) = Group::find_by_uuid_and_org(&group_id, &org_id, &conn).await else {
@@ -3888,11 +3876,11 @@ mod tests {
 
     use super::{
         CustomRolePermissions, ImportData, OrganizationImportTarget, OrganizationReportScope,
-        filter_ciphers_for_organization, index_cipher_collections, may_change_member_type,
+        deduplicate_collection_ids, filter_ciphers_for_organization, index_cipher_collections, may_change_member_type,
         may_delete_stored_member_type, may_grant_custom_permissions, may_import_to_collection, may_manage_member_type,
-        may_manage_stored_member_type, may_provision_member_type, may_provision_stored_member_type,
-        may_read_all_collections, may_read_all_collections_with_access, may_read_basic_directory,
-        may_revoke_stored_member_type, organization_report_scope, validate_collection_access,
+        may_manage_stored_member_type, may_provision_member_type, may_read_all_collections,
+        may_read_all_collections_with_access, may_read_basic_directory, may_revoke_stored_member_type,
+        organization_report_scope, validate_collection_access,
     };
     use crate::db::models::{
         Cipher, CipherId, CollectionId, Membership, MembershipStatus, MembershipType, OrganizationId,
@@ -3923,16 +3911,22 @@ mod tests {
                 assert!(!may_revoke_stored_member_type(caller, unknown), "caller={} target={unknown}", caller as i32);
             }
 
-            // Editing, confirming, restoring and reinviting all still refuse, for every caller.
+            // Editing and restoring still refuse, for every caller.
             for caller in [MembershipType::Owner, MembershipType::Admin, MembershipType::Custom, MembershipType::User] {
                 assert!(!may_manage_stored_member_type(caller, unknown), "caller={} target={unknown}", caller as i32);
-                assert!(
-                    !may_provision_stored_member_type(caller, unknown),
-                    "caller={} target={unknown}",
-                    caller as i32
-                );
             }
         }
+    }
+
+    /// Bulk delete normalizes repeated ids instead of rejecting them, so every collection is authorized,
+    /// deleted and logged exactly once, in request order.
+    #[test]
+    fn bulk_delete_collection_ids_are_deduplicated_in_request_order() {
+        let ids = |names: &[&str]| names.iter().map(|n| CollectionId::from((*n).to_owned())).collect::<Vec<_>>();
+
+        assert_eq!(deduplicate_collection_ids(ids(&["a", "a", "b", "a"])), ids(&["a", "b"]));
+        assert_eq!(deduplicate_collection_ids(ids(&["b", "a", "b"])), ids(&["b", "a"]));
+        assert_eq!(deduplicate_collection_ids(ids(&[])), ids(&[]));
     }
 
     #[test]
@@ -4225,11 +4219,6 @@ mod tests {
                     may_manage_stored_member_type(caller, target as i32),
                     manage[caller_index][target_index],
                     "stored manage {label}"
-                );
-                assert_eq!(
-                    may_provision_stored_member_type(caller, target as i32),
-                    provision[caller_index][target_index],
-                    "stored provision {label}"
                 );
             }
         }

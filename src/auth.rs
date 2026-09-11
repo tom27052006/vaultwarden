@@ -741,13 +741,16 @@ impl OrgHeaders {
     // is set on their Membership. The has_* helpers gate the flags on the
     // Custom type, so stale flags on other types can never grant anything.
     fn can_manage_users(&self) -> bool {
-        self.is_confirmed() && (self.membership_type >= MembershipType::Admin || self.membership.has_manage_users())
+        may_manage_users(&self.membership)
     }
     fn can_manage_groups(&self) -> bool {
-        self.is_confirmed() && (self.membership_type >= MembershipType::Admin || self.membership.has_manage_groups())
+        may_manage_groups(&self.membership)
+    }
+    fn can_manage_users_or_groups(&self) -> bool {
+        may_manage_users_or_groups(&self.membership)
     }
     fn can_manage_policies(&self) -> bool {
-        self.is_confirmed() && (self.membership_type >= MembershipType::Admin || self.membership.has_manage_policies())
+        may_manage_policies(&self.membership)
     }
     fn can_access_event_logs(&self) -> bool {
         self.is_confirmed()
@@ -761,6 +764,35 @@ impl OrgHeaders {
     // clients compute reports from the organization cipher list -- so `accessReports` is enforced where
     // that list is served (`get_org_details`). A guard here would invite gating an endpoint on "may call
     // reports" instead of "may read these ciphers".
+}
+
+/// Upstream's `BasePermissionRequirement`: a confirmed Owner or Admin, or a Custom member holding the
+/// permission itself. An unparsable stored role satisfies neither comparison and so fails closed.
+fn has_org_permission(membership: &Membership, permission: impl FnOnce(&Membership) -> bool) -> bool {
+    membership.has_status(MembershipStatus::Confirmed)
+        && (membership.atype >= MembershipType::Admin || permission(membership))
+}
+
+/// Upstream's `ManageUsersRequirement`.
+fn may_manage_users(membership: &Membership) -> bool {
+    has_org_permission(membership, Membership::has_manage_users)
+}
+
+/// Upstream's `ManageGroupsRequirement`, which guards `GET /organizations/<org_id>/groups/<id>/details`
+/// as well as creating, updating and deleting groups.
+fn may_manage_groups(membership: &Membership) -> bool {
+    has_org_permission(membership, Membership::has_manage_groups)
+}
+
+/// Upstream's `ManageUsersOrGroupsRequirement`, which guards the group *details list* only.
+fn may_manage_users_or_groups(membership: &Membership) -> bool {
+    has_org_permission(membership, |m| m.has_manage_users() || m.has_manage_groups())
+}
+
+/// Upstream's `ManagePoliciesRequirement`. Note that holding it does not make a member exempt from any
+/// policy; only Owners and Admins are excluded from policy enforcement.
+fn may_manage_policies(membership: &Membership) -> bool {
+    has_org_permission(membership, Membership::has_manage_policies)
 }
 
 // org_id is usually the second path param ("/organizations/<org_id>"),
@@ -952,9 +984,14 @@ generate_manage_headers!(
     can_manage_policies,
     "You need the 'Manage Policies' permission, or to be an Admin or Owner, to call this endpoint"
 );
-// NOTE: no `ManageUsersOrGroupsHeaders`. Reading group *details* is not a single-permission question
-// -- organization-wide collection reach grants it too -- so both routes take `ManagerHeadersLoose`
-// and ask `can_read_group_details`. The full *member* list is, and keeps `ManageUsersHeaders`.
+// Upstream's `ManageUsersOrGroupsRequirement`, which guards only the group *details list*
+// (`GET /organizations/<org_id>/groups/details`). The single-group view is narrower
+// (`ManageGroupsRequirement`) and therefore keeps `ManageGroupsHeaders`.
+generate_manage_headers!(
+    ManageUsersOrGroupsHeaders,
+    can_manage_users_or_groups,
+    "You need the 'Manage Users' or 'Manage Groups' permission, or to be an Admin or Owner, to call this endpoint"
+);
 generate_manage_headers!(
     AccessEventLogsHeaders,
     can_access_event_logs,
@@ -1748,7 +1785,8 @@ pub async fn refresh_tokens(
 mod tests {
     use super::{
         CollectionManageAccess, collection_delete_access, collection_edit_access, collection_modify_access,
-        collection_read_access, collection_read_with_access,
+        collection_read_access, collection_read_with_access, may_manage_groups, may_manage_policies, may_manage_users,
+        may_manage_users_or_groups,
     };
     use crate::db::models::{Membership, MembershipStatus, MembershipType};
 
@@ -1982,6 +2020,74 @@ mod tests {
             });
             unknown.atype = atype;
             assert_eq!(collection_modify_access(&unknown), Denied, "unknown atype {atype}");
+        }
+    }
+
+    /// The four org-permission guards whose routes upstream keeps deliberately apart:
+    /// `ManageUsersRequirement` (member lifecycle, including confirm and reinvite),
+    /// `ManageGroupsRequirement` (`GET /groups/<id>/details`),
+    /// `ManageUsersOrGroupsRequirement` (`GET /groups/details`) and
+    /// `ManagePoliciesRequirement` (`GET /policies`).
+    #[test]
+    fn organization_permission_guards_follow_bitwardens_requirements() {
+        let assert_guards = |label: &str, member: &Membership, expected: [bool; 4]| {
+            let actual = [
+                may_manage_users(member),
+                may_manage_groups(member),
+                may_manage_users_or_groups(member),
+                may_manage_policies(member),
+            ];
+            assert_eq!(actual, expected, "{label}");
+        };
+
+        // Owners and Admins hold every permission implicitly.
+        assert_guards("owner", &membership(MembershipType::Owner), [true; 4]);
+        assert_guards("admin", &membership(MembershipType::Admin), [true; 4]);
+
+        // A Custom member holds exactly the permission that is set. `Manage users` alone opens the
+        // group details *list* but never the single-group view, and vice versa.
+        assert_guards("manageUsers", &custom_with(|m| m.manage_users = true), [true, false, true, false]);
+        assert_guards("manageGroups", &custom_with(|m| m.manage_groups = true), [false, true, true, false]);
+        assert_guards("managePolicies", &custom_with(|m| m.manage_policies = true), [false, false, false, true]);
+
+        // Unrelated permissions never substitute for one of these four.
+        for (label, member) in [
+            ("plain user", membership(MembershipType::User)),
+            ("plain custom", membership(MembershipType::Custom)),
+            ("editAnyCollection", custom_with(|m| m.edit_any_collection = true)),
+            ("deleteAnyCollection", custom_with(|m| m.delete_any_collection = true)),
+            ("createNewCollections", custom_with(|m| m.create_new_collections = true)),
+            ("accessReports", custom_with(|m| m.access_reports = true)),
+            ("accessEventLogs", custom_with(|m| m.access_event_logs = true)),
+            ("accessImportExport", custom_with(|m| m.access_import_export = true)),
+        ] {
+            assert_guards(label, &member, [false; 4]);
+        }
+
+        // An unconfirmed membership and a stale flag on a non-Custom role grant nothing, and neither
+        // does a stored role this build cannot interpret.
+        let mut unconfirmed = custom_with(|m| {
+            m.manage_users = true;
+            m.manage_groups = true;
+            m.manage_policies = true;
+        });
+        unconfirmed.status = MembershipStatus::Accepted as i32;
+        assert_guards("unconfirmed", &unconfirmed, [false; 4]);
+
+        let mut stale_user = membership(MembershipType::User);
+        stale_user.manage_users = true;
+        stale_user.manage_groups = true;
+        stale_user.manage_policies = true;
+        assert_guards("stale flags on User", &stale_user, [false; 4]);
+
+        for atype in [-1, 3, 5, i32::MAX, i32::MIN] {
+            let mut unknown = custom_with(|m| {
+                m.manage_users = true;
+                m.manage_groups = true;
+                m.manage_policies = true;
+            });
+            unknown.atype = atype;
+            assert_guards(&format!("unknown atype {atype}"), &unknown, [false; 4]);
         }
     }
 }

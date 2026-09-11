@@ -1644,4 +1644,120 @@ mod tests {
         assert!(!member.can_delete_any_collection());
         assert!(!member.has_full_access());
     }
+
+    /// One organization (`org-a`) with one collection, plus a second organization to probe tenant
+    /// isolation from both directions. Every membership below carries the ACL row named after it.
+    #[cfg(sqlite)]
+    const COLLECTION_MANAGE_SEED: &str = "
+        INSERT INTO collections (uuid, org_uuid, name) VALUES
+            ('col-a', 'org-a', 'A'),
+            ('col-b', 'org-b', 'B');
+
+        INSERT INTO users_organizations (uuid, user_uuid, org_uuid, akey, status, atype) VALUES
+            ('m-manage',        'u-manage',        'org-a', '',  2, 2),
+            ('m-write',         'u-write',         'org-a', '',  2, 2),
+            ('m-readonly',      'u-readonly',      'org-a', '',  2, 2),
+            ('m-group-manage',  'u-group-manage',  'org-a', '',  2, 4),
+            ('m-group-plain',   'u-group-plain',   'org-a', '',  2, 2),
+            ('m-group-all',     'u-group-all',     'org-a', '',  2, 2),
+            ('m-group-foreign', 'u-group-foreign', 'org-a', '',  2, 2),
+            ('m-invited',       'u-invited',       'org-a', '',  0, 2),
+            ('m-accepted',      'u-accepted',      'org-a', '',  1, 2),
+            ('m-revoked',       'u-revoked',       'org-a', '', -1, 2),
+            ('m-unknown-3',     'u-unknown-3',     'org-a', '',  2, 3),
+            ('m-unknown-5',     'u-unknown-5',     'org-a', '',  2, 5),
+            ('m-admin',         'u-admin',         'org-a', '',  2, 1),
+            ('m-foreign',       'u-foreign',       'org-b', '',  2, 2);
+
+        -- Stale permission bits on a plain User membership, which must not widen an ACL answer.
+        UPDATE users_organizations
+           SET manage_users = TRUE, manage_groups = TRUE, manage_policies = TRUE,
+               create_new_collections = TRUE, edit_any_collection = TRUE, delete_any_collection = TRUE,
+               access_event_logs = TRUE, access_import_export = TRUE, access_reports = TRUE
+         WHERE uuid = 'm-write';
+
+        INSERT INTO users_collections (user_uuid, collection_uuid, read_only, hide_passwords, manage) VALUES
+            ('u-manage',    'col-a', FALSE, FALSE, TRUE),
+            ('u-manage',    'col-b', FALSE, FALSE, TRUE),
+            ('u-write',     'col-a', FALSE, FALSE, FALSE),
+            ('u-readonly',  'col-a', TRUE,  FALSE, FALSE),
+            ('u-invited',   'col-a', FALSE, FALSE, TRUE),
+            ('u-accepted',  'col-a', FALSE, FALSE, TRUE),
+            ('u-revoked',   'col-a', FALSE, FALSE, TRUE),
+            ('u-unknown-3', 'col-a', FALSE, FALSE, TRUE),
+            ('u-unknown-5', 'col-a', FALSE, FALSE, TRUE),
+            ('u-admin',     'col-a', FALSE, FALSE, TRUE),
+            ('u-foreign',   'col-a', FALSE, FALSE, TRUE);
+
+        INSERT INTO groups (uuid, organizations_uuid, name, access_all, creation_date, revision_date) VALUES
+            ('g-manage',  'org-a', 'manage',    FALSE, '2026-01-01 00:00:00', '2026-01-01 00:00:00'),
+            ('g-plain',   'org-a', 'plain',     FALSE, '2026-01-01 00:00:00', '2026-01-01 00:00:00'),
+            ('g-all',     'org-a', 'access-all', TRUE, '2026-01-01 00:00:00', '2026-01-01 00:00:00'),
+            ('g-foreign', 'org-b', 'foreign',   FALSE, '2026-01-01 00:00:00', '2026-01-01 00:00:00');
+
+        INSERT INTO groups_users (groups_uuid, users_organizations_uuid) VALUES
+            ('g-manage',  'm-group-manage'),
+            ('g-plain',   'm-group-plain'),
+            ('g-all',     'm-group-all'),
+            ('g-foreign', 'm-group-foreign');
+
+        INSERT INTO collections_groups (collections_uuid, groups_uuid, read_only, hide_passwords, manage) VALUES
+            ('col-a', 'g-manage',  FALSE, FALSE, TRUE),
+            ('col-a', 'g-plain',   FALSE, FALSE, FALSE),
+            ('col-a', 'g-all',     FALSE, FALSE, FALSE),
+            ('col-a', 'g-foreign', FALSE, FALSE, TRUE);
+    ";
+
+    /// Runs the real Diesel queries of `Membership::has_explicit_collection_manage_access`, the
+    /// predicate every per-collection Manage decision rests on.
+    #[cfg(sqlite)]
+    #[test]
+    fn explicit_collection_manage_access_accepts_only_real_manage_grants() {
+        use crate::db::test_db::{ORG_ACL_SCHEMA, TestDb, block_on};
+
+        async fn may_manage(conn: &DbConn, member_uuid: &str, collection_uuid: &str) -> bool {
+            let member = Membership::find_by_uuid(&MembershipId::from(member_uuid.to_owned()), conn)
+                .await
+                .unwrap_or_else(|| panic!("Missing membership {member_uuid}"));
+            member.has_explicit_collection_manage_access(&CollectionId::from(collection_uuid.to_owned()), conn).await
+        }
+
+        let db = TestDb::new(&format!("{ORG_ACL_SCHEMA}{COLLECTION_MANAGE_SEED}"));
+        block_on(async {
+            let conn = db.conn();
+
+            // A stored grant, directly and through a group.
+            assert!(may_manage(&conn, "m-manage", "col-a").await);
+            assert!(may_manage(&conn, "m-group-manage", "col-a").await);
+
+            // Write and read-only assignments are access, not management.
+            assert!(!may_manage(&conn, "m-write", "col-a").await);
+            assert!(!may_manage(&conn, "m-readonly", "col-a").await);
+            assert!(!may_manage(&conn, "m-group-plain", "col-a").await);
+
+            // Legacy `groups.access_all` never substitutes for `collections_groups.manage`.
+            assert!(!may_manage(&conn, "m-group-all", "col-a").await);
+
+            // Tenant isolation, from both sides: a foreign-organization collection, a foreign
+            // membership holding a grant on this organization's collection, and a group belonging to
+            // another organization.
+            assert!(!may_manage(&conn, "m-manage", "col-b").await);
+            assert!(!may_manage(&conn, "m-foreign", "col-a").await);
+            assert!(!may_manage(&conn, "m-group-foreign", "col-a").await);
+
+            // Only a confirmed membership may hold an ACL grant.
+            for member in ["m-invited", "m-accepted", "m-revoked"] {
+                assert!(!may_manage(&conn, member, "col-a").await, "{member}");
+            }
+
+            // A stored role this build cannot interpret (3 is the retired Manager value) fails closed.
+            for member in ["m-unknown-3", "m-unknown-5"] {
+                assert!(!may_manage(&conn, member, "col-a").await, "{member}");
+            }
+
+            // Admins and Owners are deliberately outside this predicate: their blanket authority is
+            // decided by role in `collection_access_by_role`, never by a stored assignment.
+            assert!(!may_manage(&conn, "m-admin", "col-a").await);
+        });
+    }
 }

@@ -398,6 +398,141 @@ pub mod schema;
 // Reexport the models, needs to be after the macros are defined so it can access them
 pub mod models;
 
+/// A real SQLite database behind a real [`DbConn`], so model tests execute the actual Diesel queries
+/// instead of a re-typed copy of them. A temporary file rather than `:memory:` because every pooled
+/// connection would otherwise open a database of its own.
+#[cfg(all(test, sqlite))]
+pub(crate) mod test_db {
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use super::*;
+
+    /// The membership/collection/group tables the organization ACL queries touch, with the exact
+    /// columns `src/db/schema.rs` declares.
+    pub const ORG_ACL_SCHEMA: &str = "
+        CREATE TABLE users (
+            uuid TEXT NOT NULL PRIMARY KEY,
+            updated_at DATETIME NOT NULL
+        );
+        CREATE TABLE collections (
+            uuid TEXT NOT NULL PRIMARY KEY,
+            org_uuid TEXT NOT NULL,
+            name TEXT NOT NULL,
+            external_id TEXT
+        );
+        CREATE TABLE users_collections (
+            user_uuid TEXT NOT NULL,
+            collection_uuid TEXT NOT NULL,
+            read_only BOOLEAN NOT NULL DEFAULT FALSE,
+            hide_passwords BOOLEAN NOT NULL DEFAULT FALSE,
+            manage BOOLEAN NOT NULL DEFAULT FALSE,
+            PRIMARY KEY (user_uuid, collection_uuid)
+        );
+        CREATE TABLE users_organizations (
+            uuid TEXT NOT NULL PRIMARY KEY,
+            user_uuid TEXT NOT NULL,
+            org_uuid TEXT NOT NULL,
+            invited_by_email TEXT,
+            akey TEXT NOT NULL,
+            status INTEGER NOT NULL,
+            atype INTEGER NOT NULL,
+            reset_password_key TEXT,
+            external_id TEXT,
+            manage_users BOOLEAN NOT NULL DEFAULT FALSE,
+            manage_groups BOOLEAN NOT NULL DEFAULT FALSE,
+            manage_policies BOOLEAN NOT NULL DEFAULT FALSE,
+            create_new_collections BOOLEAN NOT NULL DEFAULT FALSE,
+            edit_any_collection BOOLEAN NOT NULL DEFAULT FALSE,
+            delete_any_collection BOOLEAN NOT NULL DEFAULT FALSE,
+            access_event_logs BOOLEAN NOT NULL DEFAULT FALSE,
+            access_import_export BOOLEAN NOT NULL DEFAULT FALSE,
+            access_reports BOOLEAN NOT NULL DEFAULT FALSE
+        );
+        CREATE TABLE groups (
+            uuid TEXT NOT NULL PRIMARY KEY,
+            organizations_uuid TEXT NOT NULL,
+            name TEXT NOT NULL,
+            access_all BOOLEAN NOT NULL DEFAULT FALSE,
+            external_id TEXT,
+            creation_date DATETIME NOT NULL,
+            revision_date DATETIME NOT NULL
+        );
+        CREATE TABLE groups_users (
+            groups_uuid TEXT NOT NULL,
+            users_organizations_uuid TEXT NOT NULL,
+            PRIMARY KEY (groups_uuid, users_organizations_uuid)
+        );
+        CREATE TABLE collections_groups (
+            collections_uuid TEXT NOT NULL,
+            groups_uuid TEXT NOT NULL,
+            read_only BOOLEAN NOT NULL DEFAULT FALSE,
+            hide_passwords BOOLEAN NOT NULL DEFAULT FALSE,
+            manage BOOLEAN NOT NULL DEFAULT FALSE,
+            PRIMARY KEY (collections_uuid, groups_uuid)
+        );
+    ";
+
+    pub struct TestDb {
+        path: PathBuf,
+        // An `Option` so `Drop` can close every connection before deleting the file.
+        pool: Option<Pool<DbConnManager>>,
+    }
+
+    impl TestDb {
+        /// `schema` is the DDL (and any seed data) the test needs; only the tables under test have to
+        /// be declared.
+        pub fn new(schema: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "vaultwarden-test-{}-{}.sqlite3",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            // An existing file makes `DbConnType::from_url` take the bare-path SQLite branch.
+            drop(std::fs::remove_file(&path));
+            std::fs::File::create(&path).expect("Error creating test database file");
+
+            let pool = Pool::builder()
+                .max_size(4)
+                .build(DbConnManager::new(path.to_str().expect("Test database path is not UTF-8")))
+                .expect("Error creating test database pool");
+            pool.get().expect("Error opening test database").batch_execute(schema).expect("Error applying test schema");
+
+            Self {
+                path,
+                pool: Some(pool),
+            }
+        }
+
+        pub fn conn(&self) -> DbConn {
+            let pool = self.pool.as_ref().expect("Test pool is closed");
+            DbConn {
+                conn: Arc::new(Mutex::new(Some(pool.get().expect("Error getting test connection")))),
+                permit: None,
+            }
+        }
+    }
+
+    impl Drop for TestDb {
+        fn drop(&mut self) {
+            drop(self.pool.take());
+            drop(std::fs::remove_file(&self.path));
+        }
+    }
+
+    /// `DbConn::run` uses `block_in_place`, which needs a multi-threaded runtime.
+    pub fn block_on<F: Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Error building test runtime")
+            .block_on(future)
+    }
+}
+
 /// Creates a back-up of the sqlite database
 /// MySQL/MariaDB and PostgreSQL are not supported.
 #[cfg(sqlite)]

@@ -991,6 +991,115 @@ mod tests {
         }
     }
 
+    /// Two collections with the starting access the bulk-access merge has to preserve:
+    /// A is assigned to users X and Y, B to user X and group Z.
+    #[cfg(sqlite)]
+    const BULK_ACCESS_SEED: &str = "
+        INSERT INTO collections (uuid, org_uuid, name) VALUES
+            ('col-a', 'org-a', 'A'),
+            ('col-b', 'org-a', 'B');
+
+        INSERT INTO users (uuid, updated_at) VALUES
+            ('user-x', '2026-01-01 00:00:00'),
+            ('user-y', '2026-01-01 00:00:00');
+
+        INSERT INTO users_organizations (uuid, user_uuid, org_uuid, akey, status, atype) VALUES
+            ('m-x', 'user-x', 'org-a', '', 2, 2),
+            ('m-y', 'user-y', 'org-a', '', 2, 2);
+
+        INSERT INTO groups (uuid, organizations_uuid, name, access_all, creation_date, revision_date) VALUES
+            ('group-z', 'org-a', 'Z', FALSE, '2026-01-01 00:00:00', '2026-01-01 00:00:00'),
+            ('group-g', 'org-a', 'G', FALSE, '2026-01-01 00:00:00', '2026-01-01 00:00:00');
+
+        INSERT INTO users_collections (user_uuid, collection_uuid, read_only, hide_passwords, manage) VALUES
+            ('user-x', 'col-a', TRUE,  FALSE, FALSE),
+            ('user-y', 'col-a', FALSE, FALSE, TRUE),
+            ('user-x', 'col-b', TRUE,  FALSE, FALSE);
+
+        INSERT INTO collections_groups (collections_uuid, groups_uuid, read_only, hide_passwords, manage) VALUES
+            ('col-b', 'group-z', TRUE, FALSE, FALSE);
+    ";
+
+    /// `POST /organizations/<org_id>/collections/bulk-access` adds and updates access, it does not
+    /// replace it: upstream's `CreateOrUpdateAccessForManyAsync` leaves every assignment the request
+    /// does not mention untouched. This runs the upserts the endpoint performs against a real database.
+    #[cfg(sqlite)]
+    #[test]
+    fn bulk_access_upserts_leave_unmentioned_assignments_alone() {
+        use crate::db::{
+            DbConn,
+            models::{CollectionGroup, CollectionId, CollectionUser, GroupId, OrganizationId, UserId},
+            test_db::{ORG_ACL_SCHEMA, TestDb, block_on},
+        };
+
+        async fn users(conn: &DbConn, col: &str) -> Vec<(String, bool, bool, bool)> {
+            let mut rows: Vec<(String, bool, bool, bool)> =
+                CollectionUser::find_by_collection(&CollectionId::from(col.to_owned()), conn)
+                    .await
+                    .into_iter()
+                    .map(|u| (u.user_uuid.to_string(), u.read_only, u.hide_passwords, u.manage))
+                    .collect();
+            rows.sort();
+            rows
+        }
+
+        async fn groups(conn: &DbConn, col: &str) -> Vec<(String, bool, bool, bool)> {
+            let mut rows: Vec<(String, bool, bool, bool)> =
+                CollectionGroup::find_by_collection(&CollectionId::from(col.to_owned()), conn)
+                    .await
+                    .into_iter()
+                    .map(|g| (g.groups_uuid.to_string(), g.read_only, g.hide_passwords, g.manage))
+                    .collect();
+            rows.sort();
+            rows
+        }
+
+        let db = TestDb::new(&format!("{ORG_ACL_SCHEMA}{BULK_ACCESS_SEED}"));
+        block_on(async {
+            let conn = db.conn();
+            let org = OrganizationId::from("org-a".to_owned());
+            let col_b = CollectionId::from("col-b".to_owned());
+            let group_z = GroupId::from("group-z".to_owned());
+
+            // Request 1: add group G to both collections, with no users in the request at all.
+            for col in ["col-a", "col-b"] {
+                CollectionGroup::new(
+                    CollectionId::from(col.to_owned()),
+                    GroupId::from("group-g".to_owned()),
+                    false,
+                    false,
+                    true,
+                )
+                .save(&org, &conn)
+                .await
+                .unwrap();
+            }
+
+            // A keeps X and Y, B keeps X and Z, and both gain G.
+            assert_eq!(
+                users(&conn, "col-a").await,
+                vec![("user-x".to_owned(), true, false, false), ("user-y".to_owned(), false, false, true)]
+            );
+            assert_eq!(groups(&conn, "col-a").await, vec![("group-g".to_owned(), false, false, true)]);
+            assert_eq!(users(&conn, "col-b").await, vec![("user-x".to_owned(), true, false, false)]);
+            assert_eq!(
+                groups(&conn, "col-b").await,
+                vec![("group-g".to_owned(), false, false, true), ("group-z".to_owned(), true, false, false)]
+            );
+
+            // Request 2: the same ids again with different flags. readOnly, hidePasswords and manage are
+            // all written through, and no assignment is duplicated.
+            CollectionUser::save(&UserId::from("user-x".to_owned()), &col_b, false, false, true, &conn).await.unwrap();
+            CollectionGroup::new(col_b.clone(), group_z, false, true, false).save(&org, &conn).await.unwrap();
+
+            assert_eq!(users(&conn, "col-b").await, vec![("user-x".to_owned(), false, false, true)]);
+            assert_eq!(
+                groups(&conn, "col-b").await,
+                vec![("group-g".to_owned(), false, false, true), ("group-z".to_owned(), false, true, false)]
+            );
+        });
+    }
+
     #[test]
     fn assignment_manage_matches_collection_guard_role_boundaries() {
         for role in [MembershipType::Owner, MembershipType::Admin] {
