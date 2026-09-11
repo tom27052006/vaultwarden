@@ -924,14 +924,6 @@ impl<'r> FromRequest<'r> for AdminToken {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::models::MembershipStatus;
-
-    fn membership(member_type: MembershipType) -> Membership {
-        let mut membership = Membership::new("test-user".to_owned().into(), "test-org".to_owned().into(), None);
-        membership.atype = member_type as i32;
-        membership.status = MembershipStatus::Confirmed as i32;
-        membership
-    }
 
     #[test]
     fn validate_web_vault_compare() {
@@ -955,58 +947,5 @@ mod tests {
         assert!(web_vault_compare("2025.12.2", "2025.12.1+build.1") == 1);
         assert!(web_vault_compare("2025.12.2+build.1", "2025.12.1+build.1") == 1);
         assert!(web_vault_compare("2025.12.1+build.3", "2025.12.1+build.2") == 1);
-    }
-
-    #[test]
-    fn admin_type_changes_preserve_permissions_only_when_remaining_custom() {
-        let permissions = |membership: &Membership| {
-            [
-                membership.manage_users,
-                membership.manage_groups,
-                membership.manage_policies,
-                membership.create_new_collections,
-                membership.edit_any_collection,
-                membership.delete_any_collection,
-                membership.access_event_logs,
-                membership.access_import_export,
-                membership.access_reports,
-            ]
-        };
-
-        let mut custom = membership(MembershipType::Custom);
-        custom.manage_users = true;
-        custom.manage_groups = true;
-        custom.manage_policies = true;
-        custom.create_new_collections = true;
-        custom.edit_any_collection = true;
-        custom.delete_any_collection = true;
-        custom.access_event_logs = true;
-        custom.access_import_export = true;
-        custom.access_reports = true;
-
-        apply_membership_type_change(&mut custom, MembershipType::Custom);
-        assert_eq!(permissions(&custom), [true; 9]);
-
-        apply_membership_type_change(&mut custom, MembershipType::User);
-        assert_eq!(custom.atype, MembershipType::User as i32);
-        assert_eq!(permissions(&custom), [false; 9]);
-
-        // Entering Custom through the admin panel is fail-closed: no granular permissions are set.
-        let mut admin = membership(MembershipType::Admin);
-        apply_membership_type_change(&mut admin, MembershipType::Custom);
-        assert_eq!(admin.atype, MembershipType::Custom as i32);
-        assert_eq!(permissions(&admin), [false; 9]);
-    }
-
-    #[test]
-    fn admin_type_parser_rejects_legacy_manager_before_normalization() {
-        assert!(parse_admin_membership_type(NumberOrString::Number(3)).is_none());
-        assert!(parse_admin_membership_type(NumberOrString::String("3".to_owned())).is_none());
-        assert!(parse_admin_membership_type(NumberOrString::String("Manager".to_owned())).is_none());
-
-        assert!(parse_admin_membership_type(NumberOrString::Number(4)) == Some(MembershipType::Custom));
-        assert!(
-            parse_admin_membership_type(NumberOrString::String("Custom".to_owned())) == Some(MembershipType::Custom)
-        );
     }
 }

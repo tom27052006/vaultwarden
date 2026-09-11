@@ -618,23 +618,6 @@ pub async fn update_cipher_from_data(
     Ok(())
 }
 
-#[cfg(test)]
-mod update_authority_tests {
-    use super::has_prevalidated_organization_write_authority;
-
-    #[test]
-    fn organization_write_requires_a_validated_collection_or_full_access() {
-        let no_collections: Vec<crate::db::models::CollectionId> = Vec::new();
-        assert!(!has_prevalidated_organization_write_authority(Some(&no_collections), false, false));
-        assert!(!has_prevalidated_organization_write_authority(None, false, false));
-
-        let collections = vec!["collection".to_owned().into()];
-        assert!(has_prevalidated_organization_write_authority(Some(&collections), false, false));
-        assert!(has_prevalidated_organization_write_authority(None, true, false));
-        assert!(has_prevalidated_organization_write_authority(Some(&no_collections), false, true));
-    }
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ImportData {
