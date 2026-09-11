@@ -602,6 +602,38 @@ struct BulkCollectionAccessData {
     users: Vec<CollectionMembershipData>,
 }
 
+/// Upstream's `Collection_CreateOrUpdateAccessForMany`, for one collection: a `CollectionGroup` and a
+/// `CollectionUser` row per requested group and member, merged over what is stored. Add/update, never
+/// replace — every assignment the request does not mention is left alone. (The single-collection update
+/// route stays a replace; upstream calls `ReplaceAsync` there.)
+///
+/// The only filter is the organization. A member that already reaches every collection — Owner, Admin,
+/// or Custom holding `Edit any collection` — is written too, so the requested grant outlives a later
+/// loss of that wider access.
+async fn create_or_update_collection_access(
+    org_id: &OrganizationId,
+    col_id: &CollectionId,
+    groups: &[CollectionGroupData],
+    users: &[CollectionMembershipData],
+    conn: &DbConn,
+) -> EmptyResult {
+    for group in groups {
+        CollectionGroup::new(col_id.clone(), group.id.clone(), group.read_only, group.hide_passwords, group.manage)
+            .save(org_id, conn)
+            .await?;
+    }
+
+    for user in users {
+        let Some(member) = Membership::find_by_uuid_and_org(&user.id, org_id, conn).await else {
+            err!("User is not part of organization")
+        };
+
+        CollectionUser::save(&member.user_uuid, col_id, user.read_only, user.hide_passwords, user.manage, conn).await?;
+    }
+
+    Ok(())
+}
+
 #[post("/organizations/<org_id>/collections/bulk-access", data = "<data>", rank = 1)]
 async fn post_bulk_access_collections(
     org_id: OrganizationId,
@@ -672,8 +704,6 @@ async fn post_bulk_access_collections(
     }
 
     for collection in collections {
-        let col_id = &collection.uuid;
-
         // update collection modification date
         collection.save(&conn).await?;
 
@@ -688,26 +718,7 @@ async fn post_bulk_access_collections(
         )
         .await;
 
-        // Add/update, never replace: upstream's `CreateOrUpdateAccessForManyAsync` updates an existing
-        // row, inserts a missing one and leaves every assignment the request does not mention alone.
-        // `CollectionGroup::save` and `CollectionUser::save` are upserts, so the loops do exactly that.
-        // (The single-collection update route stays a replace — upstream calls `ReplaceAsync` there.)
-        for group in &data.groups {
-            CollectionGroup::new(col_id.clone(), group.id.clone(), group.read_only, group.hide_passwords, group.manage)
-                .save(&org_id, &conn)
-                .await?;
-        }
-
-        // A member who already reaches every collection still gets the requested row: upstream writes
-        // the whole `users` list, so the grant outlives a later loss of that wider access.
-        for user in &data.users {
-            let Some(member) = Membership::find_by_uuid_and_org(&user.id, &org_id, &conn).await else {
-                err!("User is not part of organization")
-            };
-
-            CollectionUser::save(&member.user_uuid, col_id, user.read_only, user.hide_passwords, user.manage, &conn)
-                .await?;
-        }
+        create_or_update_collection_access(&org_id, &collection.uuid, &data.groups, &data.users, &conn).await?;
     }
 
     Ok(())
@@ -3869,4 +3880,199 @@ async fn rotate_api_key(
     conn: DbConn,
 ) -> JsonResult {
     api_key(&org_id, data, true, headers, conn).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CustomRolePermissions, OrganizationImportTarget, bulk_delete_collection_targets, may_delete_stored_member_type,
+        may_grant_custom_permissions, may_import_to_collection, may_manage_member_type, may_revoke_stored_member_type,
+    };
+    use crate::db::models::{CollectionId, Membership, MembershipStatus, MembershipType};
+
+    fn confirmed_member(member_type: MembershipType) -> Membership {
+        let mut m = Membership::new("test-user".to_owned().into(), "test-org".to_owned().into(), None);
+        m.atype = member_type as i32;
+        m.status = MembershipStatus::Confirmed as i32;
+        m
+    }
+
+    /// Who may act on whom, and what a Custom actor may hand out. Both rules guard the same escalation:
+    /// a caller must never reach a role above its own, and a Custom member holding `manageUsers` must
+    /// not be able to mint permissions it does not hold itself. A stored role this build cannot
+    /// interpret holds no authority, but an Owner still has to be able to remove the row.
+    #[test]
+    fn member_lifecycle_and_delegation_follow_the_role_hierarchy() {
+        use MembershipType::{Admin, Custom, Owner, User};
+
+        // Every caller/target pair, given as the roles each caller may reach.
+        for (caller, allowed) in [
+            (Owner, &[Owner, Admin, Custom, User][..]),
+            (Admin, &[Admin, Custom, User][..]),
+            (Custom, &[Custom, User][..]),
+            (User, &[][..]),
+        ] {
+            for target in [Owner, Admin, Custom, User] {
+                let expected = allowed.contains(&target);
+                assert_eq!(may_manage_member_type(caller, target), expected, "{} -> {}", caller as i32, target as i32);
+            }
+        }
+
+        // A role this build cannot interpret: nobody may edit or restore it, and only an Owner may
+        // delete or revoke the row, so an unreadable membership is not also unremovable.
+        for unknown in [3, 5, -1, i32::MAX] {
+            assert!(may_delete_stored_member_type(Owner, unknown), "{unknown}");
+            assert!(may_revoke_stored_member_type(Owner, unknown), "{unknown}");
+            for caller in [Admin, Custom, User] {
+                assert!(!may_delete_stored_member_type(caller, unknown), "caller {} {unknown}", caller as i32);
+                assert!(!may_revoke_stored_member_type(caller, unknown), "caller {} {unknown}", caller as i32);
+            }
+        }
+
+        // Delegation: a Custom actor may only grant permissions it holds itself.
+        let mut actor = confirmed_member(Custom);
+        actor.manage_users = true;
+        let requested =
+            |permissions: CustomRolePermissions| may_grant_custom_permissions(&actor, Custom, Some(permissions));
+        assert!(requested(CustomRolePermissions {
+            manage_users: true,
+            ..CustomRolePermissions::default()
+        }));
+        assert!(!requested(CustomRolePermissions {
+            edit_any_collection: true,
+            ..CustomRolePermissions::default()
+        }));
+        // An Admin actor is not bound by the subset rule.
+        assert!(may_grant_custom_permissions(
+            &confirmed_member(Admin),
+            Custom,
+            Some(CustomRolePermissions {
+                edit_any_collection: true,
+                ..CustomRolePermissions::default()
+            })
+        ));
+    }
+
+    /// Bulk delete normalizes repeated ids the way upstream's `GetManyByManyIdsAsync` does, so a
+    /// duplicate is authorized, deleted and logged once instead of failing after the collection is
+    /// already gone. An empty list is rejected instead: upstream's bulk authorization handler fails
+    /// closed on an empty resource set, and the route propagates this before it authorizes or deletes
+    /// anything, so `{"ids": []}` can never run as a successful no-op.
+    #[test]
+    fn bulk_delete_targets_normalize_ids_and_reject_an_empty_request() {
+        let ids = |names: &[&str]| names.iter().map(|n| CollectionId::from((*n).to_owned())).collect::<Vec<_>>();
+
+        assert_eq!(bulk_delete_collection_targets(ids(&["a", "a"])).unwrap(), ids(&["a"]));
+        assert_eq!(bulk_delete_collection_targets(ids(&["a", "b", "a"])).unwrap(), ids(&["a", "b"]));
+        assert!(bulk_delete_collection_targets(ids(&[])).is_err());
+    }
+
+    /// Importing into an existing collection needs the collection-*update* authority upstream resolves
+    /// `BulkCollectionOperations.ImportCiphers` through — a plain write assignment is deliberately not
+    /// enough — while a new collection needs `createNewCollections`. `accessImportExport` authorizes the
+    /// complete organization import and is the only permission that covers both targets.
+    #[test]
+    fn organization_import_authority_depends_on_the_target_collection() {
+        let existing = |can_update| OrganizationImportTarget::Existing {
+            can_update,
+        };
+
+        let plain = confirmed_member(MembershipType::Custom);
+        assert!(!may_import_to_collection(&plain, existing(false)));
+        assert!(!may_import_to_collection(&plain, OrganizationImportTarget::New));
+        assert!(may_import_to_collection(&plain, existing(true)));
+
+        let mut create_only = confirmed_member(MembershipType::Custom);
+        create_only.create_new_collections = true;
+        assert!(may_import_to_collection(&create_only, OrganizationImportTarget::New));
+        assert!(!may_import_to_collection(&create_only, existing(false)));
+
+        let mut import_export = confirmed_member(MembershipType::Custom);
+        import_export.access_import_export = true;
+        assert!(may_import_to_collection(&import_export, existing(false)));
+        assert!(may_import_to_collection(&import_export, OrganizationImportTarget::New));
+
+        // Authority is never held by an unconfirmed membership.
+        import_export.status = MembershipStatus::Accepted as i32;
+        assert!(!may_import_to_collection(&import_export, OrganizationImportTarget::New));
+    }
+
+    /// One collection the request names and one it does not, plus a member that already reaches every
+    /// collection through `editAnyCollection`.
+    #[cfg(sqlite)]
+    const BULK_ACCESS_SEED: &str = "
+        INSERT INTO collections (uuid, org_uuid, name) VALUES ('col-a', 'org-a', 'A'), ('col-b', 'org-a', 'B');
+
+        INSERT INTO users (uuid, updated_at) VALUES
+            ('u-custom', '2026-01-01 00:00:00'),
+            ('u-plain',  '2026-01-01 00:00:00');
+
+        INSERT INTO users_organizations (uuid, user_uuid, org_uuid, akey, status, atype, edit_any_collection) VALUES
+            ('m-custom', 'u-custom', 'org-a', '', 2, 4, TRUE),
+            ('m-plain',  'u-plain',  'org-a', '', 2, 2, FALSE);
+
+        INSERT INTO users_collections (user_uuid, collection_uuid, read_only, hide_passwords, manage) VALUES
+            ('u-custom', 'col-a', TRUE, FALSE, FALSE),
+            ('u-plain',  'col-b', TRUE, FALSE, FALSE);
+    ";
+
+    /// The writes `POST /organizations/<org_id>/collections/bulk-access` performs, against a real
+    /// database. The endpoint used to skip a member that already reached every collection, so an
+    /// explicitly requested Manage grant was never stored and disappeared the moment that wider access
+    /// was revoked. Upstream's `Collection_CreateOrUpdateAccessForMany` filters only on the
+    /// organization; the existing row is upserted and an assignment the request does not name survives.
+    #[cfg(sqlite)]
+    #[test]
+    fn bulk_access_stores_a_grant_for_a_member_that_already_reaches_everything() {
+        use super::create_or_update_collection_access;
+        use crate::db::{
+            DbConn,
+            models::{CollectionUser, MembershipId, OrganizationId},
+            test_db::{ORG_ACL_SCHEMA, TestDb, block_on},
+        };
+
+        async fn rows(conn: &DbConn, col: &str) -> Vec<(String, bool, bool, bool)> {
+            let mut rows: Vec<(String, bool, bool, bool)> =
+                CollectionUser::find_by_collection(&CollectionId::from(col.to_owned()), conn)
+                    .await
+                    .into_iter()
+                    .map(|u| (u.user_uuid.to_string(), u.read_only, u.hide_passwords, u.manage))
+                    .collect();
+            rows.sort();
+            rows
+        }
+
+        let db = TestDb::new(&format!("{ORG_ACL_SCHEMA}{BULK_ACCESS_SEED}"));
+        block_on(async {
+            let conn = db.conn();
+            let org = OrganizationId::from("org-a".to_owned());
+            let col_a = CollectionId::from("col-a".to_owned());
+
+            let mut custom = Membership::find_by_uuid(&MembershipId::from("m-custom".to_owned()), &conn)
+                .await
+                .expect("Missing membership m-custom");
+            assert!(custom.grants_access_to_all_collections());
+
+            // The request: Manage on A for that member, nothing else.
+            let users = vec![super::CollectionMembershipData {
+                hide_passwords: false,
+                id: custom.uuid.clone(),
+                read_only: false,
+                manage: true,
+            }];
+            create_or_update_collection_access(&org, &col_a, &[], &users, &conn).await.unwrap();
+
+            // The read-only row it already had is updated, not duplicated, and not skipped.
+            assert_eq!(rows(&conn, "col-a").await, vec![("u-custom".to_owned(), false, false, true)]);
+
+            // Losing `editAnyCollection` leaves the explicit grant standing.
+            custom.edit_any_collection = false;
+            custom.save(&conn).await.unwrap();
+            assert!(!custom.grants_access_to_all_collections());
+            assert!(custom.has_explicit_collection_manage_access(&col_a, &conn).await);
+
+            // A collection the request did not name keeps its assignments.
+            assert_eq!(rows(&conn, "col-b").await, vec![("u-plain".to_owned(), true, false, false)]);
+        });
+    }
 }
