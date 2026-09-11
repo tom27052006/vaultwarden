@@ -8,7 +8,7 @@ use crate::{
     CONFIG,
     api::admin::FAKE_ADMIN_UUID,
     api::{
-        EmptyResult, JsonResult, Notify, PasswordOrOtpData, UpdateType,
+        ApiResult, EmptyResult, JsonResult, Notify, PasswordOrOtpData, UpdateType,
         core::{CipherSyncData, CipherSyncType, accept_org_invite, log_event, two_factor},
     },
     auth::{
@@ -698,14 +698,12 @@ async fn post_bulk_access_collections(
                 .await?;
         }
 
+        // A member who already reaches every collection still gets the requested row: upstream writes
+        // the whole `users` list, so the grant outlives a later loss of that wider access.
         for user in &data.users {
             let Some(member) = Membership::find_by_uuid_and_org(&user.id, &org_id, &conn).await else {
                 err!("User is not part of organization")
             };
-
-            if member.grants_access_to_all_collections() {
-                continue;
-            }
 
             CollectionUser::save(&member.user_uuid, col_id, user.read_only, user.hide_passwords, user.manage, &conn)
                 .await?;
@@ -848,9 +846,15 @@ struct BulkCollectionIds {
 /// a single entity that is authorized, deleted and logged once. Reproducing that here keeps a duplicate
 /// from failing the request after the collection was already gone. Request order is preserved so the
 /// event log stays deterministic. Unlike `/collections/bulk-access`, a duplicate is not an error.
-fn deduplicate_collection_ids(ids: Vec<CollectionId>) -> Vec<CollectionId> {
+/// An empty request is rejected: upstream's bulk authorization handler fails closed on an empty
+/// resource set, so nothing is authorized, deleted or logged.
+fn bulk_delete_collection_targets(ids: Vec<CollectionId>) -> ApiResult<Vec<CollectionId>> {
     let mut seen = HashSet::new();
-    ids.into_iter().filter(|id| seen.insert(id.clone())).collect()
+    let collections: Vec<CollectionId> = ids.into_iter().filter(|id| seen.insert(id.clone())).collect();
+    if collections.is_empty() {
+        err!("No collections were provided")
+    }
+    Ok(collections)
 }
 
 #[delete("/organizations/<org_id>/collections", data = "<data>")]
@@ -865,7 +869,7 @@ async fn bulk_delete_organization_collections(
     }
     let data: BulkCollectionIds = data.into_inner();
 
-    let collections = deduplicate_collection_ids(data.ids);
+    let collections = bulk_delete_collection_targets(data.ids)?;
 
     // Full prevalidation (org scope and delete permission for every id) happens here, before the first
     // deletion: one foreign or unknown collection in the request means nothing is deleted at all.
@@ -2275,8 +2279,7 @@ async fn post_org_import(
             &nt,
             UpdateType::None,
         )
-        .await
-        .ok();
+        .await?;
         ciphers.push(cipher.uuid);
     }
 
@@ -3876,9 +3879,9 @@ mod tests {
 
     use super::{
         CustomRolePermissions, ImportData, OrganizationImportTarget, OrganizationReportScope,
-        deduplicate_collection_ids, filter_ciphers_for_organization, index_cipher_collections, may_change_member_type,
-        may_delete_stored_member_type, may_grant_custom_permissions, may_import_to_collection, may_manage_member_type,
-        may_manage_stored_member_type, may_provision_member_type, may_read_all_collections,
+        bulk_delete_collection_targets, filter_ciphers_for_organization, index_cipher_collections,
+        may_change_member_type, may_delete_stored_member_type, may_grant_custom_permissions, may_import_to_collection,
+        may_manage_member_type, may_manage_stored_member_type, may_provision_member_type, may_read_all_collections,
         may_read_all_collections_with_access, may_read_basic_directory, may_revoke_stored_member_type,
         organization_report_scope, validate_collection_access,
     };
@@ -3919,14 +3922,16 @@ mod tests {
     }
 
     /// Bulk delete normalizes repeated ids instead of rejecting them, so every collection is authorized,
-    /// deleted and logged exactly once, in request order.
+    /// deleted and logged exactly once, in request order. An empty request is rejected instead: the route
+    /// propagates this error before `CollectionDeleteHeaders::from_loose` authorizes anything and before
+    /// the first deletion, so `{"ids": []}` can never run as a successful no-op.
     #[test]
-    fn bulk_delete_collection_ids_are_deduplicated_in_request_order() {
+    fn bulk_delete_targets_deduplicate_in_request_order_and_reject_an_empty_request() {
         let ids = |names: &[&str]| names.iter().map(|n| CollectionId::from((*n).to_owned())).collect::<Vec<_>>();
 
-        assert_eq!(deduplicate_collection_ids(ids(&["a", "a", "b", "a"])), ids(&["a", "b"]));
-        assert_eq!(deduplicate_collection_ids(ids(&["b", "a", "b"])), ids(&["b", "a"]));
-        assert_eq!(deduplicate_collection_ids(ids(&[])), ids(&[]));
+        assert_eq!(bulk_delete_collection_targets(ids(&["a", "a", "b", "a"])).unwrap(), ids(&["a", "b"]));
+        assert_eq!(bulk_delete_collection_targets(ids(&["b", "a", "b"])).unwrap(), ids(&["b", "a"]));
+        assert!(bulk_delete_collection_targets(ids(&[])).is_err());
     }
 
     #[test]

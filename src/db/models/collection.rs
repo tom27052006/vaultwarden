@@ -1100,6 +1100,92 @@ mod tests {
         });
     }
 
+    /// A Custom member holding `editAnyCollection` and an Owner: both already reach every collection,
+    /// which is the case the bulk-access user loop used to skip. `u-plain` holds the assignment on B
+    /// that the request must leave alone.
+    #[cfg(sqlite)]
+    const FULL_ACCESS_BULK_SEED: &str = "
+        INSERT INTO collections (uuid, org_uuid, name) VALUES
+            ('col-a', 'org-a', 'A'),
+            ('col-b', 'org-a', 'B');
+
+        INSERT INTO users (uuid, updated_at) VALUES
+            ('u-custom', '2026-01-01 00:00:00'),
+            ('u-owner',  '2026-01-01 00:00:00'),
+            ('u-plain',  '2026-01-01 00:00:00');
+
+        INSERT INTO users_organizations (uuid, user_uuid, org_uuid, akey, status, atype, edit_any_collection) VALUES
+            ('m-custom', 'u-custom', 'org-a', '', 2, 4, TRUE),
+            ('m-owner',  'u-owner',  'org-a', '', 2, 0, FALSE),
+            ('m-plain',  'u-plain',  'org-a', '', 2, 2, FALSE);
+
+        INSERT INTO users_collections (user_uuid, collection_uuid, read_only, hide_passwords, manage) VALUES
+            ('u-custom', 'col-a', TRUE, FALSE, FALSE),
+            ('u-plain',  'col-b', TRUE, FALSE, FALSE);
+    ";
+
+    /// Upstream's `CreateOrUpdateAccessForManyAsync` writes the requested row for every member of the
+    /// request, including one who currently reaches every collection anyway, so the grant is still
+    /// there once that wider access goes away.
+    #[cfg(sqlite)]
+    #[test]
+    fn bulk_access_stores_explicit_grants_for_full_access_members() {
+        use crate::db::{
+            DbConn,
+            models::{CollectionId, CollectionUser, Membership, MembershipId, UserId},
+            test_db::{ORG_ACL_SCHEMA, TestDb, block_on},
+        };
+
+        async fn users(conn: &DbConn, col: &str) -> Vec<(String, bool, bool, bool)> {
+            let mut rows: Vec<(String, bool, bool, bool)> =
+                CollectionUser::find_by_collection(&CollectionId::from(col.to_owned()), conn)
+                    .await
+                    .into_iter()
+                    .map(|u| (u.user_uuid.to_string(), u.read_only, u.hide_passwords, u.manage))
+                    .collect();
+            rows.sort();
+            rows
+        }
+
+        async fn member(conn: &DbConn, uuid: &str) -> Membership {
+            Membership::find_by_uuid(&MembershipId::from(uuid.to_owned()), conn)
+                .await
+                .unwrap_or_else(|| panic!("Missing membership {uuid}"))
+        }
+
+        let db = TestDb::new(&format!("{ORG_ACL_SCHEMA}{FULL_ACCESS_BULK_SEED}"));
+        block_on(async {
+            let conn = db.conn();
+            let col_a = CollectionId::from("col-a".to_owned());
+
+            let mut custom = member(&conn, "m-custom").await;
+            assert!(custom.grants_access_to_all_collections());
+            assert!(member(&conn, "m-owner").await.grants_access_to_all_collections());
+
+            // The request: Manage on A for both members.
+            for user in ["u-custom", "u-owner"] {
+                CollectionUser::save(&UserId::from(user.to_owned()), &col_a, false, false, true, &conn).await.unwrap();
+            }
+
+            // The read-only row the Custom member already had is updated instead of duplicated, and the
+            // Owner gains one: organization-wide access no longer skips the write.
+            assert_eq!(
+                users(&conn, "col-a").await,
+                vec![("u-custom".to_owned(), false, false, true), ("u-owner".to_owned(), false, false, true)]
+            );
+
+            // Losing `editAnyCollection` leaves the explicit grant standing.
+            custom.edit_any_collection = false;
+            custom.save(&conn).await.unwrap();
+            let custom = member(&conn, "m-custom").await;
+            assert!(!custom.grants_access_to_all_collections());
+            assert!(custom.has_explicit_collection_manage_access(&col_a, &conn).await);
+
+            // A collection the request did not name keeps its assignments.
+            assert_eq!(users(&conn, "col-b").await, vec![("u-plain".to_owned(), true, false, false)]);
+        });
+    }
+
     #[test]
     fn assignment_manage_matches_collection_guard_role_boundaries() {
         for role in [MembershipType::Owner, MembershipType::Admin] {
