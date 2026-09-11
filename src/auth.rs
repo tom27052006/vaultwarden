@@ -1002,10 +1002,10 @@ fn collection_access_by_role(membership: &Membership, custom_has_any_access: boo
     match MembershipType::from_i32(membership.atype) {
         Some(MembershipType::Owner | MembershipType::Admin) => CollectionManageAccess::Any,
         Some(MembershipType::Custom) if custom_has_any_access => CollectionManageAccess::Any,
-        // A Custom member must prove an actual users_collections.manage / collections_groups.manage
+        // A member must prove an actual users_collections.manage / collections_groups.manage
         // assignment. Neither membership nor group `access_all` is ever counted as one.
-        Some(MembershipType::Custom) => CollectionManageAccess::ExplicitManage,
-        Some(MembershipType::User) | None => CollectionManageAccess::Denied,
+        Some(MembershipType::Custom | MembershipType::User) => CollectionManageAccess::ExplicitManage,
+        None => CollectionManageAccess::Denied,
     }
 }
 
@@ -1025,8 +1025,7 @@ fn collection_read_access(membership: &Membership) -> CollectionManageAccess {
 /// Vaultwarden serializes `limitCollectionDeletion = true` unconditionally, and upstream gates
 /// manage-based deletion on that setting being *off*: with the limit active only Owners, Admins and
 /// holders of `Delete any collection` may delete. Accepting a stored `manage` grant here would break that
-/// promise and make the three collection permissions depend on each other -- `Create new collections`
-/// alone receives an automatic `manage` row for the collection it just created, and could then delete it.
+/// promise and make a per-collection Manage ACL double as a collection-deletion permission.
 /// A Manage grant keeps its full meaning for editing (`collection_edit_access`).
 fn collection_delete_access(membership: &Membership) -> CollectionManageAccess {
     if !membership.has_status(MembershipStatus::Confirmed) {
@@ -1080,9 +1079,8 @@ pub(crate) async fn can_read_collection_access(
 }
 
 /// ManagerHeaders authorizes collection updates. A Custom member with Edit any collection can
-/// update every collection; otherwise the caller must be a Custom member (or above) holding the
-/// per-collection Manage permission. Read and delete use separate guards so Edit cannot
-/// accidentally imply Delete.
+/// update every collection; otherwise the caller must hold a per-collection Manage permission.
+/// Read and delete use separate guards so Edit cannot accidentally imply Delete.
 pub struct ManagerHeaders {
     pub host: String,
     pub device: Device,
@@ -1097,7 +1095,7 @@ impl<'r> FromRequest<'r> for ManagerHeaders {
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         let headers = try_outcome!(OrgHeaders::from_request(request).await);
-        if headers.is_confirmed_and_manager() {
+        if headers.membership.has_status(MembershipStatus::Confirmed) {
             if let Some(col_id) = get_col_id(request) {
                 let access = collection_edit_access(&headers.membership);
                 if access != CollectionManageAccess::Any {
@@ -1143,7 +1141,7 @@ impl<'r> FromRequest<'r> for CollectionReadHeaders {
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         let headers = try_outcome!(OrgHeaders::from_request(request).await);
-        if !headers.is_confirmed_and_manager() {
+        if !headers.membership.has_status(MembershipStatus::Confirmed) {
             err_handler!("You need collection read permission to call this endpoint")
         }
 
@@ -1253,8 +1251,8 @@ impl From<ManagerHeaders> for Headers {
     }
 }
 
-/// The ManagerHeadersLoose is used when you at least need to be a Manager,
-/// but there is no collection_id sent with the request (either in the path or as form data).
+/// The ManagerHeadersLoose is used for organization endpoints whose exact permission depends on
+/// request data or whose response is filtered by the caller's collection-management authority.
 pub struct ManagerHeadersLoose {
     pub host: String,
     pub device: Device,
@@ -1269,7 +1267,7 @@ impl<'r> FromRequest<'r> for ManagerHeadersLoose {
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         let headers = try_outcome!(OrgHeaders::from_request(request).await);
-        if headers.is_confirmed_and_manager() {
+        if headers.membership.has_status(MembershipStatus::Confirmed) {
             Outcome::Success(Self {
                 host: headers.host,
                 device: headers.device,
@@ -1278,7 +1276,7 @@ impl<'r> FromRequest<'r> for ManagerHeadersLoose {
                 ip: headers.ip,
             })
         } else {
-            err_handler!("You need to be a Manager, Admin or Owner to call this endpoint")
+            err_handler!("You need to be a confirmed organization member to call this endpoint")
         }
     }
 }
@@ -1732,8 +1730,8 @@ mod tests {
         assert_access(
             "User",
             &membership(MembershipType::User),
-            CollectionManageAccess::Denied,
-            CollectionManageAccess::Denied,
+            CollectionManageAccess::ExplicitManage,
+            CollectionManageAccess::ExplicitManage,
             CollectionManageAccess::Denied,
         );
 
@@ -1781,8 +1779,8 @@ mod tests {
         assert_eq!(collection_read_access(&delete_any), CollectionManageAccess::Any);
         assert_eq!(collection_delete_access(&delete_any), CollectionManageAccess::Any);
 
-        // Create new collections yields the automatic users_collections.manage row on the created
-        // collection. That row must not become a delete permission either.
+        // Create remains independent. Even if the client assigns the creator a Manage ACL, that row
+        // must not become a delete permission.
         let mut create_only = membership(MembershipType::Custom);
         create_only.create_new_collections = true;
         assert_eq!(collection_edit_access(&create_only), CollectionManageAccess::ExplicitManage);

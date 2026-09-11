@@ -1205,6 +1205,21 @@ impl Cipher {
         })
         .await
     }
+
+    pub async fn get_collections_with_cipher_by_organization(
+        org_uuid: &OrganizationId,
+        conn: &DbConn,
+    ) -> Vec<(CipherId, CollectionId)> {
+        conn.run(move |conn| {
+            ciphers_collections::table
+                .inner_join(collections::table.on(collections::uuid.eq(ciphers_collections::collection_uuid)))
+                .filter(collections::org_uuid.eq(org_uuid))
+                .select(ciphers_collections::all_columns)
+                .load::<(CipherId, CollectionId)>(conn)
+                .unwrap_or_default()
+        })
+        .await
+    }
 }
 
 #[derive(

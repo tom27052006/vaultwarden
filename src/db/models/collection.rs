@@ -62,8 +62,8 @@ pub struct CollectionCipher {
 pub(super) fn assignment_manage_for_member(membership_type: i32, stored_manage: bool) -> bool {
     match MembershipType::from_i32(membership_type) {
         Some(MembershipType::Owner | MembershipType::Admin) => true,
-        Some(MembershipType::Custom) => stored_manage,
-        Some(MembershipType::User) | None => false,
+        Some(MembershipType::Custom | MembershipType::User) => stored_manage,
+        None => false,
     }
 }
 
@@ -167,12 +167,7 @@ impl Collection {
                         m.has_explicit_collection_manage_access(&self.uuid, conn).await,
                     ),
                 ),
-                Some(m)
-                    if m.atype >= MembershipType::Custom
-                        && m.has_explicit_collection_manage_access(&self.uuid, conn).await =>
-                {
-                    (false, false, true)
-                }
+                Some(m) if m.has_explicit_collection_manage_access(&self.uuid, conn).await => (false, false, true),
                 Some(_) => {
                     let read_only = !self.is_writable_by_user(user_uuid, conn).await;
                     let hide_passwords = self.hide_passwords_for_user(user_uuid, conn).await;
@@ -632,7 +627,7 @@ impl Collection {
                 )
                 .filter(collections::org_uuid.eq(&org_uuid))
                 .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
-                .filter(users_organizations::atype.eq(MembershipType::Custom as i32))
+                .filter(users_organizations::atype.eq_any([MembershipType::User as i32, MembershipType::Custom as i32]))
                 .filter(
                     // Manage permission on a collection assigned directly or via a group.
                     users_collections::manage.eq(true).or(collections_groups::manage.eq(true)),
@@ -1004,7 +999,8 @@ mod tests {
 
         assert!(assignment_manage_for_member(MembershipType::Custom as i32, true));
         assert!(!assignment_manage_for_member(MembershipType::Custom as i32, false));
-        assert!(!assignment_manage_for_member(MembershipType::User as i32, true));
+        assert!(assignment_manage_for_member(MembershipType::User as i32, true));
+        assert!(!assignment_manage_for_member(MembershipType::User as i32, false));
         assert!(!assignment_manage_for_member(i32::MAX, true));
     }
 }

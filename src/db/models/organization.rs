@@ -906,8 +906,7 @@ impl Membership {
     }
 
     /// Check for an explicit per-collection Manage grant without treating any `access_all` value as such
-    /// a grant. This is the *only* per-collection authority a Custom member can hold: neither membership
-    /// nor group `access_all` may manufacture one.
+    /// a grant. Neither membership nor group `access_all` may manufacture one.
     ///
     /// There is deliberately no live exception for legacy Managers whose authority came from an
     /// organization-local `access_all` group. That legacy management authority is intentionally not
@@ -934,7 +933,7 @@ impl Membership {
                 .filter(users_organizations::user_uuid.eq(user_uuid.clone()))
                 .filter(users_organizations::org_uuid.eq(org_uuid.clone()))
                 .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
-                .filter(users_organizations::atype.eq(MembershipType::Custom as i32))
+                .filter(users_organizations::atype.eq_any([MembershipType::User as i32, MembershipType::Custom as i32]))
                 .filter(collections::uuid.eq(collection_uuid.clone()))
                 .filter(users_collections::manage.eq(true))
                 .count()
@@ -965,7 +964,7 @@ impl Membership {
                 .filter(users_organizations::user_uuid.eq(user_uuid))
                 .filter(users_organizations::org_uuid.eq(org_uuid))
                 .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
-                .filter(users_organizations::atype.eq(MembershipType::Custom as i32))
+                .filter(users_organizations::atype.eq_any([MembershipType::User as i32, MembershipType::Custom as i32]))
                 .filter(collections::uuid.eq(collection_uuid))
                 .filter(collections_groups::manage.eq(true))
                 .count()

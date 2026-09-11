@@ -369,7 +369,16 @@ async fn post_ciphers(data: Json<CipherData>, headers: Headers, conn: DbConn, nt
     data.last_known_revision_date = None;
 
     let mut cipher = Cipher::new(data.r#type, data.name.clone());
-    update_cipher_from_data(&mut cipher, data, &headers, None, &conn, &nt, UpdateType::SyncCipherCreate).await?;
+    update_cipher_from_data(
+        &mut cipher,
+        data,
+        &headers,
+        CipherUpdateAuthorization::default(),
+        &conn,
+        &nt,
+        UpdateType::SyncCipherCreate,
+    )
+    .await?;
 
     Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, &conn).await?))
 }
@@ -395,15 +404,40 @@ async fn enforce_personal_ownership_policy(data: Option<&CipherData>, headers: &
 fn has_prevalidated_organization_write_authority(
     shared_to_collections: Option<&Vec<CollectionId>>,
     member_has_full_access: bool,
+    organization_write_authorized: bool,
 ) -> bool {
-    shared_to_collections.is_some_and(|collections| !collections.is_empty()) || member_has_full_access
+    organization_write_authorized
+        || shared_to_collections.is_some_and(|collections| !collections.is_empty())
+        || member_has_full_access
+}
+
+#[derive(Default)]
+pub struct CipherUpdateAuthorization {
+    shared_to_collections: Option<Vec<CollectionId>>,
+    organization_write_authorized: bool,
+}
+
+impl CipherUpdateAuthorization {
+    pub fn shared_to(collections: Vec<CollectionId>) -> Self {
+        Self {
+            shared_to_collections: Some(collections),
+            organization_write_authorized: false,
+        }
+    }
+
+    pub fn organization_import(collections: Vec<CollectionId>, organization_write_authorized: bool) -> Self {
+        Self {
+            shared_to_collections: Some(collections),
+            organization_write_authorized,
+        }
+    }
 }
 
 pub async fn update_cipher_from_data(
     cipher: &mut Cipher,
     data: CipherData,
     headers: &Headers,
-    shared_to_collections: Option<Vec<CollectionId>>,
+    authorization: CipherUpdateAuthorization,
     conn: &DbConn,
     nt: &Notify<'_>,
     ut: UpdateType,
@@ -421,6 +455,11 @@ pub async fn update_cipher_from_data(
         }
         json_data
     }
+
+    let CipherUpdateAuthorization {
+        shared_to_collections,
+        organization_write_authorized,
+    } = authorization;
 
     enforce_personal_ownership_policy(Some(&data), headers, conn).await?;
 
@@ -462,6 +501,7 @@ pub async fn update_cipher_from_data(
                 if has_prevalidated_organization_write_authority(
                     shared_to_collections.as_ref(),
                     member.has_full_access(),
+                    organization_write_authorized,
                 ) || cipher.is_write_accessible_to_user(&headers.user.uuid, conn).await
                 {
                     cipher.organization_uuid = Some(org_id);
@@ -585,12 +625,13 @@ mod update_authority_tests {
     #[test]
     fn organization_write_requires_a_validated_collection_or_full_access() {
         let no_collections: Vec<crate::db::models::CollectionId> = Vec::new();
-        assert!(!has_prevalidated_organization_write_authority(Some(&no_collections), false));
-        assert!(!has_prevalidated_organization_write_authority(None, false));
+        assert!(!has_prevalidated_organization_write_authority(Some(&no_collections), false, false));
+        assert!(!has_prevalidated_organization_write_authority(None, false, false));
 
         let collections = vec!["collection".to_owned().into()];
-        assert!(has_prevalidated_organization_write_authority(Some(&collections), false));
-        assert!(has_prevalidated_organization_write_authority(None, true));
+        assert!(has_prevalidated_organization_write_authority(Some(&collections), false, false));
+        assert!(has_prevalidated_organization_write_authority(None, true, false));
+        assert!(has_prevalidated_organization_write_authority(Some(&no_collections), false, true));
     }
 }
 
@@ -652,7 +693,16 @@ async fn post_ciphers_import(data: Json<ImportData>, headers: Headers, conn: DbC
         cipher_data.folder_id = folder_id;
 
         let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
-        update_cipher_from_data(&mut cipher, cipher_data, &headers, None, &conn, &nt, UpdateType::None).await?;
+        update_cipher_from_data(
+            &mut cipher,
+            cipher_data,
+            &headers,
+            CipherUpdateAuthorization::default(),
+            &conn,
+            &nt,
+            UpdateType::None,
+        )
+        .await?;
     }
 
     let mut user = headers.user;
@@ -719,7 +769,16 @@ async fn put_cipher(
         err!("Cipher is not write accessible")
     }
 
-    update_cipher_from_data(&mut cipher, data, &headers, None, &conn, &nt, UpdateType::SyncCipherUpdate).await?;
+    update_cipher_from_data(
+        &mut cipher,
+        data,
+        &headers,
+        CipherUpdateAuthorization::default(),
+        &conn,
+        &nt,
+        UpdateType::SyncCipherUpdate,
+    )
+    .await?;
 
     Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, &conn).await?))
 }
@@ -1097,7 +1156,16 @@ async fn share_cipher_by_uuid(
         UpdateType::SyncCipherCreate
     };
 
-    update_cipher_from_data(&mut cipher, data.cipher, headers, Some(shared_to_collections), conn, nt, ut).await?;
+    update_cipher_from_data(
+        &mut cipher,
+        data.cipher,
+        headers,
+        CipherUpdateAuthorization::shared_to(shared_to_collections),
+        conn,
+        nt,
+        ut,
+    )
+    .await?;
 
     Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, conn).await?))
 }
