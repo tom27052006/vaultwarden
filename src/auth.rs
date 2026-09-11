@@ -1020,6 +1020,48 @@ fn collection_read_access(membership: &Membership) -> CollectionManageAccess {
     )
 }
 
+/// Upstream's `BulkCollectionOperations.ReadWithAccess`, which guards the *single* collection
+/// `/details` endpoint: Owner/Admin, `Edit any collection`, `Delete any collection` and `Manage users`
+/// reach every collection, everyone else needs a real per-collection Manage grant.
+///
+/// Deliberately not the same question as [`collection_read_access`], which models upstream's
+/// `ReadAccess` (`GET /collections/<col_id>/users`) and does *not* accept `Manage users`. The two
+/// upstream operations differ, so these two predicates differ as well — widening
+/// `CollectionReadHeaders` instead would have silently changed the `/users` endpoint too.
+///
+/// `Manage groups` is absent on purpose: upstream grants it `ReadAllWithAccess` (the collection
+/// *list*, see `may_read_all_collections_with_access`) but not `ReadWithAccess`.
+fn collection_read_with_access(membership: &Membership) -> CollectionManageAccess {
+    collection_access_by_role(
+        membership,
+        membership.has_edit_any_collection() || membership.has_delete_any_collection() || membership.has_manage_users(),
+    )
+}
+
+/// Upstream authorizes `POST /collections/bulk-access` against **both**
+/// `BulkCollectionOperations.ModifyUserAccess` and `BulkCollectionOperations.ModifyGroupAccess`, and
+/// its authorization service only succeeds when every requirement passes. With Vaultwarden's
+/// effective `allowAdminAccessToAllCollectionItems = true`, upstream resolves them as
+///
+/// * `ModifyUserAccess`  = `Manage users`  OR the regular collection-update authorization
+/// * `ModifyGroupAccess` = `Manage groups` OR the regular collection-update authorization
+///
+/// Requiring both therefore reduces to: a caller who may update the collection anyway (Owner/Admin,
+/// `Edit any collection`, or a per-collection Manage grant), or one holding *both* org-wide
+/// permissions. Only `Manage users` or only `Manage groups` is not enough, because the other
+/// requirement then still falls back to the update check — which is the point of an endpoint that
+/// rewrites a collection's user *and* group assignments in the same request.
+fn collection_modify_access(membership: &Membership) -> CollectionManageAccess {
+    if membership.has_status(MembershipStatus::Confirmed)
+        && membership.has_manage_users()
+        && membership.has_manage_groups()
+    {
+        return CollectionManageAccess::Any;
+    }
+
+    collection_edit_access(membership)
+}
+
 /// Collection deletion never falls back to a per-collection Manage grant.
 ///
 /// Vaultwarden serializes `limitCollectionDeletion = true` unconditionally, and upstream gates
@@ -1078,6 +1120,27 @@ pub(crate) async fn can_read_collection_access(
     can_manage_collection(collection_read_access(membership), membership, collection_uuid, conn).await
 }
 
+/// Whether `membership` may read `collection_uuid` *together with* its user/group assignments —
+/// upstream's `ReadWithAccess`, which guards `GET /organizations/<org_id>/collections/<col_id>/details`.
+/// See [`collection_read_with_access`] for why this is not [`can_read_collection_access`].
+pub(crate) async fn can_read_collection_with_access(
+    membership: &Membership,
+    collection_uuid: &CollectionId,
+    conn: &DbConn,
+) -> bool {
+    can_manage_collection(collection_read_with_access(membership), membership, collection_uuid, conn).await
+}
+
+/// Whether `membership` may rewrite both the user *and* the group assignments of `collection_uuid`,
+/// as `POST /organizations/<org_id>/collections/bulk-access` does. See [`collection_modify_access`].
+pub(crate) async fn can_modify_collection_access(
+    membership: &Membership,
+    collection_uuid: &CollectionId,
+    conn: &DbConn,
+) -> bool {
+    can_manage_collection(collection_modify_access(membership), membership, collection_uuid, conn).await
+}
+
 /// ManagerHeaders authorizes collection updates. A Custom member with Edit any collection can
 /// update every collection; otherwise the caller must hold a per-collection Manage permission.
 /// Read and delete use separate guards so Edit cannot accidentally imply Delete.
@@ -1124,13 +1187,14 @@ impl<'r> FromRequest<'r> for ManagerHeaders {
     }
 }
 
-/// Read access to collection metadata and assignment details. Delete any collection needs this
-/// visibility to render the standard collection view, but it does not grant edit or cipher access.
+/// Read access to a collection's access mappings — upstream's `BulkCollectionOperations.ReadAccess`.
+/// Delete any collection needs this visibility to render the standard collection view, but it does not
+/// grant edit or cipher access, and — unlike `ReadWithAccess`, see [`collection_read_with_access`] —
+/// `Manage users` alone does not open it.
 pub struct CollectionReadHeaders {
     pub host: String,
     pub device: Device,
     pub user: User,
-    pub membership: Membership,
     pub ip: ClientIp,
     pub org_id: OrganizationId,
 }
@@ -1166,8 +1230,7 @@ impl<'r> FromRequest<'r> for CollectionReadHeaders {
             device: headers.device,
             user: headers.user,
             ip: headers.ip,
-            org_id: headers.membership.org_uuid.clone(),
-            membership: headers.membership,
+            org_id: headers.membership.org_uuid,
         })
     }
 }
@@ -1683,7 +1746,10 @@ pub async fn refresh_tokens(
 
 #[cfg(test)]
 mod tests {
-    use super::{CollectionManageAccess, collection_delete_access, collection_edit_access, collection_read_access};
+    use super::{
+        CollectionManageAccess, collection_delete_access, collection_edit_access, collection_modify_access,
+        collection_read_access, collection_read_with_access,
+    };
     use crate::db::models::{Membership, MembershipStatus, MembershipType};
 
     fn membership(member_type: MembershipType) -> Membership {
@@ -1785,5 +1851,137 @@ mod tests {
         create_only.create_new_collections = true;
         assert_eq!(collection_edit_access(&create_only), CollectionManageAccess::ExplicitManage);
         assert_eq!(collection_delete_access(&create_only), CollectionManageAccess::Denied);
+    }
+
+    /// A Custom member holding exactly one permission, for the single-permission matrices below.
+    fn custom_with(set: impl FnOnce(&mut Membership)) -> Membership {
+        let mut membership = membership(MembershipType::Custom);
+        set(&mut membership);
+        membership
+    }
+
+    /// `GET /organizations/<org_id>/collections/<col_id>/details` is upstream's `ReadWithAccess`,
+    /// `GET /organizations/<org_id>/collections/<col_id>/users` its `ReadAccess`. The two differ by
+    /// exactly one permission -- `Manage users` -- which is why `/details` does not reuse the
+    /// `CollectionReadHeaders` guard that still serves `/users`.
+    ///
+    /// As everywhere in this module, `ExplicitManage` is the "needs a real per-collection Manage row"
+    /// outcome: allowed for a collection the member actually manages, denied for every other.
+    #[test]
+    fn single_collection_details_follow_bitwardens_read_with_access() {
+        use CollectionManageAccess::{Any, Denied, ExplicitManage};
+
+        let assert_access =
+            |name: &str, member: &Membership, read: CollectionManageAccess, with: CollectionManageAccess| {
+                assert_eq!(collection_read_access(member), read, "{name}: ReadAccess (/users)");
+                assert_eq!(collection_read_with_access(member), with, "{name}: ReadWithAccess (/details)");
+            };
+
+        assert_access("Admin", &membership(MembershipType::Admin), Any, Any);
+        assert_access("Owner", &membership(MembershipType::Owner), Any, Any);
+
+        // The one permission that separates the two operations.
+        assert_access("manageUsers", &custom_with(|m| m.manage_users = true), ExplicitManage, Any);
+
+        assert_access("editAnyCollection", &custom_with(|m| m.edit_any_collection = true), Any, Any);
+        assert_access("deleteAnyCollection", &custom_with(|m| m.delete_any_collection = true), Any, Any);
+
+        // `Manage groups` reaches the collection *list* (`ReadAllWithAccess`), never a single
+        // collection's access details, and the remaining permissions reach neither.
+        for (name, member) in [
+            ("manageGroups", custom_with(|m| m.manage_groups = true)),
+            ("managePolicies", custom_with(|m| m.manage_policies = true)),
+            ("createNewCollections", custom_with(|m| m.create_new_collections = true)),
+            ("accessReports", custom_with(|m| m.access_reports = true)),
+            ("accessImportExport", custom_with(|m| m.access_import_export = true)),
+            ("accessEventLogs", custom_with(|m| m.access_event_logs = true)),
+            ("flagless Custom", membership(MembershipType::Custom)),
+            ("User", membership(MembershipType::User)),
+        ] {
+            assert_access(name, &member, ExplicitManage, ExplicitManage);
+        }
+
+        // A stale flag on a role that cannot hold it grants nothing ...
+        let mut stale_user = membership(MembershipType::User);
+        stale_user.manage_users = true;
+        assert_access("stale manageUsers on a User", &stale_user, ExplicitManage, ExplicitManage);
+
+        // ... and neither does an unconfirmed membership or an unparsable stored role.
+        let mut unconfirmed = custom_with(|m| m.manage_users = true);
+        unconfirmed.status = MembershipStatus::Accepted as i32;
+        assert_access("unconfirmed manageUsers", &unconfirmed, Denied, Denied);
+
+        for atype in [-1, 3, 5, i32::MAX, i32::MIN] {
+            let mut unknown = custom_with(|m| m.manage_users = true);
+            unknown.atype = atype;
+            assert_access(&format!("unknown atype {atype}"), &unknown, Denied, Denied);
+        }
+    }
+
+    /// `POST /organizations/<org_id>/collections/bulk-access` rewrites a collection's user *and* group
+    /// assignments, and upstream authorizes it against both `ModifyUserAccess` and `ModifyGroupAccess`.
+    /// Each falls back to the collection-update check when its own permission is missing, so holding
+    /// only one of the two never opens the endpoint on its own.
+    #[test]
+    fn bulk_access_requires_both_modify_user_and_modify_group_access() {
+        use CollectionManageAccess::{Any, Denied, ExplicitManage};
+
+        // 1. Both permissions, no Edit any collection and no per-collection Manage: every collection.
+        let both = custom_with(|m| {
+            m.manage_users = true;
+            m.manage_groups = true;
+        });
+        assert_eq!(collection_modify_access(&both), Any);
+
+        // 2./3. Only one of the two: the other requirement still needs the collection-update check,
+        // so authority is limited to collections carrying a real Manage grant.
+        assert_eq!(collection_modify_access(&custom_with(|m| m.manage_users = true)), ExplicitManage);
+        assert_eq!(collection_modify_access(&custom_with(|m| m.manage_groups = true)), ExplicitManage);
+
+        // 4. Neither permission: a real per-collection Manage grant still authorizes its own collection.
+        assert_eq!(collection_modify_access(&membership(MembershipType::Custom)), ExplicitManage);
+        assert_eq!(collection_modify_access(&membership(MembershipType::User)), ExplicitManage);
+
+        // 5. Edit any collection, Admin and Owner keep blanket access through the update fallback.
+        assert_eq!(collection_modify_access(&custom_with(|m| m.edit_any_collection = true)), Any);
+        assert_eq!(collection_modify_access(&membership(MembershipType::Admin)), Any);
+        assert_eq!(collection_modify_access(&membership(MembershipType::Owner)), Any);
+
+        // Delete any collection is not an update permission upstream and is not one here either.
+        assert_eq!(collection_modify_access(&custom_with(|m| m.delete_any_collection = true)), ExplicitManage);
+
+        // The endpoint never becomes more permissive than the single-collection edit route.
+        for member in [
+            custom_with(|m| m.manage_users = true),
+            custom_with(|m| m.manage_groups = true),
+            custom_with(|m| m.create_new_collections = true),
+            custom_with(|m| m.access_import_export = true),
+            membership(MembershipType::User),
+        ] {
+            assert_eq!(collection_modify_access(&member), collection_edit_access(&member));
+        }
+
+        // An unconfirmed membership, a stale flag on a non-Custom role and an unparsable stored role
+        // never reach the org-wide branch.
+        let mut unconfirmed = custom_with(|m| {
+            m.manage_users = true;
+            m.manage_groups = true;
+        });
+        unconfirmed.status = MembershipStatus::Accepted as i32;
+        assert_eq!(collection_modify_access(&unconfirmed), Denied);
+
+        let mut stale_user = membership(MembershipType::User);
+        stale_user.manage_users = true;
+        stale_user.manage_groups = true;
+        assert_eq!(collection_modify_access(&stale_user), ExplicitManage);
+
+        for atype in [-1, 3, 5, i32::MAX, i32::MIN] {
+            let mut unknown = custom_with(|m| {
+                m.manage_users = true;
+                m.manage_groups = true;
+            });
+            unknown.atype = atype;
+            assert_eq!(collection_modify_access(&unknown), Denied, "unknown atype {atype}");
+        }
     }
 }

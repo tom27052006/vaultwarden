@@ -14,7 +14,7 @@ use crate::{
     auth::{
         AccessImportExportHeaders, AdminHeaders, CollectionDeleteHeaders, CollectionReadHeaders, Headers,
         ManageGroupsHeaders, ManagePoliciesHeaders, ManageUsersHeaders, ManagerHeaders, ManagerHeadersLoose,
-        OrgMemberHeaders, OwnerHeaders, can_read_collection_access, decode_invite,
+        OrgMemberHeaders, OwnerHeaders, can_read_collection_access, can_read_collection_with_access, decode_invite,
     },
     db::{
         DbConn,
@@ -624,10 +624,12 @@ async fn post_bulk_access_collections(
         err!("Can't find organization details")
     }
 
-    // Security: authorization is per collection below, via the same `auth::can_edit_collection` the
-    // single-collection edit endpoint uses — a body-param endpoint cannot use `ManagerHeaders`, and the
-    // two must not diverge. Group `access_all` deliberately does not satisfy it (the previous
-    // `is_manageable_by_user` check accepted it, and disagreed with the single-edit endpoint).
+    // Security: authorization is per collection below, via `auth::can_modify_collection_access`, which
+    // mirrors upstream authorizing this route against *both* `ModifyUserAccess` and `ModifyGroupAccess`:
+    // the regular collection-update authorization (Owner/Admin, `Edit any collection`, or a real
+    // per-collection Manage grant), or `Manage users` *and* `Manage groups` together. Group `access_all`
+    // deliberately does not satisfy it (the previous `is_manageable_by_user` check accepted it, and
+    // disagreed with the single-edit endpoint).
 
     // Security and atomicity: validate the whole request against this organization before mutating
     // anything — every collection, group and user must belong to it and be manageable by the caller.
@@ -649,8 +651,8 @@ async fn post_bulk_access_collections(
             err!("Collection not found")
         };
 
-        if !crate::auth::can_edit_collection(&headers.membership, &collection.uuid, &conn).await {
-            err!("Collection not found", "The current user isn't a manager for this collection")
+        if !crate::auth::can_modify_collection_access(&headers.membership, &collection.uuid, &conn).await {
+            err!("Collection not found", "The current user isn't allowed to modify this collection's access")
         }
 
         collections.push(collection);
@@ -849,14 +851,18 @@ async fn bulk_delete_organization_collections(
     Ok(())
 }
 
+// Upstream guards this route with `BulkCollectionOperations.ReadWithAccess`, which — unlike the
+// `ReadAccess` used by `/collections/<col_id>/users` below — also admits `Manage users`. Hence the
+// route-specific `can_read_collection_with_access` instead of the general `CollectionReadHeaders`
+// guard: extending that guard would have changed the `/users` endpoint along with it.
 #[get("/organizations/<org_id>/collections/<col_id>/details")]
 async fn get_org_collection_detail(
     org_id: OrganizationId,
     col_id: CollectionId,
-    headers: CollectionReadHeaders,
+    headers: ManagerHeadersLoose,
     conn: DbConn,
 ) -> JsonResult {
-    if org_id != headers.org_id {
+    if org_id != headers.membership.org_uuid {
         err!("Organization not found", "Organization id's do not match");
     }
     match Collection::find_by_uuid_and_org(&col_id, &org_id, &conn).await {
@@ -864,6 +870,11 @@ async fn get_org_collection_detail(
         Some(collection) => {
             if collection.org_uuid != org_id {
                 err!("Collection is not owned by organization")
+            }
+
+            // Authorize against the resolved collection, never against the request-supplied id.
+            if !can_read_collection_with_access(&headers.membership, &collection.uuid, &conn).await {
+                err!("Collection not found", "The current user isn't allowed to read this collection's access")
             }
 
             let groups: Vec<Value> = if CONFIG.org_groups_enabled() {
@@ -2162,23 +2173,27 @@ async fn post_org_import(
         }
     }
 
-    // Security (audit F8/upstream): index the existing collections by id so the per-collection
-    // authorization below can use the *write* predicate `is_writable_by_user`. A read-only
-    // assignment must not let an importer plant ciphers into a shared collection.
+    // Security: index the existing collections by id so the per-collection authorization below can run
+    // the collection-*update* predicate `auth::can_edit_collection` on them. Upstream resolves
+    // `BulkCollectionOperations.ImportCiphers` through the very same `CanUpdateCollectionAsync` as a
+    // collection update, so importing into an existing collection needs Owner/Admin, `Edit any
+    // collection` or a real per-collection Manage grant. A plain write assignment
+    // (`readOnly = false`, `manage = false`) is deliberately *not* enough — the previous
+    // `is_writable_by_user` check accepted it and was more permissive than upstream.
     let existing_collections: HashMap<CollectionId, Collection> =
         Collection::find_by_organization(&org_id, &conn).await.into_iter().map(|c| (c.uuid.clone(), c)).collect();
 
     // Finish every request-controlled collection authorization check before the first new collection
     // is written. This matters for the PR's create-only Custom role: a payload may name a new
-    // collection first and an existing, non-writable collection later. Rejecting the latter only in
+    // collection first and an existing, unauthorized collection later. Rejecting the latter only in
     // the write loop left the former behind even though the request failed.
     for col in &data.collections {
         if let Some(collection) = col.id.as_ref().and_then(|col_id| existing_collections.get(col_id)) {
-            let writable = collection.is_writable_by_user(&headers.membership.user_uuid, &conn).await;
+            let can_update = crate::auth::can_edit_collection(&headers.membership, &collection.uuid, &conn).await;
             if !may_import_to_collection(
                 &headers.membership,
                 OrganizationImportTarget::Existing {
-                    writable,
+                    can_update,
                 },
             ) {
                 err!(Compact, "The current user isn't allowed to manage this collection")
@@ -3139,7 +3154,11 @@ fn may_revoke_stored_member_type(caller_type: MembershipType, target_atype: i32)
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OrganizationImportTarget {
     Existing {
-        writable: bool,
+        /// The outcome of `auth::can_edit_collection` for this collection — upstream resolves
+        /// `BulkCollectionOperations.ImportCiphers` through exactly the same `CanUpdateCollectionAsync`
+        /// it uses for a collection update, so this is the collection-update authorization, not a
+        /// write/edit assignment. A `readOnly = false, manage = false` assignment does not qualify.
+        can_update: bool,
     },
     New,
 }
@@ -3154,8 +3173,8 @@ fn may_import_to_collection(caller: &Membership, target: OrganizationImportTarge
 
     match target {
         OrganizationImportTarget::Existing {
-            writable,
-        } => writable,
+            can_update,
+        } => can_update,
         OrganizationImportTarget::New => caller.can_create_new_collections(),
     }
 }
@@ -3964,7 +3983,7 @@ mod tests {
         assert!(may_import_to_collection(
             &import_export,
             OrganizationImportTarget::Existing {
-                writable: false
+                can_update: false
             }
         ));
         assert!(may_import_to_collection(&import_export, OrganizationImportTarget::New));
@@ -3972,7 +3991,7 @@ mod tests {
         assert!(may_import_to_collection(
             &import_export,
             OrganizationImportTarget::Existing {
-                writable: true
+                can_update: true
             }
         ));
 
@@ -3987,14 +4006,14 @@ mod tests {
         assert!(may_import_to_collection(
             &confirmed_member(MembershipType::User),
             OrganizationImportTarget::Existing {
-                writable: true
+                can_update: true
             }
         ));
 
         assert!(may_import_to_collection(
             &confirmed_member(MembershipType::Admin),
             OrganizationImportTarget::Existing {
-                writable: false
+                can_update: false
             }
         ));
         assert!(may_import_to_collection(&confirmed_member(MembershipType::Owner), OrganizationImportTarget::New));
@@ -4003,9 +4022,83 @@ mod tests {
         assert!(!may_import_to_collection(
             &import_export,
             OrganizationImportTarget::Existing {
-                writable: true
+                can_update: true
             }
         ));
+    }
+
+    /// Importing into an *existing* collection is upstream's `BulkCollectionOperations.ImportCiphers`,
+    /// which it resolves through the very same `CanUpdateCollectionAsync` as a collection update. So
+    /// the `can_update` input below is `auth::can_edit_collection`, not a write assignment: a member
+    /// with `readOnly = false, manage = false` gets `can_update = false` and must be refused, while
+    /// Admin/Owner, `Edit any collection` and a real per-collection Manage grant all yield
+    /// `can_update = true`. Which membership maps to which `can_update` is pinned down by
+    /// `collection_edit_access` in `auth`'s own tests.
+    #[test]
+    fn importing_into_an_existing_collection_needs_collection_update_authority() {
+        let existing = |can_update| OrganizationImportTarget::Existing {
+            can_update,
+        };
+
+        // A plain write/edit assignment (`can_update = false`) is not enough for anyone who does not
+        // hold blanket import authority -- this is the case the old `is_writable_by_user` check let in.
+        for member in [
+            confirmed_member(MembershipType::User),
+            confirmed_member(MembershipType::Custom),
+            {
+                let mut create = confirmed_member(MembershipType::Custom);
+                create.create_new_collections = true;
+                create
+            },
+            {
+                let mut reports = confirmed_member(MembershipType::Custom);
+                reports.access_reports = true;
+                reports
+            },
+            {
+                let mut manage_users = confirmed_member(MembershipType::Custom);
+                manage_users.manage_users = true;
+                manage_users
+            },
+        ] {
+            assert!(!may_import_to_collection(&member, existing(false)), "atype {} must not import", member.atype);
+            // Whatever grants collection-update authority (per-collection Manage, Edit any
+            // collection) does authorize the import for that same collection.
+            assert!(may_import_to_collection(&member, existing(true)), "atype {} may import", member.atype);
+        }
+
+        // `Create new collections` stays exactly that: it authorizes a new collection and nothing else.
+        let mut create = confirmed_member(MembershipType::Custom);
+        create.create_new_collections = true;
+        assert!(may_import_to_collection(&create, OrganizationImportTarget::New));
+        assert!(!may_import_to_collection(&create, existing(false)));
+
+        // `Access import/export` authorizes the whole organization, existing collections included.
+        let mut import_export = confirmed_member(MembershipType::Custom);
+        import_export.access_import_export = true;
+        assert!(may_import_to_collection(&import_export, existing(false)));
+        assert!(may_import_to_collection(&import_export, OrganizationImportTarget::New));
+
+        // Admin/Owner likewise, and an unconfirmed or unparsable membership never at all.
+        for role in [MembershipType::Admin, MembershipType::Owner] {
+            assert!(may_import_to_collection(&confirmed_member(role), existing(false)));
+        }
+
+        let mut unconfirmed = confirmed_member(MembershipType::Custom);
+        unconfirmed.access_import_export = true;
+        unconfirmed.status = MembershipStatus::Accepted as i32;
+        assert!(!may_import_to_collection(&unconfirmed, existing(true)));
+        assert!(!may_import_to_collection(&unconfirmed, OrganizationImportTarget::New));
+
+        for atype in [-1, 3, 5, i32::MAX] {
+            let mut unknown = confirmed_member(MembershipType::Custom);
+            unknown.access_import_export = true;
+            unknown.create_new_collections = true;
+            unknown.atype = atype;
+            // A role above Admin's wire value must not be read as "at least Admin" either.
+            assert!(!may_import_to_collection(&unknown, existing(false)), "unknown atype {atype}");
+            assert!(!may_import_to_collection(&unknown, OrganizationImportTarget::New), "unknown atype {atype}");
+        }
     }
 
     #[test]
