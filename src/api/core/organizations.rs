@@ -1018,12 +1018,14 @@ fn filter_ciphers_for_organization(ciphers: Vec<Cipher>, org_id: &OrganizationId
 // organization. DeleteAnyCollection must never make cipher contents visible.
 #[get("/ciphers/organization-details/assigned?<data..>")]
 async fn get_assigned_org_details(data: OrgIdData, headers: Headers, conn: DbConn) -> JsonResult {
-    if Membership::find_confirmed_by_user_and_org(&headers.user.uuid, &data.organization_id, &conn).await.is_none() {
+    let Some(membership) =
+        Membership::find_confirmed_by_user_and_org(&headers.user.uuid, &data.organization_id, &conn).await
+    else {
         err_code!("Resource not found.", "User is not a confirmed member of the organization", Status::NotFound.code);
-    }
+    };
 
     Ok(Json(json!({
-        "data": assigned_org_ciphers_json(&data.organization_id, &headers.host, &headers.user.uuid, &conn).await?,
+        "data": assigned_org_ciphers_json(&membership, &headers.host, &conn).await?,
         "object": "list",
         "continuationToken": null,
     })))
@@ -1035,13 +1037,34 @@ async fn get_assigned_org_details(data: OrgIdData, headers: Headers, conn: DbCon
 // NOTE: as everywhere else in Vaultwarden (and Bitwarden), `hidePasswords` is reported as
 // `viewPassword: false` rather than redacted server-side, so this returns exactly what the same member
 // already receives from `/api/sync` -- never more.
-async fn assigned_org_ciphers_json(
-    org_id: &OrganizationId,
-    host: &str,
-    user_id: &UserId,
-    conn: &DbConn,
-) -> Result<Value, crate::Error> {
-    let ciphers = filter_ciphers_for_organization(Cipher::find_by_user_visible(user_id, conn).await, org_id);
+//
+// On top of that, upstream's `GetAssignedOrganizationCiphers` adds the organization's *unassigned*
+// ciphers for the roles allowed to reach them (`CanAccessUnassignedCiphersAsync`: Owner/Admin, or a
+// Custom member holding `Edit any collection`) -- which is exactly `Membership::has_full_access`. This
+// is deliberately the only place that widens the scope: the regular `/api/sync` view stays as it is.
+async fn assigned_org_ciphers(membership: &Membership, conn: &DbConn) -> Vec<Cipher> {
+    let org_id = &membership.org_uuid;
+    let mut ciphers =
+        filter_ciphers_for_organization(Cipher::find_by_user_visible(&membership.user_uuid, conn).await, org_id);
+
+    if membership.has_full_access() {
+        // An unassigned cipher is in no collection, so the query above can only have returned it
+        // through the organization-wide `Edit any collection` reach. De-duplicate on that.
+        let assigned: HashSet<CipherId> = ciphers.iter().map(|cipher| cipher.uuid.clone()).collect();
+        ciphers.extend(
+            Cipher::find_unassigned_by_org(org_id, conn)
+                .await
+                .into_iter()
+                .filter(|cipher| !assigned.contains(&cipher.uuid)),
+        );
+    }
+
+    ciphers
+}
+
+async fn assigned_org_ciphers_json(membership: &Membership, host: &str, conn: &DbConn) -> Result<Value, crate::Error> {
+    let user_id = &membership.user_uuid;
+    let ciphers = assigned_org_ciphers(membership, conn).await;
     let cipher_sync_data = CipherSyncData::new(user_id, CipherSyncType::User, conn).await;
 
     let mut ciphers_json = Vec::with_capacity(ciphers.len());
@@ -4218,6 +4241,105 @@ mod tests {
             assert_eq!(admin.len(), 1);
             assert_eq!(admin[0]["manage"], true);
             assert!(!stored_membership_ids.contains(&MembershipId::from("m-admin".to_owned())));
+        });
+    }
+
+    /// Two organizations. In `org-a`: a collection every role below is assigned to, a collection
+    /// nobody in this fixture is assigned to, and a cipher that is in no collection at all.
+    #[cfg(sqlite)]
+    const ASSIGNED_DETAILS_SEED: &str = "
+        INSERT INTO collections (uuid, org_uuid, name) VALUES
+            ('col-assigned', 'org-a', 'assigned'),
+            ('col-foreign',  'org-a', 'foreign'),
+            ('col-other',    'org-b', 'other org');
+
+        INSERT INTO users (uuid, updated_at) VALUES
+            ('u-owner',     '2026-01-01 00:00:00'),
+            ('u-admin',     '2026-01-01 00:00:00'),
+            ('u-editany',   '2026-01-01 00:00:00'),
+            ('u-deleteany', '2026-01-01 00:00:00'),
+            ('u-custom',    '2026-01-01 00:00:00'),
+            ('u-user',      '2026-01-01 00:00:00');
+
+        INSERT INTO users_organizations
+            (uuid, user_uuid, org_uuid, akey, status, atype,
+             edit_any_collection, delete_any_collection, manage_users) VALUES
+            ('m-owner',     'u-owner',     'org-a', '', 2, 0, FALSE, FALSE, FALSE),
+            ('m-admin',     'u-admin',     'org-a', '', 2, 1, FALSE, FALSE, FALSE),
+            ('m-editany',   'u-editany',   'org-a', '', 2, 4, TRUE,  FALSE, FALSE),
+            ('m-deleteany', 'u-deleteany', 'org-a', '', 2, 4, FALSE, TRUE,  FALSE),
+            ('m-custom',    'u-custom',    'org-a', '', 2, 4, FALSE, FALSE, TRUE),
+            ('m-user',      'u-user',      'org-a', '', 2, 2, FALSE, FALSE, FALSE);
+
+        INSERT INTO users_collections (user_uuid, collection_uuid, read_only, hide_passwords, manage) VALUES
+            ('u-owner', 'col-assigned', FALSE, FALSE, FALSE),
+            ('u-admin', 'col-assigned', FALSE, FALSE, FALSE),
+            ('u-user',  'col-assigned', FALSE, FALSE, FALSE);
+
+        INSERT INTO ciphers (uuid, organization_uuid) VALUES
+            ('c-assigned',   'org-a'),
+            ('c-foreign',    'org-a'),
+            ('c-unassigned', 'org-a'),
+            ('c-other-org',  'org-b');
+        INSERT INTO ciphers_collections (cipher_uuid, collection_uuid) VALUES
+            ('c-assigned',  'col-assigned'),
+            ('c-foreign',   'col-foreign'),
+            ('c-other-org', 'col-other');
+    ";
+
+    /// `GET /ciphers/organization-details/assigned` serves the caller's own organization ciphers plus,
+    /// for the roles upstream's `CanAccessUnassignedCiphersAsync` admits (Owner/Admin, or Custom with
+    /// `Edit any collection`), the organization's unassigned ciphers.
+    ///
+    /// Restoring `visible_only` removes the role-based reach from the underlying query, so this route
+    /// has to carry the unassigned set itself — and only this route, never the regular sync view.
+    #[cfg(sqlite)]
+    #[test]
+    fn assigned_org_details_add_unassigned_ciphers_only_for_the_roles_upstream_allows() {
+        use super::assigned_org_ciphers;
+        use crate::db::{
+            DbConn,
+            models::MembershipId,
+            test_db::{ORG_ACL_SCHEMA, TestDb, block_on},
+        };
+
+        async fn served(member: &str, conn: &DbConn) -> Vec<String> {
+            let membership = Membership::find_by_uuid(&MembershipId::from(member.to_owned()), conn)
+                .await
+                .unwrap_or_else(|| panic!("Missing membership {member}"));
+            let mut ids: Vec<String> =
+                assigned_org_ciphers(&membership, conn).await.into_iter().map(|c| c.uuid.to_string()).collect();
+            ids.sort();
+            ids
+        }
+
+        let db = TestDb::new(&format!("{ORG_ACL_SCHEMA}{ASSIGNED_DETAILS_SEED}"));
+        block_on(async {
+            let conn = db.conn();
+
+            // Owner and Admin: their own collections plus the unassigned cipher — but not a
+            // collection they were never assigned to.
+            for member in ["m-owner", "m-admin"] {
+                assert_eq!(served(member, &conn).await, ["c-assigned", "c-unassigned"], "{member}");
+            }
+
+            // `Edit any collection` reaches every collection anyway; the unassigned cipher is added
+            // once, not twice.
+            assert_eq!(served("m-editany", &conn).await, ["c-assigned", "c-foreign", "c-unassigned"]);
+
+            // A plain member gets only what they are assigned to.
+            assert_eq!(served("m-user", &conn).await, ["c-assigned"]);
+
+            // A Custom member without a matching collection permission gets nothing — `manage_users`
+            // is not a cipher permission, and `delete_any_collection` must never make cipher contents
+            // visible, which is exactly what this route's comment promises.
+            assert!(served("m-custom", &conn).await.is_empty());
+            assert!(served("m-deleteany", &conn).await.is_empty());
+
+            // The other organization's cipher never appears, for anyone.
+            for member in ["m-owner", "m-admin", "m-editany", "m-deleteany", "m-custom", "m-user"] {
+                assert!(!served(member, &conn).await.contains(&"c-other-org".to_owned()), "{member}");
+            }
         });
     }
 }

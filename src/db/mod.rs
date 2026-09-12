@@ -451,6 +451,18 @@ pub(crate) mod test_db {
             enabled BOOLEAN NOT NULL, data TEXT NOT NULL, last_used BIGINT NOT NULL
         );
         CREATE TABLE collections (uuid TEXT NOT NULL PRIMARY KEY, org_uuid TEXT NOT NULL, name TEXT NOT NULL, external_id TEXT);
+        CREATE TABLE ciphers (
+            uuid TEXT NOT NULL PRIMARY KEY,
+            created_at DATETIME NOT NULL DEFAULT '2026-01-01 00:00:00',
+            updated_at DATETIME NOT NULL DEFAULT '2026-01-01 00:00:00',
+            user_uuid TEXT, organization_uuid TEXT, key TEXT,
+            atype INTEGER NOT NULL DEFAULT 1, name TEXT NOT NULL DEFAULT '', notes TEXT, fields TEXT,
+            data TEXT NOT NULL DEFAULT '{}', password_history TEXT, deleted_at DATETIME, reprompt INTEGER
+        );
+        CREATE TABLE ciphers_collections (
+            cipher_uuid TEXT NOT NULL, collection_uuid TEXT NOT NULL,
+            PRIMARY KEY (cipher_uuid, collection_uuid)
+        );
         CREATE TABLE groups_users (groups_uuid TEXT NOT NULL, users_organizations_uuid TEXT NOT NULL, PRIMARY KEY (groups_uuid, users_organizations_uuid));
         CREATE TABLE users_collections (
             user_uuid TEXT NOT NULL, collection_uuid TEXT NOT NULL,
