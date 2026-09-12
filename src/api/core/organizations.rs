@@ -1022,23 +1022,61 @@ async fn get_assigned_org_details(data: OrgIdData, headers: Headers, conn: DbCon
 async fn assigned_org_ciphers_json(membership: &Membership, host: &str, conn: &DbConn) -> Result<Value, crate::Error> {
     let user_id = &membership.user_uuid;
     let org_id = &membership.org_uuid;
-    let mut ciphers = filter_ciphers_for_organization(Cipher::find_by_user_visible(user_id, conn).await, org_id);
 
-    if membership.has_full_access() {
-        let assigned: HashSet<CipherId> = ciphers.iter().map(|cipher| cipher.uuid.clone()).collect();
-        ciphers.extend(
-            Cipher::find_unassigned_by_org(org_id, conn)
-                .await
-                .into_iter()
-                .filter(|cipher| !assigned.contains(&cipher.uuid)),
+    let ciphers = filter_ciphers_for_organization(Cipher::find_by_user_visible(user_id, conn).await, org_id);
+    let assigned: HashSet<CipherId> = ciphers.iter().map(|cipher| cipher.uuid.clone()).collect();
+
+    let cipher_sync_data = CipherSyncData::new(user_id, CipherSyncType::User, conn).await;
+    let mut ciphers_json = Vec::new();
+
+    // Assigned ciphers keep the user's actual collection restrictions.
+    for cipher in ciphers {
+        ciphers_json.push(
+            cipher
+                .to_json(host, user_id, Some(&cipher_sync_data), CipherSyncType::User, conn)
+                .await?,
         );
     }
 
-    let cipher_sync_data = CipherSyncData::new(user_id, CipherSyncType::User, conn).await;
+    // Bitwarden exposes unassigned ciphers with full edit/password access to
+    // Owner/Admin and Custom members with EditAnyCollection.
+    if membership.has_full_access() {
+        for cipher in Cipher::find_unassigned_by_org(org_id, conn)
+            .await
+            .into_iter()
+            .filter(|cipher| !assigned.contains(&cipher.uuid))
+        {
+            // Use Organization serialization here so the normal user-access
+            // assertion is deliberately skipped for this already-authorized
+            // special case. Add the user-specific fields below explicitly.
+            let mut cipher_json = cipher
+                .to_json(
+                    host,
+                    user_id,
+                    Some(&cipher_sync_data),
+                    CipherSyncType::Organization,
+                    conn,
+                )
+                .await?;
 
-    let mut ciphers_json = Vec::with_capacity(ciphers.len());
-    for cipher in ciphers {
-        ciphers_json.push(cipher.to_json(host, user_id, Some(&cipher_sync_data), CipherSyncType::User, conn).await?);
+            cipher_json["folderId"] = json!(cipher_sync_data.cipher_folders.get(&cipher.uuid).cloned());
+            cipher_json["favorite"] = json!(cipher_sync_data.cipher_favorites.contains(&cipher.uuid));
+            cipher_json["archivedDate"] = json!(
+                cipher_sync_data
+                    .cipher_archives
+                    .get(&cipher.uuid)
+                    .map_or(Value::Null, |date| Value::String(crate::util::format_date(date)))
+            );
+
+            cipher_json["edit"] = json!(true);
+            cipher_json["viewPassword"] = json!(true);
+            cipher_json["permissions"] = json!({
+                "delete": true,
+                "restore": true,
+            });
+
+            ciphers_json.push(cipher_json);
+        }
     }
 
     Ok(Value::Array(ciphers_json))
