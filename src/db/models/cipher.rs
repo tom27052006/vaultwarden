@@ -25,7 +25,7 @@ use macros::UuidFromParam;
 
 use super::{
     Archive, Attachment, CollectionCipher, CollectionId, Favorite, FolderCipher, FolderId, Group, Membership,
-    MembershipStatus, OrganizationId, User, UserId,
+    MembershipStatus, MembershipType, OrganizationId, User, UserId,
     organization::{ORG_ADMIN_ATYPES, custom_membership_with_edit_any_collection},
 };
 
@@ -544,7 +544,8 @@ impl Cipher {
         self.user_uuid.is_some() && self.user_uuid.as_ref().unwrap() == user_uuid
     }
 
-    /// Returns whether this cipher is owned by an org in which the user has full access.
+    /// Returns whether this cipher is owned by an org in which the user has unrestricted normal
+    /// cipher access by role. Custom collection-management permissions do not grant this access.
     async fn is_in_full_access_org(
         &self,
         user_uuid: &UserId,
@@ -554,10 +555,10 @@ impl Cipher {
         if let Some(ref org_uuid) = self.organization_uuid {
             if let Some(cipher_sync_data) = cipher_sync_data {
                 if let Some(cached_member) = cipher_sync_data.members.get(org_uuid) {
-                    return cached_member.has_full_access();
+                    return cached_member.atype >= MembershipType::Admin;
                 }
             } else if let Some(member) = Membership::find_confirmed_by_user_and_org(user_uuid, org_uuid, conn).await {
-                return member.has_full_access();
+                return member.atype >= MembershipType::Admin;
             }
         }
         false
