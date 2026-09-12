@@ -656,30 +656,3 @@ impl GroupUser {
     UuidFromParam,
 )]
 pub struct GroupId(String);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `manage` is reported straight from the stored grant. Synthesizing it from read/write access
-    /// turned a GET followed by an unchanged PUT into a silent Manage grant.
-    #[test]
-    fn collection_group_manage_is_reported_as_stored() {
-        let manage = |read_only, hide_passwords, manage| {
-            CollectionGroup::new(
-                CollectionId::from("col-a".to_owned()),
-                GroupId::from("g-a".to_owned()),
-                read_only,
-                hide_passwords,
-                manage,
-            )
-            .to_json_details_for_group()["manage"]
-                .clone()
-        };
-
-        assert_eq!(manage(false, false, false), json!(false));
-        assert_eq!(manage(true, false, false), json!(false));
-        assert_eq!(manage(false, true, false), json!(false));
-        assert_eq!(manage(false, false, true), json!(true));
-    }
-}

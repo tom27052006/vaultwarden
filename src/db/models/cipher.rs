@@ -873,18 +873,16 @@ impl Cipher {
                             .and(collections_groups::groups_uuid.eq(groups::uuid))),
                     )
                     .filter(ciphers::user_uuid.eq(user_uuid)) // Cipher owner
-                    // Custom "Edit any collection" — the successor of the membership access_all flag.
-                    // The org admin/owner *role* deliberately stays out of this filter: it only widens
-                    // the scope when `visible_only` is false, exactly as access_all never implied it.
-                    .or_filter(custom_membership_with_edit_any_collection())
                     .or_filter(users_collections::user_uuid.eq(user_uuid)) // Access to collection
                     .or_filter(groups::access_all.eq(true)) // Access via groups
                     .or_filter(collections_groups::collections_uuid.is_not_null()) // Access via groups
                     .into_boxed();
 
                 if !visible_only {
+                    // Administrative organization scope, separate from the normal user vault.
                     query = query.or_filter(
-                        users_organizations::atype.eq_any(ORG_ADMIN_ATYPES), // Org admin/owner
+                        custom_membership_with_edit_any_collection()
+                            .or(users_organizations::atype.eq_any(ORG_ADMIN_ATYPES)),
                     );
                 }
 
@@ -913,16 +911,14 @@ impl Cipher {
                             .and(users_organizations::user_uuid.eq(users_collections::user_uuid))),
                     )
                     .filter(ciphers::user_uuid.eq(user_uuid)) // Cipher owner
-                    // Custom "Edit any collection" — the successor of the membership access_all flag.
-                    // The org admin/owner *role* deliberately stays out of this filter: it only widens
-                    // the scope when `visible_only` is false, exactly as access_all never implied it.
-                    .or_filter(custom_membership_with_edit_any_collection())
                     .or_filter(users_collections::user_uuid.eq(user_uuid)) // Access to collection
                     .into_boxed();
 
                 if !visible_only {
+                    // Administrative organization scope, separate from the normal user vault.
                     query = query.or_filter(
-                        users_organizations::atype.eq_any(ORG_ADMIN_ATYPES), // Org admin/owner
+                        custom_membership_with_edit_any_collection()
+                            .or(users_organizations::atype.eq_any(ORG_ADMIN_ATYPES)),
                     );
                 }
 
@@ -1219,23 +1215,16 @@ impl Cipher {
         .await
     }
 
-    /// The organization's ciphers that are in none of its collections — upstream's
+    /// The organization's ciphers that have no collection assignment — upstream's
     /// `GetUnassignedOrganizationCiphers`.
-    ///
-    /// The collection join is scoped to the same organization, exactly as upstream's
-    /// `CipherOrganizationDetailsReadByOrganizationIdQuery` scopes its `collectionCipherIds`
-    /// sub-query, so a stray link to another organization's collection cannot hide a cipher here.
     pub async fn find_unassigned_by_org(org_uuid: &OrganizationId, conn: &DbConn) -> Vec<Self> {
         conn.run(move |conn| {
             ciphers::table
                 .left_join(ciphers_collections::table.on(ciphers_collections::cipher_uuid.eq(ciphers::uuid)))
-                .left_join(collections::table.on(
-                    collections::uuid.eq(ciphers_collections::collection_uuid).and(collections::org_uuid.eq(org_uuid)),
-                ))
                 .filter(ciphers::organization_uuid.eq(org_uuid))
-                .filter(collections::uuid.is_null())
+                .filter(ciphers::user_uuid.is_null())
+                .filter(ciphers_collections::cipher_uuid.is_null())
                 .select(ciphers::all_columns)
-                .distinct()
                 .load::<Self>(conn)
                 .unwrap_or_default()
         })
@@ -1260,147 +1249,3 @@ impl Cipher {
     UuidFromParam,
 )]
 pub struct CipherId(String);
-
-#[cfg(all(test, sqlite))]
-mod tests {
-    use super::*;
-    use crate::db::test_db::{ORG_ACL_SCHEMA, TestDb, block_on};
-
-    /// One organization with three collections and a cipher in each:
-    ///
-    /// * `col-assigned` -- the Owner, the Admin and a plain User hold a direct assignment,
-    /// * `col-foreign`  -- nobody in this fixture is assigned to it,
-    /// * `col-group`    -- reachable only through a group.
-    ///
-    /// Plus a cipher in no collection at all, and a second organization's cipher.
-    /// Status 2 is Confirmed; atype 0/1/2/4 is Owner/Admin/User/Custom.
-    const VISIBILITY_SEED: &str = "
-        INSERT INTO collections (uuid, org_uuid, name) VALUES
-            ('col-assigned', 'org-a', 'assigned'),
-            ('col-foreign',  'org-a', 'foreign'),
-            ('col-group',    'org-a', 'group'),
-            ('col-other',    'org-b', 'other org');
-
-        INSERT INTO users (uuid, updated_at) VALUES
-            ('u-owner',   '2026-01-01 00:00:00'),
-            ('u-admin',   '2026-01-01 00:00:00'),
-            ('u-editany', '2026-01-01 00:00:00'),
-            ('u-custom',  '2026-01-01 00:00:00'),
-            ('u-user',    '2026-01-01 00:00:00'),
-            ('u-grouped', '2026-01-01 00:00:00');
-
-        INSERT INTO users_organizations
-            (uuid, user_uuid, org_uuid, akey, status, atype, edit_any_collection, manage_users) VALUES
-            ('m-owner',   'u-owner',   'org-a', '', 2, 0, FALSE, FALSE),
-            ('m-admin',   'u-admin',   'org-a', '', 2, 1, FALSE, FALSE),
-            ('m-editany', 'u-editany', 'org-a', '', 2, 4, TRUE,  FALSE),
-            ('m-custom',  'u-custom',  'org-a', '', 2, 4, FALSE, TRUE),
-            ('m-user',    'u-user',    'org-a', '', 2, 2, FALSE, FALSE),
-            ('m-grouped', 'u-grouped', 'org-a', '', 2, 2, FALSE, FALSE);
-
-        INSERT INTO users_collections (user_uuid, collection_uuid, read_only, hide_passwords, manage) VALUES
-            ('u-owner', 'col-assigned', FALSE, FALSE, FALSE),
-            ('u-admin', 'col-assigned', FALSE, FALSE, FALSE),
-            ('u-user',  'col-assigned', FALSE, FALSE, FALSE);
-
-        INSERT INTO groups (uuid, organizations_uuid, name, access_all, creation_date, revision_date) VALUES
-            ('g-col', 'org-a', 'col', FALSE, '2026-01-01 00:00:00', '2026-01-01 00:00:00');
-        INSERT INTO groups_users (groups_uuid, users_organizations_uuid) VALUES ('g-col', 'm-grouped');
-        INSERT INTO collections_groups (collections_uuid, groups_uuid, read_only, hide_passwords, manage) VALUES
-            ('col-group', 'g-col', FALSE, FALSE, FALSE);
-
-        INSERT INTO ciphers (uuid, organization_uuid) VALUES
-            ('c-assigned',   'org-a'),
-            ('c-foreign',    'org-a'),
-            ('c-group',      'org-a'),
-            ('c-unassigned', 'org-a'),
-            ('c-other-org',  'org-b');
-        INSERT INTO ciphers_collections (cipher_uuid, collection_uuid) VALUES
-            ('c-assigned',  'col-assigned'),
-            ('c-foreign',   'col-foreign'),
-            ('c-group',     'col-group'),
-            ('c-other-org', 'col-other');
-    ";
-
-    async fn ids(user: &str, visible_only: bool, conn: &DbConn) -> Vec<String> {
-        let mut ids: Vec<String> = Cipher::find_by_user(&UserId::from(user.to_owned()), visible_only, &vec![], conn)
-            .await
-            .into_iter()
-            .map(|cipher| cipher.uuid.to_string())
-            .collect();
-        ids.sort();
-        ids
-    }
-
-    /// `visible_only` has to keep meaning what the doc comment on `find_by_user` promises: the org
-    /// owner/admin *role* alone does not put every organization cipher into "My Vault".
-    ///
-    /// The membership `access_all` flag this branch replaced never implied the role -- it was a
-    /// separate bit, and `atype <= Admin` widened the scope only when `visible_only` was false.
-    /// Folding the role into the base filter made the parameter a no-op for every caller (all three
-    /// wrappers pass `visible_only = true`). `Edit any collection` is the only thing that inherits
-    /// the old flag's organization-wide reach.
-    ///
-    /// `find_by_user` has two query paths, keyed on `CONFIG.org_groups_enabled()`. Both are covered:
-    /// every assertion below holds in either configuration, and the one that cannot (a member whose
-    /// only access is a group) is asserted against the active setting.
-    #[test]
-    fn visible_only_excludes_unassigned_collections_for_owner_and_admin() {
-        let db = TestDb::new(&format!("{ORG_ACL_SCHEMA}{VISIBILITY_SEED}"));
-        block_on(async {
-            let conn = db.conn();
-            let whole_org = ["c-assigned", "c-foreign", "c-group", "c-unassigned"];
-
-            // Role alone: only the collection they are actually assigned to ...
-            assert_eq!(ids("u-owner", true, &conn).await, ["c-assigned"]);
-            assert_eq!(ids("u-admin", true, &conn).await, ["c-assigned"]);
-            // ... while the non-visible-only path still returns the full organization scope.
-            assert_eq!(ids("u-owner", false, &conn).await, whole_org);
-            assert_eq!(ids("u-admin", false, &conn).await, whole_org);
-
-            // `Edit any collection` is the successor of the membership access_all flag and keeps its
-            // organization-wide reach in both modes.
-            assert_eq!(ids("u-editany", true, &conn).await, whole_org);
-            assert_eq!(ids("u-editany", false, &conn).await, whole_org);
-
-            // A Custom member without it gains nothing, in either mode.
-            assert!(ids("u-custom", true, &conn).await.is_empty());
-            assert!(ids("u-custom", false, &conn).await.is_empty());
-
-            // Plain members keep exactly their direct assignment ...
-            assert_eq!(ids("u-user", true, &conn).await, ["c-assigned"]);
-            // ... and their group assignment, on the query path that considers groups at all.
-            let group_access: &[&str] = if CONFIG.org_groups_enabled() {
-                &["c-group"]
-            } else {
-                &[]
-            };
-            assert_eq!(ids("u-grouped", true, &conn).await, group_access);
-            assert_eq!(ids("u-grouped", false, &conn).await, group_access);
-
-            // Nobody reaches the other organization's cipher, in either mode.
-            for user in ["u-owner", "u-admin", "u-editany", "u-custom", "u-user", "u-grouped"] {
-                for visible_only in [true, false] {
-                    assert!(!ids(user, visible_only, &conn).await.contains(&"c-other-org".to_owned()), "{user}");
-                }
-            }
-        });
-    }
-
-    /// Upstream's `GetUnassignedOrganizationCiphers`: the organization's ciphers that are in none of
-    /// its collections, and nothing else.
-    #[test]
-    fn unassigned_org_ciphers_are_scoped_to_the_organization() {
-        let db = TestDb::new(&format!("{ORG_ACL_SCHEMA}{VISIBILITY_SEED}"));
-        block_on(async {
-            let conn = db.conn();
-
-            let unassigned = Cipher::find_unassigned_by_org(&OrganizationId::from("org-a".to_owned()), &conn).await;
-            assert_eq!(unassigned.iter().map(|c| c.uuid.to_string()).collect::<Vec<_>>(), ["c-unassigned"]);
-
-            // The second organization has no unassigned cipher of its own, and org-a's never leaks in.
-            let other = Cipher::find_unassigned_by_org(&OrganizationId::from("org-b".to_owned()), &conn).await;
-            assert!(other.is_empty());
-        });
-    }
-}

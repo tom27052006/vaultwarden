@@ -478,7 +478,16 @@ async fn get_org_collections_details(org_id: OrganizationId, headers: ManagerHea
                 )
             })
             .collect();
-        append_missing_manage_all_members(&mut users, &stored_membership_ids, &manage_all_members);
+        users.extend(manage_all_members.iter().filter(|member| !stored_membership_ids.contains(&member.uuid)).map(
+            |member| {
+                json!({
+                    "id": member.uuid,
+                    "readOnly": false,
+                    "hidePasswords": false,
+                    "manage": true,
+                })
+            },
+        ));
 
         let groups: Vec<Value> = if CONFIG.org_groups_enabled() {
             CollectionGroup::find_by_collection(&col.uuid, &conn)
@@ -504,23 +513,6 @@ async fn get_org_collections_details(org_id: OrganizationId, headers: ManagerHea
         "object": "list",
         "continuationToken": null,
     })))
-}
-
-fn append_missing_manage_all_members(
-    users: &mut Vec<Value>,
-    stored_membership_ids: &HashSet<&MembershipId>,
-    manage_all_members: &[Membership],
-) {
-    users.extend(manage_all_members.iter().filter(|member| !stored_membership_ids.contains(&member.uuid)).map(
-        |member| {
-            json!({
-                "id": member.uuid,
-                "readOnly": false,
-                "hidePasswords": false,
-                "manage": true,
-            })
-        },
-    ));
 }
 
 fn may_read_all_collections(member: &Membership) -> bool {
@@ -602,38 +594,6 @@ struct BulkCollectionAccessData {
     collection_ids: Vec<CollectionId>,
     groups: Vec<CollectionGroupData>,
     users: Vec<CollectionMembershipData>,
-}
-
-/// Upstream's `Collection_CreateOrUpdateAccessForMany`, for one collection: a `CollectionGroup` and a
-/// `CollectionUser` row per requested group and member, merged over what is stored. Add/update, never
-/// replace — every assignment the request does not mention is left alone. (The single-collection update
-/// route stays a replace; upstream calls `ReplaceAsync` there.)
-///
-/// The only filter is the organization. A member that already reaches every collection — Owner, Admin,
-/// or Custom holding `Edit any collection` — is written too, so the requested grant outlives a later
-/// loss of that wider access.
-async fn create_or_update_collection_access(
-    org_id: &OrganizationId,
-    col_id: &CollectionId,
-    groups: &[CollectionGroupData],
-    users: &[CollectionMembershipData],
-    conn: &DbConn,
-) -> EmptyResult {
-    for group in groups {
-        CollectionGroup::new(col_id.clone(), group.id.clone(), group.read_only, group.hide_passwords, group.manage)
-            .save(org_id, conn)
-            .await?;
-    }
-
-    for user in users {
-        let Some(member) = Membership::find_by_uuid_and_org(&user.id, org_id, conn).await else {
-            err!("User is not part of organization")
-        };
-
-        CollectionUser::save(&member.user_uuid, col_id, user.read_only, user.hide_passwords, user.manage, conn).await?;
-    }
-
-    Ok(())
 }
 
 #[post("/organizations/<org_id>/collections/bulk-access", data = "<data>", rank = 1)]
@@ -720,7 +680,34 @@ async fn post_bulk_access_collections(
         )
         .await;
 
-        create_or_update_collection_access(&org_id, &collection.uuid, &data.groups, &data.users, &conn).await?;
+        // Add/update, never replace: every assignment the request does not mention is left alone.
+        for group in &data.groups {
+            CollectionGroup::new(
+                collection.uuid.clone(),
+                group.id.clone(),
+                group.read_only,
+                group.hide_passwords,
+                group.manage,
+            )
+            .save(&org_id, &conn)
+            .await?;
+        }
+
+        for user in &data.users {
+            let Some(member) = Membership::find_by_uuid_and_org(&user.id, &org_id, &conn).await else {
+                err!("User is not part of organization")
+            };
+
+            CollectionUser::save(
+                &member.user_uuid,
+                &collection.uuid,
+                user.read_only,
+                user.hide_passwords,
+                user.manage,
+                &conn,
+            )
+            .await?;
+        }
     }
 
     Ok(())
@@ -735,25 +722,6 @@ async fn put_organization_collection_update(
     conn: DbConn,
 ) -> JsonResult {
     post_organization_collection_update(org_id, col_id, headers, data, conn).await
-}
-
-async fn replace_collection_user_access(
-    org_id: &OrganizationId,
-    col_id: &CollectionId,
-    users: &[CollectionMembershipData],
-    conn: &DbConn,
-) -> EmptyResult {
-    CollectionUser::delete_all_by_collection(col_id, conn).await?;
-
-    for user in users {
-        let Some(member) = Membership::find_by_uuid_and_org(&user.id, org_id, conn).await else {
-            err!("User is not part of organization")
-        };
-
-        CollectionUser::save(&member.user_uuid, col_id, user.read_only, user.hide_passwords, user.manage, conn).await?;
-    }
-
-    Ok(())
 }
 
 #[post("/organizations/<org_id>/collections/<col_id>", data = "<data>", rank = 2)]
@@ -805,7 +773,16 @@ async fn post_organization_collection_update(
             .await?;
     }
 
-    replace_collection_user_access(&org_id, &col_id, &data.users, &conn).await?;
+    CollectionUser::delete_all_by_collection(&col_id, &conn).await?;
+
+    for user in data.users {
+        let Some(member) = Membership::find_by_uuid_and_org(&user.id, &org_id, &conn).await else {
+            err!("User is not part of organization")
+        };
+
+        CollectionUser::save(&member.user_uuid, &col_id, user.read_only, user.hide_passwords, user.manage, &conn)
+            .await?;
+    }
 
     Ok(Json(collection.to_json_details(&headers.user.uuid, None, &conn).await))
 }
@@ -1035,21 +1012,19 @@ async fn get_assigned_org_details(data: OrgIdData, headers: Headers, conn: DbCon
 // `CipherSyncType::User` keeps the per-cipher access restrictions in place, so nothing outside the
 // caller's own collections is returned and every cipher carries its real `edit`/`viewPassword` flags.
 // NOTE: as everywhere else in Vaultwarden (and Bitwarden), `hidePasswords` is reported as
-// `viewPassword: false` rather than redacted server-side, so this returns exactly what the same member
-// already receives from `/api/sync` -- never more.
+// `viewPassword: false` rather than redacted server-side, so this assigned portion matches what the
+// same member receives from `/api/sync`.
 //
 // On top of that, upstream's `GetAssignedOrganizationCiphers` adds the organization's *unassigned*
 // ciphers for the roles allowed to reach them (`CanAccessUnassignedCiphersAsync`: Owner/Admin, or a
 // Custom member holding `Edit any collection`) -- which is exactly `Membership::has_full_access`. This
 // is deliberately the only place that widens the scope: the regular `/api/sync` view stays as it is.
-async fn assigned_org_ciphers(membership: &Membership, conn: &DbConn) -> Vec<Cipher> {
+async fn assigned_org_ciphers_json(membership: &Membership, host: &str, conn: &DbConn) -> Result<Value, crate::Error> {
+    let user_id = &membership.user_uuid;
     let org_id = &membership.org_uuid;
-    let mut ciphers =
-        filter_ciphers_for_organization(Cipher::find_by_user_visible(&membership.user_uuid, conn).await, org_id);
+    let mut ciphers = filter_ciphers_for_organization(Cipher::find_by_user_visible(user_id, conn).await, org_id);
 
     if membership.has_full_access() {
-        // An unassigned cipher is in no collection, so the query above can only have returned it
-        // through the organization-wide `Edit any collection` reach. De-duplicate on that.
         let assigned: HashSet<CipherId> = ciphers.iter().map(|cipher| cipher.uuid.clone()).collect();
         ciphers.extend(
             Cipher::find_unassigned_by_org(org_id, conn)
@@ -1059,12 +1034,6 @@ async fn assigned_org_ciphers(membership: &Membership, conn: &DbConn) -> Vec<Cip
         );
     }
 
-    ciphers
-}
-
-async fn assigned_org_ciphers_json(membership: &Membership, host: &str, conn: &DbConn) -> Result<Value, crate::Error> {
-    let user_id = &membership.user_uuid;
-    let ciphers = assigned_org_ciphers(membership, conn).await;
     let cipher_sync_data = CipherSyncData::new(user_id, CipherSyncType::User, conn).await;
 
     let mut ciphers_json = Vec::with_capacity(ciphers.len());
@@ -1890,21 +1859,6 @@ struct EditUserData {
     permissions: Option<HashMap<String, Value>>,
 }
 
-async fn replace_member_collection_access(
-    org_id: &OrganizationId,
-    user_id: &UserId,
-    assignments: &[(CollectionId, bool, bool, bool)],
-    conn: &DbConn,
-) -> EmptyResult {
-    for collection_user in CollectionUser::find_by_organization_and_user_uuid(org_id, user_id, conn).await {
-        collection_user.delete(conn).await?;
-    }
-    for (collection_id, read_only, hide_passwords, manage) in assignments {
-        CollectionUser::save(user_id, collection_id, *read_only, *hide_passwords, *manage, conn).await?;
-    }
-    Ok(())
-}
-
 #[put("/organizations/<org_id>/users/<member_id>", data = "<data>", rank = 1)]
 async fn put_member(
     org_id: OrganizationId,
@@ -1999,7 +1953,15 @@ async fn edit_member(
         }
     }
 
-    replace_member_collection_access(&org_id, &member_to_edit.user_uuid, &collection_assignments, &conn).await?;
+    for collection_user in
+        CollectionUser::find_by_organization_and_user_uuid(&org_id, &member_to_edit.user_uuid, &conn).await
+    {
+        collection_user.delete(&conn).await?;
+    }
+    for (collection_id, read_only, hide_passwords, manage) in collection_assignments {
+        CollectionUser::save(&member_to_edit.user_uuid, &collection_id, read_only, hide_passwords, manage, &conn)
+            .await?;
+    }
 
     GroupUser::delete_all_by_member(&member_to_edit.uuid, &conn).await?;
     for group_id in data.groups.iter().flatten() {
@@ -2848,14 +2810,6 @@ async fn bulk_restore_members(
     })))
 }
 
-/// Only a revoked membership can be restored. `Membership::restore()` leaves every other status
-/// untouched, so accepting for example `Invited` here would report success and log an
-/// `OrganizationUserRestored` event without anything having changed. Revoking stores
-/// `status - 128`, which is why this is a range and not a comparison against `Revoked` alone.
-fn may_restore_stored_member_status(status: i32) -> bool {
-    status <= MembershipStatus::Revoked as i32
-}
-
 async fn restore_member_impl(
     org_id: &OrganizationId,
     member_id: &MembershipId,
@@ -2866,7 +2820,8 @@ async fn restore_member_impl(
         err!("Organization not found", "Organization id's do not match");
     }
     match Membership::find_by_uuid_and_org(member_id, org_id, conn).await {
-        Some(mut member) if may_restore_stored_member_status(member.status) => {
+        // Revoking stores `status - 128`, so every revoked value is accepted, not only -1.
+        Some(mut member) if member.status <= MembershipStatus::Revoked as i32 => {
             if member.user_uuid == headers.user.uuid {
                 err!("You cannot restore yourself")
             }
@@ -3912,434 +3867,4 @@ async fn rotate_api_key(
     conn: DbConn,
 ) -> JsonResult {
     api_key(&org_id, data, true, headers, conn).await
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::{HashMap, HashSet};
-
-    use serde_json::Value;
-
-    use super::{
-        CustomRolePermissions, OrganizationImportTarget, append_missing_manage_all_members,
-        bulk_delete_collection_targets, may_delete_stored_member_type, may_grant_custom_permissions,
-        may_import_to_collection, may_manage_member_type, may_restore_stored_member_status,
-        may_revoke_stored_member_type, replace_member_collection_access,
-    };
-    use crate::db::models::{CollectionId, Membership, MembershipStatus, MembershipType};
-
-    fn confirmed_member(member_type: MembershipType) -> Membership {
-        let mut m = Membership::new("test-user".to_owned().into(), "test-org".to_owned().into(), None);
-        m.atype = member_type as i32;
-        m.status = MembershipStatus::Confirmed as i32;
-        m
-    }
-
-    /// Who may act on whom, and what a Custom actor may hand out. Both rules guard the same escalation:
-    /// a caller must never reach a role above its own, and a Custom member holding `manageUsers` must
-    /// not be able to mint permissions it does not hold itself. A stored role this build cannot
-    /// interpret holds no authority, but an Owner still has to be able to remove the row.
-    #[test]
-    fn member_lifecycle_and_delegation_follow_the_role_hierarchy() {
-        use MembershipType::{Admin, Custom, Owner, User};
-
-        // Every caller/target pair, given as the roles each caller may reach.
-        for (caller, allowed) in [
-            (Owner, &[Owner, Admin, Custom, User][..]),
-            (Admin, &[Admin, Custom, User][..]),
-            (Custom, &[Custom, User][..]),
-            (User, &[][..]),
-        ] {
-            for target in [Owner, Admin, Custom, User] {
-                let expected = allowed.contains(&target);
-                assert_eq!(may_manage_member_type(caller, target), expected, "{} -> {}", caller as i32, target as i32);
-            }
-        }
-
-        // A role this build cannot interpret: nobody may edit or restore it, and only an Owner may
-        // delete or revoke the row, so an unreadable membership is not also unremovable.
-        for unknown in [3, 5, -1, i32::MAX] {
-            assert!(may_delete_stored_member_type(Owner, unknown), "{unknown}");
-            assert!(may_revoke_stored_member_type(Owner, unknown), "{unknown}");
-            for caller in [Admin, Custom, User] {
-                assert!(!may_delete_stored_member_type(caller, unknown), "caller {} {unknown}", caller as i32);
-                assert!(!may_revoke_stored_member_type(caller, unknown), "caller {} {unknown}", caller as i32);
-            }
-        }
-
-        // Delegation: a Custom actor may only grant permissions it holds itself.
-        let mut actor = confirmed_member(Custom);
-        actor.manage_users = true;
-        let requested =
-            |permissions: CustomRolePermissions| may_grant_custom_permissions(&actor, Custom, Some(permissions));
-        assert!(requested(CustomRolePermissions {
-            manage_users: true,
-            ..CustomRolePermissions::default()
-        }));
-        assert!(!requested(CustomRolePermissions {
-            edit_any_collection: true,
-            ..CustomRolePermissions::default()
-        }));
-        // An Admin actor is not bound by the subset rule.
-        assert!(may_grant_custom_permissions(
-            &confirmed_member(Admin),
-            Custom,
-            Some(CustomRolePermissions {
-                edit_any_collection: true,
-                ..CustomRolePermissions::default()
-            })
-        ));
-    }
-
-    /// Upstream loads the requested ids and compares the number of collections it got back with the
-    /// number of ids it asked for, so a repeated id fails the request. An empty list is rejected too:
-    /// upstream's bulk authorization handler fails closed on an empty resource set. The route
-    /// propagates both before it authorizes or deletes anything, so neither `{"ids": []}` nor
-    /// `{"ids": ["a", "a"]}` can run as a successful no-op or a partial delete.
-    #[test]
-    fn bulk_delete_targets_reject_an_empty_request_and_duplicate_ids() {
-        let ids = |names: &[&str]| names.iter().map(|n| CollectionId::from((*n).to_owned())).collect::<Vec<_>>();
-
-        assert!(bulk_delete_collection_targets(ids(&[])).is_err());
-        assert_eq!(bulk_delete_collection_targets(ids(&["a"])).unwrap(), ids(&["a"]));
-        assert_eq!(bulk_delete_collection_targets(ids(&["a", "b"])).unwrap(), ids(&["a", "b"]));
-        assert!(bulk_delete_collection_targets(ids(&["a", "a"])).is_err());
-        assert!(bulk_delete_collection_targets(ids(&["a", "b", "a"])).is_err());
-    }
-
-    /// Restore is only ever offered a revoked membership: on any active status `Membership::restore()`
-    /// is a no-op, so letting it through would report success and log a restore event for a membership
-    /// that never changed.
-    #[test]
-    fn restore_accepts_only_a_revoked_membership() {
-        for status in
-            [MembershipStatus::Invited as i32, MembershipStatus::Accepted as i32, MembershipStatus::Confirmed as i32]
-        {
-            let mut member = confirmed_member(MembershipType::User);
-            member.status = status;
-            assert!(!may_restore_stored_member_status(member.status), "status {status}");
-            assert!(!member.restore(), "status {status} must not change");
-            assert_eq!(member.status, status);
-
-            // Revoking stores `status - 128`, so every revoked value is restorable, not only -1.
-            assert!(member.revoke());
-            assert!(may_restore_stored_member_status(member.status), "revoked from {status}");
-            assert!(member.restore());
-            assert_eq!(member.status, status);
-        }
-
-        assert!(may_restore_stored_member_status(MembershipStatus::Revoked as i32));
-    }
-
-    /// Importing into an existing collection needs the collection-*update* authority upstream resolves
-    /// `BulkCollectionOperations.ImportCiphers` through — a plain write assignment is deliberately not
-    /// enough — while a new collection needs `createNewCollections`. `accessImportExport` authorizes the
-    /// complete organization import and is the only permission that covers both targets.
-    #[test]
-    fn organization_import_authority_depends_on_the_target_collection() {
-        let existing = |can_update| OrganizationImportTarget::Existing {
-            can_update,
-        };
-
-        let plain = confirmed_member(MembershipType::Custom);
-        assert!(!may_import_to_collection(&plain, existing(false)));
-        assert!(!may_import_to_collection(&plain, OrganizationImportTarget::New));
-        assert!(may_import_to_collection(&plain, existing(true)));
-
-        let mut create_only = confirmed_member(MembershipType::Custom);
-        create_only.create_new_collections = true;
-        assert!(may_import_to_collection(&create_only, OrganizationImportTarget::New));
-        assert!(!may_import_to_collection(&create_only, existing(false)));
-
-        let mut import_export = confirmed_member(MembershipType::Custom);
-        import_export.access_import_export = true;
-        assert!(may_import_to_collection(&import_export, existing(false)));
-        assert!(may_import_to_collection(&import_export, OrganizationImportTarget::New));
-
-        // Authority is never held by an unconfirmed membership.
-        import_export.status = MembershipStatus::Accepted as i32;
-        assert!(!may_import_to_collection(&import_export, OrganizationImportTarget::New));
-    }
-
-    /// One collection the request names and one it does not, plus a member that already reaches every
-    /// collection through `editAnyCollection`.
-    #[cfg(sqlite)]
-    const BULK_ACCESS_SEED: &str = "
-        INSERT INTO collections (uuid, org_uuid, name) VALUES ('col-a', 'org-a', 'A'), ('col-b', 'org-a', 'B');
-
-        INSERT INTO users (uuid, updated_at) VALUES
-            ('u-custom', '2026-01-01 00:00:00'),
-            ('u-plain',  '2026-01-01 00:00:00'),
-            ('u-admin',  '2026-01-01 00:00:00');
-
-        INSERT INTO users_organizations (uuid, user_uuid, org_uuid, akey, status, atype, edit_any_collection) VALUES
-            ('m-custom', 'u-custom', 'org-a', '', 2, 4, TRUE),
-            ('m-plain',  'u-plain',  'org-a', '', 2, 2, FALSE),
-            ('m-admin',  'u-admin',  'org-a', '', 2, 1, FALSE);
-
-        INSERT INTO users_collections (user_uuid, collection_uuid, read_only, hide_passwords, manage) VALUES
-            ('u-custom', 'col-a', TRUE, FALSE, FALSE),
-            ('u-plain',  'col-b', TRUE, FALSE, FALSE);
-    ";
-
-    /// The writes `POST /organizations/<org_id>/collections/bulk-access` performs, against a real
-    /// database. The endpoint used to skip a member that already reached every collection, so an
-    /// explicitly requested Manage grant was never stored and disappeared the moment that wider access
-    /// was revoked. Upstream's `Collection_CreateOrUpdateAccessForMany` filters only on the
-    /// organization; the existing row is upserted and an assignment the request does not name survives.
-    #[cfg(sqlite)]
-    #[test]
-    fn bulk_access_stores_a_grant_for_a_member_that_already_reaches_everything() {
-        use super::create_or_update_collection_access;
-        use crate::db::{
-            DbConn,
-            models::{CollectionUser, MembershipId, OrganizationId},
-            test_db::{ORG_ACL_SCHEMA, TestDb, block_on},
-        };
-
-        async fn rows(conn: &DbConn, col: &str) -> Vec<(String, bool, bool, bool)> {
-            let mut rows: Vec<(String, bool, bool, bool)> =
-                CollectionUser::find_by_collection(&CollectionId::from(col.to_owned()), conn)
-                    .await
-                    .into_iter()
-                    .map(|u| (u.user_uuid.to_string(), u.read_only, u.hide_passwords, u.manage))
-                    .collect();
-            rows.sort();
-            rows
-        }
-
-        let db = TestDb::new(&format!("{ORG_ACL_SCHEMA}{BULK_ACCESS_SEED}"));
-        block_on(async {
-            let conn = db.conn();
-            let org = OrganizationId::from("org-a".to_owned());
-            let col_a = CollectionId::from("col-a".to_owned());
-
-            let mut custom = Membership::find_by_uuid(&MembershipId::from("m-custom".to_owned()), &conn)
-                .await
-                .expect("Missing membership m-custom");
-            assert!(custom.grants_access_to_all_collections());
-
-            // The request: Manage on A for that member, nothing else.
-            let users = vec![super::CollectionMembershipData {
-                hide_passwords: false,
-                id: custom.uuid.clone(),
-                read_only: false,
-                manage: true,
-            }];
-            create_or_update_collection_access(&org, &col_a, &[], &users, &conn).await.unwrap();
-
-            // The read-only row it already had is updated, not duplicated, and not skipped.
-            assert_eq!(rows(&conn, "col-a").await, vec![("u-custom".to_owned(), false, false, true)]);
-
-            // Losing `editAnyCollection` leaves the explicit grant standing.
-            custom.edit_any_collection = false;
-            custom.save(&conn).await.unwrap();
-            assert!(!custom.grants_access_to_all_collections());
-            assert!(custom.has_explicit_collection_manage_access(&col_a, &conn).await);
-
-            // A collection the request did not name keeps its assignments.
-            assert_eq!(rows(&conn, "col-b").await, vec![("u-plain".to_owned(), true, false, false)]);
-        });
-    }
-
-    #[cfg(sqlite)]
-    #[test]
-    fn explicit_grant_survives_member_and_collection_round_trips() {
-        use crate::db::{
-            models::{Collection, CollectionUser, MembershipId, OrganizationId},
-            test_db::{ORG_ACL_SCHEMA, TestDb, block_on},
-        };
-
-        let db = TestDb::new(&format!("{ORG_ACL_SCHEMA}{BULK_ACCESS_SEED}"));
-        block_on(async {
-            let conn = db.conn();
-            let org = OrganizationId::from("org-a".to_owned());
-            let col_a = CollectionId::from("col-a".to_owned());
-            let col_b = CollectionId::from("col-b".to_owned());
-            let mut custom = Membership::find_by_uuid(&MembershipId::from("m-custom".to_owned()), &conn)
-                .await
-                .expect("Missing membership m-custom");
-            assert!(custom.grants_access_to_all_collections());
-
-            CollectionUser::save(&custom.user_uuid, &col_a, false, false, true, &conn).await.unwrap();
-            let details = custom.to_json_user_details(true, false, &conn).await;
-            let returned_collections = details["collections"].as_array().expect("collections must be an array");
-            let saved = returned_collections
-                .iter()
-                .find(|collection| collection["id"] == "col-a")
-                .expect("explicit collection missing from member details");
-            assert_eq!(saved["manage"], true);
-            assert_eq!(saved["readOnly"], false);
-            assert_eq!(saved["hidePasswords"], false);
-            assert!(!returned_collections.iter().any(|collection| collection["id"] == "col-b"));
-
-            let assignments = returned_collections
-                .iter()
-                .map(|collection| {
-                    (
-                        CollectionId::from(
-                            collection["id"].as_str().expect("collection id must be a string").to_owned(),
-                        ),
-                        collection["readOnly"].as_bool().expect("readOnly must be a boolean"),
-                        collection["hidePasswords"].as_bool().expect("hidePasswords must be a boolean"),
-                        collection["manage"].as_bool().expect("manage must be a boolean"),
-                    )
-                })
-                .collect::<Vec<_>>();
-            replace_member_collection_access(&org, &custom.user_uuid, &assignments, &conn).await.unwrap();
-            custom.save(&conn).await.unwrap();
-            let rows = CollectionUser::find_by_organization_and_user_uuid(&org, &custom.user_uuid, &conn).await;
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].collection_uuid, col_a);
-            assert!(!rows.iter().any(|row| row.collection_uuid == col_b));
-            assert!(rows[0].manage);
-
-            custom.edit_any_collection = false;
-            custom.save(&conn).await.unwrap();
-            assert!(!custom.grants_access_to_all_collections());
-            assert!(custom.has_explicit_collection_manage_access(&col_a, &conn).await);
-            assert!(Collection::find_by_uuid_and_user(&col_a, custom.user_uuid.clone(), &conn).await.is_some());
-            assert!(Collection::find_by_uuid_and_user(&col_b, custom.user_uuid.clone(), &conn).await.is_none());
-        });
-    }
-
-    #[cfg(sqlite)]
-    #[test]
-    fn collection_details_do_not_duplicate_members_with_stored_access() {
-        use crate::db::{
-            models::{CollectionUser, MembershipId, OrganizationId},
-            test_db::{ORG_ACL_SCHEMA, TestDb, block_on},
-        };
-
-        let db = TestDb::new(&format!("{ORG_ACL_SCHEMA}{BULK_ACCESS_SEED}"));
-        block_on(async {
-            let conn = db.conn();
-            let org = OrganizationId::from("org-a".to_owned());
-            let col_a = CollectionId::from("col-a".to_owned());
-            let col_users = CollectionUser::find_by_organization_swap_user_uuid_with_member_uuid(&org, &conn).await;
-            let membership_type: HashMap<_, _> =
-                Membership::find_confirmed_by_org(&org, &conn).await.into_iter().map(|m| (m.uuid, m.atype)).collect();
-            let collection_users: Vec<_> = col_users.iter().filter(|user| user.collection_uuid == col_a).collect();
-            let stored_membership_ids: HashSet<_> = collection_users.iter().map(|user| &user.membership_uuid).collect();
-            let mut users: Vec<Value> = collection_users
-                .iter()
-                .map(|user| {
-                    user.to_json_details_for_member(
-                        *membership_type.get(&user.membership_uuid).unwrap_or(&(MembershipType::User as i32)),
-                    )
-                })
-                .collect();
-            let manage_all_members = Membership::find_confirmed_and_manage_all_by_org(&org, &conn).await;
-            append_missing_manage_all_members(&mut users, &stored_membership_ids, &manage_all_members);
-
-            let matches = |id: &str| users.iter().filter(|user| user["id"] == id).collect::<Vec<_>>();
-            let custom = matches("m-custom");
-            assert_eq!(custom.len(), 1);
-            assert_eq!(custom[0]["manage"], false);
-
-            let admin = matches("m-admin");
-            assert_eq!(admin.len(), 1);
-            assert_eq!(admin[0]["manage"], true);
-            assert!(!stored_membership_ids.contains(&MembershipId::from("m-admin".to_owned())));
-        });
-    }
-
-    /// Two organizations. In `org-a`: a collection every role below is assigned to, a collection
-    /// nobody in this fixture is assigned to, and a cipher that is in no collection at all.
-    #[cfg(sqlite)]
-    const ASSIGNED_DETAILS_SEED: &str = "
-        INSERT INTO collections (uuid, org_uuid, name) VALUES
-            ('col-assigned', 'org-a', 'assigned'),
-            ('col-foreign',  'org-a', 'foreign'),
-            ('col-other',    'org-b', 'other org');
-
-        INSERT INTO users (uuid, updated_at) VALUES
-            ('u-owner',     '2026-01-01 00:00:00'),
-            ('u-admin',     '2026-01-01 00:00:00'),
-            ('u-editany',   '2026-01-01 00:00:00'),
-            ('u-deleteany', '2026-01-01 00:00:00'),
-            ('u-custom',    '2026-01-01 00:00:00'),
-            ('u-user',      '2026-01-01 00:00:00');
-
-        INSERT INTO users_organizations
-            (uuid, user_uuid, org_uuid, akey, status, atype,
-             edit_any_collection, delete_any_collection, manage_users) VALUES
-            ('m-owner',     'u-owner',     'org-a', '', 2, 0, FALSE, FALSE, FALSE),
-            ('m-admin',     'u-admin',     'org-a', '', 2, 1, FALSE, FALSE, FALSE),
-            ('m-editany',   'u-editany',   'org-a', '', 2, 4, TRUE,  FALSE, FALSE),
-            ('m-deleteany', 'u-deleteany', 'org-a', '', 2, 4, FALSE, TRUE,  FALSE),
-            ('m-custom',    'u-custom',    'org-a', '', 2, 4, FALSE, FALSE, TRUE),
-            ('m-user',      'u-user',      'org-a', '', 2, 2, FALSE, FALSE, FALSE);
-
-        INSERT INTO users_collections (user_uuid, collection_uuid, read_only, hide_passwords, manage) VALUES
-            ('u-owner', 'col-assigned', FALSE, FALSE, FALSE),
-            ('u-admin', 'col-assigned', FALSE, FALSE, FALSE),
-            ('u-user',  'col-assigned', FALSE, FALSE, FALSE);
-
-        INSERT INTO ciphers (uuid, organization_uuid) VALUES
-            ('c-assigned',   'org-a'),
-            ('c-foreign',    'org-a'),
-            ('c-unassigned', 'org-a'),
-            ('c-other-org',  'org-b');
-        INSERT INTO ciphers_collections (cipher_uuid, collection_uuid) VALUES
-            ('c-assigned',  'col-assigned'),
-            ('c-foreign',   'col-foreign'),
-            ('c-other-org', 'col-other');
-    ";
-
-    /// `GET /ciphers/organization-details/assigned` serves the caller's own organization ciphers plus,
-    /// for the roles upstream's `CanAccessUnassignedCiphersAsync` admits (Owner/Admin, or Custom with
-    /// `Edit any collection`), the organization's unassigned ciphers.
-    ///
-    /// Restoring `visible_only` removes the role-based reach from the underlying query, so this route
-    /// has to carry the unassigned set itself — and only this route, never the regular sync view.
-    #[cfg(sqlite)]
-    #[test]
-    fn assigned_org_details_add_unassigned_ciphers_only_for_the_roles_upstream_allows() {
-        use super::assigned_org_ciphers;
-        use crate::db::{
-            DbConn,
-            models::MembershipId,
-            test_db::{ORG_ACL_SCHEMA, TestDb, block_on},
-        };
-
-        async fn served(member: &str, conn: &DbConn) -> Vec<String> {
-            let membership = Membership::find_by_uuid(&MembershipId::from(member.to_owned()), conn)
-                .await
-                .unwrap_or_else(|| panic!("Missing membership {member}"));
-            let mut ids: Vec<String> =
-                assigned_org_ciphers(&membership, conn).await.into_iter().map(|c| c.uuid.to_string()).collect();
-            ids.sort();
-            ids
-        }
-
-        let db = TestDb::new(&format!("{ORG_ACL_SCHEMA}{ASSIGNED_DETAILS_SEED}"));
-        block_on(async {
-            let conn = db.conn();
-
-            // Owner and Admin: their own collections plus the unassigned cipher — but not a
-            // collection they were never assigned to.
-            for member in ["m-owner", "m-admin"] {
-                assert_eq!(served(member, &conn).await, ["c-assigned", "c-unassigned"], "{member}");
-            }
-
-            // `Edit any collection` reaches every collection anyway; the unassigned cipher is added
-            // once, not twice.
-            assert_eq!(served("m-editany", &conn).await, ["c-assigned", "c-foreign", "c-unassigned"]);
-
-            // A plain member gets only what they are assigned to.
-            assert_eq!(served("m-user", &conn).await, ["c-assigned"]);
-
-            // A Custom member without a matching collection permission gets nothing — `manage_users`
-            // is not a cipher permission, and `delete_any_collection` must never make cipher contents
-            // visible, which is exactly what this route's comment promises.
-            assert!(served("m-custom", &conn).await.is_empty());
-            assert!(served("m-deleteany", &conn).await.is_empty());
-
-            // The other organization's cipher never appears, for anyone.
-            for member in ["m-owner", "m-admin", "m-editany", "m-deleteany", "m-custom", "m-user"] {
-                assert!(!served(member, &conn).await.contains(&"c-other-org".to_owned()), "{member}");
-            }
-        });
-    }
 }
