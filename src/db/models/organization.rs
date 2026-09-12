@@ -593,51 +593,50 @@ impl Membership {
         let full_access_group =
             CONFIG.org_groups_enabled() && Group::is_in_full_access_group(&self.user_uuid, &self.org_uuid, conn).await;
 
-        // If collections are to be included, only include them if the user does not have full access via a group or defined to the user it self
-        let collections: Vec<Value> =
-            if include_collections && !(full_access_group || self.grants_access_to_all_collections()) {
-                // Get all collections for the user here already to prevent more queries
-                let cu: HashMap<CollectionId, CollectionUser> =
-                    CollectionUser::find_by_organization_and_user_uuid(&self.org_uuid, &self.user_uuid, conn)
-                        .await
-                        .into_iter()
-                        .map(|cu| (cu.collection_uuid.clone(), cu))
-                        .collect();
-
-                // Get all collection groups for this user to prevent there inclusion
-                let cg: HashSet<CollectionId> = CollectionGroup::find_by_user(&self.user_uuid, conn)
+        // If collections are to be included, only exclude them when a group grants full access.
+        let collections: Vec<Value> = if include_collections && !full_access_group {
+            // Get all collections for the user here already to prevent more queries
+            let cu: HashMap<CollectionId, CollectionUser> =
+                CollectionUser::find_by_organization_and_user_uuid(&self.org_uuid, &self.user_uuid, conn)
                     .await
                     .into_iter()
-                    .map(|cg| cg.collections_uuid)
+                    .map(|cu| (cu.collection_uuid.clone(), cu))
                     .collect();
 
-                Collection::find_by_organization_and_user_uuid(&self.org_uuid, &self.user_uuid, conn)
-                    .await
-                    .into_iter()
-                    .filter_map(|c| {
-                        let (read_only, hide_passwords, manage) = if self.has_full_access() {
-                            (false, false, assignment_manage(self.atype, false))
-                        } else if let Some(cu) = cu.get(&c.uuid) {
-                            (cu.read_only, cu.hide_passwords, stored_assignment_manage(self.atype, cu.manage))
-                        // If previous checks failed it might be that this user has access via a group, but we should not return those elements here
-                        // Those are returned via a special group endpoint
-                        } else if cg.contains(&c.uuid) {
-                            return None;
-                        } else {
-                            (true, true, false)
-                        };
+            // Get all collection groups for this user to prevent there inclusion
+            let cg: HashSet<CollectionId> = CollectionGroup::find_by_user(&self.user_uuid, conn)
+                .await
+                .into_iter()
+                .map(|cg| cg.collections_uuid)
+                .collect();
 
-                        Some(json!({
-                            "id": c.uuid,
-                            "readOnly": read_only,
-                            "hidePasswords": hide_passwords,
-                            "manage": manage,
-                        }))
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+            Collection::find_by_organization_and_user_uuid(&self.org_uuid, &self.user_uuid, conn)
+                .await
+                .into_iter()
+                .filter_map(|c| {
+                    let (read_only, hide_passwords, manage) = if let Some(cu) = cu.get(&c.uuid) {
+                        (cu.read_only, cu.hide_passwords, stored_assignment_manage(self.atype, cu.manage))
+                    } else if self.has_full_access() {
+                        (false, false, assignment_manage(self.atype, false))
+                    // If previous checks failed it might be that this user has access via a group, but we should not return those elements here
+                    // Those are returned via a special group endpoint
+                    } else if cg.contains(&c.uuid) {
+                        return None;
+                    } else {
+                        (true, true, false)
+                    };
+
+                    Some(json!({
+                        "id": c.uuid,
+                        "readOnly": read_only,
+                        "hidePasswords": hide_passwords,
+                        "manage": manage,
+                    }))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let membership_type = self.atype;
 

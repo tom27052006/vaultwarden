@@ -413,7 +413,43 @@ pub(crate) mod test_db {
     /// The membership/collection/group tables the organization ACL queries touch, with the exact
     /// columns `src/db/schema.rs` declares.
     pub const ORG_ACL_SCHEMA: &str = "
-        CREATE TABLE users (uuid TEXT NOT NULL PRIMARY KEY, updated_at DATETIME NOT NULL);
+        CREATE TABLE users (
+            uuid TEXT NOT NULL PRIMARY KEY,
+            enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at DATETIME NOT NULL DEFAULT '2026-01-01 00:00:00',
+            updated_at DATETIME NOT NULL,
+            verified_at DATETIME,
+            last_verifying_at DATETIME,
+            login_verify_count INTEGER NOT NULL DEFAULT 0,
+            email TEXT NOT NULL DEFAULT '',
+            email_new TEXT,
+            email_new_token TEXT,
+            name TEXT NOT NULL DEFAULT '',
+            password_hash BLOB NOT NULL DEFAULT X'',
+            salt BLOB NOT NULL DEFAULT X'',
+            password_iterations INTEGER NOT NULL DEFAULT 600000,
+            password_hint TEXT,
+            akey TEXT NOT NULL DEFAULT '',
+            private_key TEXT,
+            public_key TEXT,
+            totp_secret TEXT,
+            totp_recover TEXT,
+            security_stamp TEXT NOT NULL DEFAULT '',
+            stamp_exception TEXT,
+            equivalent_domains TEXT NOT NULL DEFAULT '[]',
+            excluded_globals TEXT NOT NULL DEFAULT '[]',
+            client_kdf_type INTEGER NOT NULL DEFAULT 0,
+            client_kdf_iter INTEGER NOT NULL DEFAULT 600000,
+            client_kdf_memory INTEGER,
+            client_kdf_parallelism INTEGER,
+            api_key TEXT,
+            avatar_color TEXT,
+            external_id TEXT
+        );
+        CREATE TABLE twofactor (
+            uuid TEXT NOT NULL PRIMARY KEY, user_uuid TEXT NOT NULL, atype INTEGER NOT NULL,
+            enabled BOOLEAN NOT NULL, data TEXT NOT NULL, last_used BIGINT NOT NULL
+        );
         CREATE TABLE collections (uuid TEXT NOT NULL PRIMARY KEY, org_uuid TEXT NOT NULL, name TEXT NOT NULL, external_id TEXT);
         CREATE TABLE groups_users (groups_uuid TEXT NOT NULL, users_organizations_uuid TEXT NOT NULL, PRIMARY KEY (groups_uuid, users_organizations_uuid));
         CREATE TABLE users_collections (
