@@ -1452,8 +1452,10 @@ mod tests {
         // The retired Manager wire value is accepted and folded onto Custom, never onto Admin.
         assert!(MembershipType::Custom == MembershipType::from_str("3").unwrap());
         // A stored role this build cannot interpret outranks nothing and stays under every ceiling.
+        // It is incomparable, so `Admin > atype` is false without `Admin <= atype` being true; the
+        // `partial_cmp` form states exactly that and does not invite the `<=` rewrite.
         for atype in [3, 5, -1, i32::MAX] {
-            assert!(!(MembershipType::Admin > atype), "atype {atype}");
+            assert_ne!(MembershipType::Admin.partial_cmp(&atype), Some(Ordering::Greater), "atype {atype}");
             assert!(atype < MembershipType::Admin, "atype {atype}");
         }
     }

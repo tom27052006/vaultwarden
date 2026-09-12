@@ -232,6 +232,7 @@ enum ClientEventKind {
     User,
     Cipher,
     Organization,
+    OrganizationUser,
 }
 
 const MAX_CLIENT_EVENT_BATCH_SIZE: usize = 1_000;
@@ -283,13 +284,19 @@ fn client_event_kind(event_type: i32) -> Option<ClientEventKind> {
         }
         event_type
             if event_type == EventType::OrganizationClientExportedVault as i32
-                || event_type == EventType::OrganizationItemOrganizationAccepted as i32
-                || event_type == EventType::OrganizationItemOrganizationDeclined as i32
                 || event_type == EventType::OrganizationAutoConfirmEnabledAdmin as i32
                 || event_type == EventType::OrganizationAutoConfirmDisabledAdmin as i32
                 || event_type == EventType::OrganizationInviteLinkClientCopied as i32 =>
         {
             Some(ClientEventKind::Organization)
+        }
+        // Upstream logs these two through `LogOrganizationUserEventAsync`: they describe the acting
+        // user's own membership, not the organization as a whole.
+        event_type
+            if event_type == EventType::OrganizationItemOrganizationAccepted as i32
+                || event_type == EventType::OrganizationItemOrganizationDeclined as i32 =>
+        {
+            Some(ClientEventKind::OrganizationUser)
         }
         _ => None,
     }
@@ -351,6 +358,20 @@ async fn post_events_collect(data: Json<Vec<EventCollection>>, headers: Headers,
                     .await;
                 }
             }
+            ClientEventKind::OrganizationUser => {
+                if let Some(org_id) = &event.organization_id {
+                    log_client_org_user_event(
+                        event.r#type,
+                        org_id,
+                        &headers.user.uuid,
+                        headers.device.atype,
+                        event_date,
+                        &headers.ip.ip,
+                        &conn,
+                    )
+                    .await;
+                }
+            }
             ClientEventKind::Cipher => {
                 // The cipher determines the organization the event is logged to, so make sure the
                 // user can actually access it instead of trusting the provided cipher uuid.
@@ -375,6 +396,24 @@ async fn post_events_collect(data: Json<Vec<EventCollection>>, headers: Headers,
         }
     }
     Ok(())
+}
+
+/// Logs a client event against the membership the acting user holds in `org_id`. Without such a
+/// membership there is nothing to log against, so a request naming another organization writes no
+/// event at all instead of one pointing at a foreign or non-existent membership.
+async fn log_client_org_user_event(
+    event_type: i32,
+    org_id: &OrganizationId,
+    act_user_id: &UserId,
+    device_type: i32,
+    event_date: NaiveDateTime,
+    ip: &IpAddr,
+    conn: &DbConn,
+) {
+    if let Some(membership) = Membership::find_confirmed_by_user_and_org(act_user_id, org_id, conn).await {
+        log_event_impl(event_type, &membership.uuid, org_id, act_user_id, device_type, Some(event_date), ip, conn)
+            .await;
+    }
 }
 
 pub async fn log_user_event(event_type: i32, user_id: &UserId, device_type: i32, ip: &IpAddr, conn: &DbConn) {
@@ -464,7 +503,14 @@ async fn log_event_impl(
         1500..=1599 => {
             event.org_user_uuid = Some(source_uuid.to_owned().into());
         }
-        // 1600..=1699 Are organizational events, and they do not need the source_uuid
+        // 1600..=1699 Are organizational events, and they do not need the source_uuid, except for
+        // the two item-organization events, which upstream logs against a membership.
+        event_type
+            if event_type == EventType::OrganizationItemOrganizationAccepted as i32
+                || event_type == EventType::OrganizationItemOrganizationDeclined as i32 =>
+        {
+            event.org_user_uuid = Some(source_uuid.to_owned().into());
+        }
         // Policy Events
         1700..=1799 => {
             event.policy_uuid = Some(source_uuid.to_owned().into());
@@ -491,5 +537,91 @@ pub async fn event_cleanup_job(pool: DbPool) {
         Event::clean_events(&conn).await.ok();
     } else {
         error!("Failed to get DB connection while trying to cleanup the events table");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two item-organization events describe a membership, so they must not be collected as plain
+    /// organization events. `OrganizationUser_NotificationBannerActionClicked` (1522) stays absent:
+    /// Vaultwarden does not support the notification banner policy behind it.
+    #[test]
+    fn item_organization_events_are_membership_events() {
+        assert_eq!(client_event_kind(1618), Some(ClientEventKind::OrganizationUser));
+        assert_eq!(client_event_kind(1619), Some(ClientEventKind::OrganizationUser));
+        assert_eq!(client_event_kind(1602), Some(ClientEventKind::Organization));
+        assert_eq!(client_event_kind(1522), None);
+    }
+
+    /// `org-b` holds a confirmed membership of *another* user, so a lookup resolving by organization
+    /// alone would log that foreign membership.
+    #[cfg(sqlite)]
+    const ORG_USER_EVENT_SEED: &str = "
+        CREATE TABLE event (
+            uuid TEXT NOT NULL PRIMARY KEY, event_type INTEGER NOT NULL,
+            user_uuid TEXT, org_uuid TEXT, cipher_uuid TEXT, collection_uuid TEXT, group_uuid TEXT,
+            org_user_uuid TEXT, act_user_uuid TEXT, device_type INTEGER, ip_address TEXT,
+            event_date DATETIME NOT NULL, policy_uuid TEXT,
+            provider_uuid TEXT, provider_user_uuid TEXT, provider_org_uuid TEXT
+        );
+
+        INSERT INTO users (uuid, updated_at) VALUES
+            ('u-member', '2026-01-01 00:00:00'), ('u-other', '2026-01-01 00:00:00');
+
+        INSERT INTO users_organizations (uuid, user_uuid, org_uuid, akey, status, atype) VALUES
+            ('m-member', 'u-member', 'org-a', '', 2, 2),
+            ('m-other',  'u-other',  'org-b', '', 2, 2);
+    ";
+
+    /// 1618 and 1619 are logged against the acting user's own membership, and only against that one:
+    /// an organization the acting user is not a member of writes no event at all.
+    #[cfg(sqlite)]
+    #[test]
+    fn item_organization_events_are_logged_against_the_acting_membership() {
+        use crate::db::test_db::{ORG_ACL_SCHEMA, TestDb, block_on};
+
+        const TYPES: [i32; 2] = [
+            EventType::OrganizationItemOrganizationAccepted as i32,
+            EventType::OrganizationItemOrganizationDeclined as i32,
+        ];
+
+        fn date(day: u32) -> NaiveDateTime {
+            chrono::NaiveDate::from_ymd_opt(2026, 1, day).unwrap().and_hms_opt(0, 0, 0).unwrap()
+        }
+
+        async fn logged(conn: &DbConn, org_id: &OrganizationId) -> Vec<Event> {
+            Event::find_by_organization_uuid(org_id, &date(1), &date(3), conn).await
+        }
+
+        let db = TestDb::new(&format!("{ORG_ACL_SCHEMA}{ORG_USER_EVENT_SEED}"));
+        block_on(async {
+            let conn = db.conn();
+            let user = UserId::from("u-member".to_owned());
+            let own_org = OrganizationId::from("org-a".to_owned());
+            let foreign_org = OrganizationId::from("org-b".to_owned());
+            let ip = IpAddr::from([127, 0, 0, 1]);
+
+            for event_type in TYPES {
+                log_client_org_user_event(event_type, &foreign_org, &user, 0, date(2), &ip, &conn).await;
+            }
+            assert!(logged(&conn, &foreign_org).await.is_empty(), "a foreign organization must not be logged");
+
+            for event_type in TYPES {
+                log_client_org_user_event(event_type, &own_org, &user, 0, date(2), &ip, &conn).await;
+            }
+
+            let mut events = logged(&conn, &own_org).await;
+            events.sort_by_key(|event| event.event_type);
+            assert_eq!(events.iter().map(|event| event.event_type).collect::<Vec<_>>(), TYPES);
+            for event in &events {
+                let at = event.event_type;
+                assert_eq!(event.org_uuid.as_ref(), Some(&own_org), "{at}");
+                assert_eq!(event.org_user_uuid, Some(MembershipId::from("m-member".to_owned())), "{at}");
+                assert_eq!(event.act_user_uuid.as_ref(), Some(&user), "{at}");
+            }
+            assert!(logged(&conn, &foreign_org).await.is_empty(), "nothing may leak into another organization");
+        });
     }
 }

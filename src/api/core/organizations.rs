@@ -853,19 +853,20 @@ struct BulkCollectionIds {
     ids: Vec<CollectionId>,
 }
 
-/// Upstream resolves a bulk delete through `GetManyByManyIdsAsync(model.Ids)`, so a repeated id yields
-/// a single entity that is authorized, deleted and logged once. Reproducing that here keeps a duplicate
-/// from failing the request after the collection was already gone. Request order is preserved so the
-/// event log stays deterministic. Unlike `/collections/bulk-access`, a duplicate is not an error.
-/// An empty request is rejected: upstream's bulk authorization handler fails closed on an empty
-/// resource set, so nothing is authorized, deleted or logged.
+/// Upstream resolves a bulk delete through `GetManyByManyIdsAsync(model.Ids)` and then compares the
+/// number of loaded collections against the number of requested ids, so a repeated id resolves to one
+/// entity and fails that count check. Duplicates are therefore rejected instead of deduplicated.
+/// An empty request is rejected as well: upstream's bulk authorization handler fails closed on an
+/// empty resource set. Both checks run before the first deletion, so nothing is authorized, deleted
+/// or logged for a rejected request.
 fn bulk_delete_collection_targets(ids: Vec<CollectionId>) -> ApiResult<Vec<CollectionId>> {
-    let mut seen = HashSet::new();
-    let collections: Vec<CollectionId> = ids.into_iter().filter(|id| seen.insert(id.clone())).collect();
-    if collections.is_empty() {
+    if ids.is_empty() {
         err!("No collections were provided")
     }
-    Ok(collections)
+    if ids.iter().collect::<HashSet<_>>().len() != ids.len() {
+        err!("Collection not found", "The request contains duplicate collection ids")
+    }
+    Ok(ids)
 }
 
 #[delete("/organizations/<org_id>/collections", data = "<data>")]
@@ -2824,6 +2825,14 @@ async fn bulk_restore_members(
     })))
 }
 
+/// Only a revoked membership can be restored. `Membership::restore()` leaves every other status
+/// untouched, so accepting for example `Invited` here would report success and log an
+/// `OrganizationUserRestored` event without anything having changed. Revoking stores
+/// `status - 128`, which is why this is a range and not a comparison against `Revoked` alone.
+fn may_restore_stored_member_status(status: i32) -> bool {
+    status <= MembershipStatus::Revoked as i32
+}
+
 async fn restore_member_impl(
     org_id: &OrganizationId,
     member_id: &MembershipId,
@@ -2834,7 +2843,7 @@ async fn restore_member_impl(
         err!("Organization not found", "Organization id's do not match");
     }
     match Membership::find_by_uuid_and_org(member_id, org_id, conn).await {
-        Some(mut member) if member.status < MembershipStatus::Accepted as i32 => {
+        Some(mut member) if may_restore_stored_member_status(member.status) => {
             if member.user_uuid == headers.user.uuid {
                 err!("You cannot restore yourself")
             }
@@ -3886,7 +3895,8 @@ async fn rotate_api_key(
 mod tests {
     use super::{
         CustomRolePermissions, OrganizationImportTarget, bulk_delete_collection_targets, may_delete_stored_member_type,
-        may_grant_custom_permissions, may_import_to_collection, may_manage_member_type, may_revoke_stored_member_type,
+        may_grant_custom_permissions, may_import_to_collection, may_manage_member_type,
+        may_restore_stored_member_status, may_revoke_stored_member_type,
     };
     use crate::db::models::{CollectionId, Membership, MembershipStatus, MembershipType};
 
@@ -3953,18 +3963,44 @@ mod tests {
         ));
     }
 
-    /// Bulk delete normalizes repeated ids the way upstream's `GetManyByManyIdsAsync` does, so a
-    /// duplicate is authorized, deleted and logged once instead of failing after the collection is
-    /// already gone. An empty list is rejected instead: upstream's bulk authorization handler fails
-    /// closed on an empty resource set, and the route propagates this before it authorizes or deletes
-    /// anything, so `{"ids": []}` can never run as a successful no-op.
+    /// Upstream loads the requested ids and compares the number of collections it got back with the
+    /// number of ids it asked for, so a repeated id fails the request. An empty list is rejected too:
+    /// upstream's bulk authorization handler fails closed on an empty resource set. The route
+    /// propagates both before it authorizes or deletes anything, so neither `{"ids": []}` nor
+    /// `{"ids": ["a", "a"]}` can run as a successful no-op or a partial delete.
     #[test]
-    fn bulk_delete_targets_normalize_ids_and_reject_an_empty_request() {
+    fn bulk_delete_targets_reject_an_empty_request_and_duplicate_ids() {
         let ids = |names: &[&str]| names.iter().map(|n| CollectionId::from((*n).to_owned())).collect::<Vec<_>>();
 
-        assert_eq!(bulk_delete_collection_targets(ids(&["a", "a"])).unwrap(), ids(&["a"]));
-        assert_eq!(bulk_delete_collection_targets(ids(&["a", "b", "a"])).unwrap(), ids(&["a", "b"]));
         assert!(bulk_delete_collection_targets(ids(&[])).is_err());
+        assert_eq!(bulk_delete_collection_targets(ids(&["a"])).unwrap(), ids(&["a"]));
+        assert_eq!(bulk_delete_collection_targets(ids(&["a", "b"])).unwrap(), ids(&["a", "b"]));
+        assert!(bulk_delete_collection_targets(ids(&["a", "a"])).is_err());
+        assert!(bulk_delete_collection_targets(ids(&["a", "b", "a"])).is_err());
+    }
+
+    /// Restore is only ever offered a revoked membership: on any active status `Membership::restore()`
+    /// is a no-op, so letting it through would report success and log a restore event for a membership
+    /// that never changed.
+    #[test]
+    fn restore_accepts_only_a_revoked_membership() {
+        for status in
+            [MembershipStatus::Invited as i32, MembershipStatus::Accepted as i32, MembershipStatus::Confirmed as i32]
+        {
+            let mut member = confirmed_member(MembershipType::User);
+            member.status = status;
+            assert!(!may_restore_stored_member_status(member.status), "status {status}");
+            assert!(!member.restore(), "status {status} must not change");
+            assert_eq!(member.status, status);
+
+            // Revoking stores `status - 128`, so every revoked value is restorable, not only -1.
+            assert!(member.revoke());
+            assert!(may_restore_stored_member_status(member.status), "revoked from {status}");
+            assert!(member.restore());
+            assert_eq!(member.status, status);
+        }
+
+        assert!(may_restore_stored_member_status(MembershipStatus::Revoked as i32));
     }
 
     /// Importing into an existing collection needs the collection-*update* authority upstream resolves
