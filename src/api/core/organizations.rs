@@ -3901,7 +3901,7 @@ mod tests {
         CustomRolePermissions, OrganizationImportTarget, append_missing_manage_all_members,
         bulk_delete_collection_targets, may_delete_stored_member_type, may_grant_custom_permissions,
         may_import_to_collection, may_manage_member_type, may_restore_stored_member_status,
-        may_revoke_stored_member_type, replace_collection_user_access, replace_member_collection_access,
+        may_revoke_stored_member_type, replace_member_collection_access,
     };
     use crate::db::models::{CollectionId, Membership, MembershipStatus, MembershipType};
 
@@ -4123,7 +4123,7 @@ mod tests {
     #[test]
     fn explicit_grant_survives_member_and_collection_round_trips() {
         use crate::db::{
-            models::{CollectionUser, MembershipId, OrganizationId},
+            models::{Collection, CollectionUser, MembershipId, OrganizationId},
             test_db::{ORG_ACL_SCHEMA, TestDb, block_on},
         };
 
@@ -4132,6 +4132,7 @@ mod tests {
             let conn = db.conn();
             let org = OrganizationId::from("org-a".to_owned());
             let col_a = CollectionId::from("col-a".to_owned());
+            let col_b = CollectionId::from("col-b".to_owned());
             let mut custom = Membership::find_by_uuid(&MembershipId::from("m-custom".to_owned()), &conn)
                 .await
                 .expect("Missing membership m-custom");
@@ -4139,36 +4140,43 @@ mod tests {
 
             CollectionUser::save(&custom.user_uuid, &col_a, false, false, true, &conn).await.unwrap();
             let details = custom.to_json_user_details(true, false, &conn).await;
-            let saved = details["collections"]
-                .as_array()
-                .expect("collections must be an array")
+            let returned_collections = details["collections"].as_array().expect("collections must be an array");
+            let saved = returned_collections
                 .iter()
                 .find(|collection| collection["id"] == "col-a")
                 .expect("explicit collection missing from member details");
             assert_eq!(saved["manage"], true);
             assert_eq!(saved["readOnly"], false);
             assert_eq!(saved["hidePasswords"], false);
+            assert!(!returned_collections.iter().any(|collection| collection["id"] == "col-b"));
 
-            let assignments = vec![(col_a.clone(), false, false, true)];
+            let assignments = returned_collections
+                .iter()
+                .map(|collection| {
+                    (
+                        CollectionId::from(
+                            collection["id"].as_str().expect("collection id must be a string").to_owned(),
+                        ),
+                        collection["readOnly"].as_bool().expect("readOnly must be a boolean"),
+                        collection["hidePasswords"].as_bool().expect("hidePasswords must be a boolean"),
+                        collection["manage"].as_bool().expect("manage must be a boolean"),
+                    )
+                })
+                .collect::<Vec<_>>();
             replace_member_collection_access(&org, &custom.user_uuid, &assignments, &conn).await.unwrap();
             custom.save(&conn).await.unwrap();
-            let rows = CollectionUser::find_by_collection(&col_a, &conn).await;
+            let rows = CollectionUser::find_by_organization_and_user_uuid(&org, &custom.user_uuid, &conn).await;
             assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].collection_uuid, col_a);
+            assert!(!rows.iter().any(|row| row.collection_uuid == col_b));
             assert!(rows[0].manage);
-
-            let collection_users = vec![super::CollectionMembershipData {
-                hide_passwords: false,
-                id: custom.uuid.clone(),
-                read_only: false,
-                manage: true,
-            }];
-            replace_collection_user_access(&org, &col_a, &collection_users, &conn).await.unwrap();
-            assert!(CollectionUser::find_by_collection(&col_a, &conn).await[0].manage);
 
             custom.edit_any_collection = false;
             custom.save(&conn).await.unwrap();
             assert!(!custom.grants_access_to_all_collections());
             assert!(custom.has_explicit_collection_manage_access(&col_a, &conn).await);
+            assert!(Collection::find_by_uuid_and_user(&col_a, custom.user_uuid.clone(), &conn).await.is_some());
+            assert!(Collection::find_by_uuid_and_user(&col_b, custom.user_uuid.clone(), &conn).await.is_none());
         });
     }
 

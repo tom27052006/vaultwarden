@@ -1,7 +1,4 @@
-use std::{
-    cmp::Ordering,
-    collections::{HashMap, HashSet},
-};
+use std::cmp::Ordering;
 
 use chrono::{NaiveDateTime, Utc};
 use derive_more::{AsRef, Deref, Display, From};
@@ -24,9 +21,8 @@ use crate::{
 use macros::UuidFromParam;
 
 use super::{
-    Cipher, CipherId, Collection, CollectionGroup, CollectionId, CollectionUser, Group, GroupId, GroupUser, OrgPolicy,
-    OrgPolicyType, TwoFactor, User, UserId,
-    collection::{assignment_manage_for_member as assignment_manage, stored_assignment_manage},
+    Cipher, CipherId, Collection, CollectionId, CollectionUser, Group, GroupId, GroupUser, OrgPolicy, OrgPolicyType,
+    TwoFactor, User, UserId, collection::stored_assignment_manage,
 };
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
@@ -588,50 +584,17 @@ impl Membership {
             Vec::new()
         };
 
-        // Check if a user is in a group which has access to all collections
-        // If that is the case, we should not return individual collections!
-        let full_access_group =
-            CONFIG.org_groups_enabled() && Group::is_in_full_access_group(&self.user_uuid, &self.org_uuid, conn).await;
-
-        // If collections are to be included, only exclude them when a group grants full access.
-        let collections: Vec<Value> = if include_collections && !full_access_group {
-            // Get all collections for the user here already to prevent more queries
-            let cu: HashMap<CollectionId, CollectionUser> =
-                CollectionUser::find_by_organization_and_user_uuid(&self.org_uuid, &self.user_uuid, conn)
-                    .await
-                    .into_iter()
-                    .map(|cu| (cu.collection_uuid.clone(), cu))
-                    .collect();
-
-            // Get all collection groups for this user to prevent there inclusion
-            let cg: HashSet<CollectionId> = CollectionGroup::find_by_user(&self.user_uuid, conn)
+        let collections: Vec<Value> = if include_collections {
+            CollectionUser::find_by_organization_and_user_uuid(&self.org_uuid, &self.user_uuid, conn)
                 .await
                 .into_iter()
-                .map(|cg| cg.collections_uuid)
-                .collect();
-
-            Collection::find_by_organization_and_user_uuid(&self.org_uuid, &self.user_uuid, conn)
-                .await
-                .into_iter()
-                .filter_map(|c| {
-                    let (read_only, hide_passwords, manage) = if let Some(cu) = cu.get(&c.uuid) {
-                        (cu.read_only, cu.hide_passwords, stored_assignment_manage(self.atype, cu.manage))
-                    } else if self.has_full_access() {
-                        (false, false, assignment_manage(self.atype, false))
-                    // If previous checks failed it might be that this user has access via a group, but we should not return those elements here
-                    // Those are returned via a special group endpoint
-                    } else if cg.contains(&c.uuid) {
-                        return None;
-                    } else {
-                        (true, true, false)
-                    };
-
-                    Some(json!({
-                        "id": c.uuid,
-                        "readOnly": read_only,
-                        "hidePasswords": hide_passwords,
-                        "manage": manage,
-                    }))
+                .map(|collection_user| {
+                    json!({
+                        "id": collection_user.collection_uuid,
+                        "readOnly": collection_user.read_only,
+                        "hidePasswords": collection_user.hide_passwords,
+                        "manage": stored_assignment_manage(self.atype, collection_user.manage),
+                    })
                 })
                 .collect()
         } else {
