@@ -69,6 +69,57 @@ pub enum RepromptType {
     Password = 1,
 }
 
+/// Whether `membership` holds organization-wide authority over its organization's ciphers.
+///
+/// Upstream gates every administrative cipher route on `CanEditCipherAsAdminAsync`,
+/// `CanDeleteOrRestoreCipherAsAdminAsync` or `CanEditAllCiphersAsync`. All three first require
+/// Owner, Admin or `Edit any collection`, and then resolve through `CanEditAllCiphersAsync` --
+/// which is that very same set, because Vaultwarden always serializes
+/// `allowAdminAccessToAllCollectionItems = true`. So all three reduce to this one predicate, and
+/// the per-cipher fallbacks they contain for restricted admins are unreachable here.
+///
+/// Deliberately narrower than upstream's `ViewAllCollections` (which guards
+/// `GET /ciphers/<id>/admin` and additionally admits `Delete any collection`): honouring that would
+/// hand cipher *contents* to a permission that upstream's own `CanAccessAllCiphersAsync` -- and
+/// therefore `GET /ciphers/organization-details` here -- deliberately keeps away from them. Where
+/// the two upstream answers disagree, this takes the stricter one.
+pub fn may_administer_org_ciphers(membership: &Membership) -> bool {
+    // `has_full_access()` is exactly "confirmed, and Owner/Admin or Custom holding
+    // `Edit any collection`".
+    membership.has_full_access()
+}
+
+/// Which authorization a cipher operation runs under.
+///
+/// Vaultwarden serves the organization's administrative cipher routes (`/ciphers/<id>/admin` and
+/// friends) from the same handlers as the regular vault routes, so the handlers state the scope
+/// explicitly and every authorization call site shows which one it uses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CipherAccessScope {
+    /// The regular vault routes. Only ownership and the caller's per-collection/group assignments
+    /// count. `Edit any collection` deliberately does not widen `/sync`, `GET /ciphers` or the
+    /// non-admin `GET|PUT /ciphers/<id>`, so a Custom member holding it still sees exactly the
+    /// ciphers they are assigned to.
+    User,
+    /// The organization's administrative cipher routes, where a member with organization-wide
+    /// cipher authority reaches every cipher of that organization.
+    OrganizationAdmin,
+}
+
+impl CipherAccessScope {
+    /// Whether `membership` reaches every cipher of its organization in this scope.
+    ///
+    /// Owner and Admin qualify in both scopes, which is the behaviour Vaultwarden has always had.
+    /// `Edit any collection` is administrative authority only, so it qualifies in
+    /// [`Self::OrganizationAdmin`] alone.
+    fn grants_org_wide_cipher_access(self, membership: &Membership) -> bool {
+        match self {
+            Self::User => membership.atype >= MembershipType::Admin,
+            Self::OrganizationAdmin => may_administer_org_ciphers(membership),
+        }
+    }
+}
+
 /// Local methods
 impl Cipher {
     pub fn new(atype: i32, name: String) -> Self {
@@ -153,6 +204,35 @@ impl Cipher {
         sync_type: CipherSyncType,
         conn: &DbConn,
     ) -> Result<Value, crate::Error> {
+        self.to_json_scoped(host, user_uuid, cipher_sync_data, sync_type, CipherAccessScope::User, conn).await
+    }
+
+    /// [`Cipher::to_json`] for one of the organization's administrative cipher routes.
+    ///
+    /// Same response shape those handlers have always produced; only the access flags differ. They
+    /// are resolved with [`CipherAccessScope::OrganizationAdmin`], so a member acting with
+    /// organization-wide cipher authority is reported as able to edit the cipher -- which is
+    /// exactly what the route authorized. Resolving them as `User` would answer a successfully
+    /// authorized admin request with `edit: false` and log an ownership assertion failure.
+    pub async fn to_json_org_admin(
+        &self,
+        host: &str,
+        user_uuid: &UserId,
+        conn: &DbConn,
+    ) -> Result<Value, crate::Error> {
+        self.to_json_scoped(host, user_uuid, None, CipherSyncType::User, CipherAccessScope::OrganizationAdmin, conn)
+            .await
+    }
+
+    async fn to_json_scoped(
+        &self,
+        host: &str,
+        user_uuid: &UserId,
+        cipher_sync_data: Option<&CipherSyncData>,
+        sync_type: CipherSyncType,
+        scope: CipherAccessScope,
+        conn: &DbConn,
+    ) -> Result<Value, crate::Error> {
         use crate::util::{format_date, validate_and_format_date};
 
         let mut attachments_json: Value = Value::Null;
@@ -180,7 +260,7 @@ impl Cipher {
         // We don't need these values at all for Organizational syncs
         // Skip any other database calls if this is the case and just return false.
         let (read_only, hide_passwords, _) = if sync_type == CipherSyncType::User {
-            if let Some((ro, hp, mn)) = self.get_access_restrictions(user_uuid, cipher_sync_data, conn).await {
+            if let Some((ro, hp, mn)) = self.get_access_restrictions(user_uuid, scope, cipher_sync_data, conn).await {
                 (ro, hp, mn)
             } else {
                 error!("Cipher ownership assertion failure");
@@ -544,21 +624,22 @@ impl Cipher {
         self.user_uuid.is_some() && self.user_uuid.as_ref().unwrap() == user_uuid
     }
 
-    /// Returns whether this cipher is owned by an org in which the user has unrestricted normal
-    /// cipher access by role. Custom collection-management permissions do not grant this access.
+    /// Returns whether this cipher is owned by an org in which the user reaches every cipher by
+    /// role, for the given [`CipherAccessScope`].
     async fn is_in_full_access_org(
         &self,
         user_uuid: &UserId,
+        scope: CipherAccessScope,
         cipher_sync_data: Option<&CipherSyncData>,
         conn: &DbConn,
     ) -> bool {
         if let Some(ref org_uuid) = self.organization_uuid {
             if let Some(cipher_sync_data) = cipher_sync_data {
                 if let Some(cached_member) = cipher_sync_data.members.get(org_uuid) {
-                    return cached_member.atype >= MembershipType::Admin;
+                    return scope.grants_org_wide_cipher_access(cached_member);
                 }
             } else if let Some(member) = Membership::find_confirmed_by_user_and_org(user_uuid, org_uuid, conn).await {
-                return member.atype >= MembershipType::Admin;
+                return scope.grants_org_wide_cipher_access(&member);
             }
         }
         false
@@ -591,6 +672,7 @@ impl Cipher {
     pub async fn get_access_restrictions(
         &self,
         user_uuid: &UserId,
+        scope: CipherAccessScope,
         cipher_sync_data: Option<&CipherSyncData>,
         conn: &DbConn,
     ) -> Option<(bool, bool, bool)> {
@@ -610,7 +692,7 @@ impl Cipher {
         // a collection that the user has full access to. If so, there are no
         // access restrictions.
         if self.is_owned_by_user(user_uuid)
-            || self.is_in_full_access_org(user_uuid, cipher_sync_data, conn).await
+            || self.is_in_full_access_org(user_uuid, scope, cipher_sync_data, conn).await
             || self.is_in_full_access_group(user_uuid, cipher_sync_data, conn).await
         {
             return Some((false, false, true));
@@ -748,8 +830,13 @@ impl Cipher {
         .await
     }
 
-    pub async fn is_write_accessible_to_user(&self, user_uuid: &UserId, conn: &DbConn) -> bool {
-        match self.get_access_restrictions(user_uuid, None, conn).await {
+    pub async fn is_write_accessible_to_user(
+        &self,
+        user_uuid: &UserId,
+        scope: CipherAccessScope,
+        conn: &DbConn,
+    ) -> bool {
+        match self.get_access_restrictions(user_uuid, scope, None, conn).await {
             Some((read_only, _hide_passwords, manage)) => !read_only || manage,
             None => false,
         }
@@ -757,15 +844,20 @@ impl Cipher {
 
     // used for checking if collection can be edited (only if user has access to a collection they
     // can write to and also passwords are not hidden to prevent privilege escalation)
-    pub async fn is_in_editable_collection_by_user(&self, user_uuid: &UserId, conn: &DbConn) -> bool {
-        match self.get_access_restrictions(user_uuid, None, conn).await {
+    pub async fn is_in_editable_collection_by_user(
+        &self,
+        user_uuid: &UserId,
+        scope: CipherAccessScope,
+        conn: &DbConn,
+    ) -> bool {
+        match self.get_access_restrictions(user_uuid, scope, None, conn).await {
             Some((read_only, hide_passwords, manage)) => (!read_only && !hide_passwords) || manage,
             None => false,
         }
     }
 
-    pub async fn is_accessible_to_user(&self, user_uuid: &UserId, conn: &DbConn) -> bool {
-        self.get_access_restrictions(user_uuid, None, conn).await.is_some()
+    pub async fn is_accessible_to_user(&self, user_uuid: &UserId, scope: CipherAccessScope, conn: &DbConn) -> bool {
+        self.get_access_restrictions(user_uuid, scope, None, conn).await.is_some()
     }
 
     // Returns whether this cipher is a favorite of the specified user.
@@ -1250,3 +1342,125 @@ impl Cipher {
     UuidFromParam,
 )]
 pub struct CipherId(String);
+
+#[cfg(test)]
+mod tests {
+    use super::{CipherAccessScope, may_administer_org_ciphers};
+    use crate::db::models::{Membership, MembershipStatus, MembershipType, OrganizationId, UserId};
+
+    /// A membership of `atype`/`status`, optionally holding the Custom `Edit any collection`
+    /// permission. The flag is set regardless of the role on purpose, so the tests can also cover a
+    /// stale flag left on a non-Custom membership.
+    fn membership(atype: MembershipType, status: MembershipStatus, edit_any_collection: bool) -> Membership {
+        let mut member = Membership::new(
+            UserId::from(String::from("test-user")),
+            OrganizationId::from(String::from("test-org")),
+            None,
+        );
+        member.atype = atype as i32;
+        member.status = status as i32;
+        member.edit_any_collection = edit_any_collection;
+        member
+    }
+
+    fn confirmed(atype: MembershipType, edit_any_collection: bool) -> Membership {
+        membership(atype, MembershipStatus::Confirmed, edit_any_collection)
+    }
+
+    /// A: a confirmed Custom member holding `Edit any collection` administers the organization's
+    /// ciphers -- upstream's `CanEditAllCiphersAsync` -- but that authority is administrative only.
+    #[test]
+    fn confirmed_custom_with_edit_any_collection_administers_org_ciphers() {
+        let member = confirmed(MembershipType::Custom, true);
+
+        assert!(may_administer_org_ciphers(&member));
+        assert!(CipherAccessScope::OrganizationAdmin.grants_org_wide_cipher_access(&member));
+    }
+
+    /// G: the regression this separation exists for. The administrative authority above must not
+    /// leak into the regular vault routes, so `/sync`, `GET /ciphers` and the non-admin
+    /// `GET|PUT /ciphers/<id>` keep answering from the member's own collection assignments.
+    #[test]
+    fn edit_any_collection_does_not_widen_the_regular_vault_scope() {
+        let member = confirmed(MembershipType::Custom, true);
+
+        assert!(!CipherAccessScope::User.grants_org_wide_cipher_access(&member));
+        // The two scopes must genuinely disagree for this member; that difference *is* the fix.
+        assert_ne!(
+            CipherAccessScope::User.grants_org_wide_cipher_access(&member),
+            CipherAccessScope::OrganizationAdmin.grants_org_wide_cipher_access(&member)
+        );
+    }
+
+    /// B: Custom without the permission gains nothing on the administrative routes.
+    #[test]
+    fn confirmed_custom_without_edit_any_collection_has_no_authority() {
+        let member = confirmed(MembershipType::Custom, false);
+
+        assert!(!may_administer_org_ciphers(&member));
+        assert!(!CipherAccessScope::OrganizationAdmin.grants_org_wide_cipher_access(&member));
+        assert!(!CipherAccessScope::User.grants_org_wide_cipher_access(&member));
+    }
+
+    /// C: the permission flags are only meaningful on a Custom membership, so a flag left behind by
+    /// a role change grants nothing.
+    #[test]
+    fn stale_edit_any_collection_on_a_plain_user_grants_nothing() {
+        let member = confirmed(MembershipType::User, true);
+
+        assert!(!may_administer_org_ciphers(&member));
+        assert!(!CipherAccessScope::OrganizationAdmin.grants_org_wide_cipher_access(&member));
+        assert!(!CipherAccessScope::User.grants_org_wide_cipher_access(&member));
+    }
+
+    /// D: the permission only activates once the membership is confirmed.
+    #[test]
+    fn unconfirmed_custom_with_edit_any_collection_has_no_authority() {
+        for status in [MembershipStatus::Invited, MembershipStatus::Accepted, MembershipStatus::Revoked] {
+            let member = membership(MembershipType::Custom, status, true);
+
+            assert!(!may_administer_org_ciphers(&member), "status {} must not grant authority", member.status);
+            assert!(!CipherAccessScope::OrganizationAdmin.grants_org_wide_cipher_access(&member));
+        }
+    }
+
+    /// E: Owner and Admin are untouched by this change -- they already reached every cipher of the
+    /// organization in both scopes, without holding any Custom permission.
+    #[test]
+    fn owner_and_admin_reach_org_ciphers_in_both_scopes() {
+        for atype in [MembershipType::Owner, MembershipType::Admin] {
+            let member = confirmed(atype, false);
+
+            assert!(may_administer_org_ciphers(&member), "atype {} must administer org ciphers", member.atype);
+            assert!(CipherAccessScope::OrganizationAdmin.grants_org_wide_cipher_access(&member));
+            assert!(CipherAccessScope::User.grants_org_wide_cipher_access(&member));
+        }
+    }
+
+    /// F: upstream resolves `CanDeleteOrRestoreCipherAsAdminAsync` through the same
+    /// `CanEditAllCiphersAsync` as `CanEditCipherAsAdminAsync`, so delete and restore answer to the
+    /// same authority as edit and need no separate permission. This pins that down: if upstream ever
+    /// splits them, one predicate will no longer be enough and this test should be the thing that
+    /// fails.
+    #[test]
+    fn delete_and_restore_share_the_edit_authority() {
+        let allowed = confirmed(MembershipType::Custom, true);
+        let denied = confirmed(MembershipType::Custom, false);
+
+        // One predicate backs every administrative cipher route, so edit, delete and restore all
+        // read the same answer for the same member.
+        assert!(may_administer_org_ciphers(&allowed));
+        assert!(!may_administer_org_ciphers(&denied));
+    }
+
+    /// An `atype` this build cannot interpret holds no authority in either scope.
+    #[test]
+    fn unknown_role_has_no_authority() {
+        let mut member = confirmed(MembershipType::Custom, true);
+        member.atype = 99;
+
+        assert!(!may_administer_org_ciphers(&member));
+        assert!(!CipherAccessScope::OrganizationAdmin.grants_org_wide_cipher_access(&member));
+        assert!(!CipherAccessScope::User.grants_org_wide_cipher_access(&member));
+    }
+}

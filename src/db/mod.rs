@@ -900,8 +900,8 @@ fn custom_role_preflight_decision(
 
 /// The full operator-facing text for a refusal: what was found, and what to do about it.
 ///
-/// Kept separate from the `Error` so it can be logged with `Display` (the only formatting that
-/// preserves the newlines the SQL below depends on) and asserted on in tests.
+/// Kept separate from the `Error` so it can be logged with `Display`, which is the only formatting
+/// that preserves the newlines the SQL below depends on.
 fn custom_role_preflight_report(decision: CustomRolePreflightDecision, facts: CustomRoleMigrationFacts) -> String {
     let detail = match decision {
         CustomRolePreflightDecision::RefuseMissingAccessAll => format!(

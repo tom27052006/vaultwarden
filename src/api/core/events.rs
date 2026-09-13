@@ -11,8 +11,8 @@ use crate::{
     db::{
         DbConn, DbPool,
         models::{
-            Cipher, CipherId, Event, EventType, Membership, MembershipId, MembershipStatus, MembershipType,
-            OrganizationId, UserId,
+            Cipher, CipherAccessScope, CipherId, Event, EventType, Membership, MembershipId, MembershipStatus,
+            MembershipType, OrganizationId, UserId,
         },
     },
     util::try_parse_date,
@@ -377,7 +377,7 @@ async fn post_events_collect(data: Json<Vec<EventCollection>>, headers: Headers,
                 // user can actually access it instead of trusting the provided cipher uuid.
                 if let Some(cipher_uuid) = &event.cipher_id
                     && let Some(cipher) = Cipher::find_by_uuid(cipher_uuid, &conn).await
-                    && cipher.is_accessible_to_user(&headers.user.uuid, &conn).await
+                    && cipher.is_accessible_to_user(&headers.user.uuid, CipherAccessScope::User, &conn).await
                     && let Some(org_id) = cipher.organization_uuid
                 {
                     log_event_impl(

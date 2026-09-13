@@ -20,10 +20,10 @@ use crate::{
     db::{
         DbConn,
         models::{
-            Cipher, CipherId, Collection, CollectionCipher, CollectionGroup, CollectionId, CollectionUser, EventType,
-            Group, GroupId, GroupUser, Invitation, Membership, MembershipId, MembershipStatus, MembershipType,
-            OrgPolicy, OrgPolicyType, Organization, OrganizationApiKey, OrganizationId, TwoFactor, TwoFactorType, User,
-            UserId,
+            Cipher, CipherAccessScope, CipherId, Collection, CollectionCipher, CollectionGroup, CollectionId,
+            CollectionUser, EventType, Group, GroupId, GroupUser, Invitation, Membership, MembershipId,
+            MembershipStatus, MembershipType, OrgPolicy, OrgPolicyType, Organization, OrganizationApiKey,
+            OrganizationId, TwoFactor, TwoFactorType, User, UserId,
         },
     },
     mail,
@@ -2365,8 +2365,13 @@ async fn post_bulk_collections(data: Json<BulkCollectionsData>, headers: Headers
     for cipher_id in &data.cipher_ids {
         // Only act on existing cipher uuid's
         // Do not abort the operation just ignore it, it could be a cipher was just deleted for example
+        //
+        // Upstream authorizes this route with `CanModifyCipherCollectionsAsync`, which resolves
+        // through `CanEditAllCiphersAsync` -- so a member with organization-wide cipher authority
+        // reaches every cipher of the organization here, exactly as the collection half above
+        // already does.
         if let Some(cipher) = Cipher::find_by_uuid_and_org(cipher_id, &data.organization_id, &conn).await
-            && cipher.is_write_accessible_to_user(&headers.user.uuid, &conn).await
+            && cipher.is_write_accessible_to_user(&headers.user.uuid, CipherAccessScope::OrganizationAdmin, &conn).await
         {
             // When selecting a specific collection from the left filter list, and use the bulk option, you can remove an item from that collection
             // In these cases the client will call this endpoint twice, once for adding the new collections and a second for deleting.
