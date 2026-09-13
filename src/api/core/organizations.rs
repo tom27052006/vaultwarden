@@ -3908,16 +3908,17 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        CustomRolePermissions, may_change_member_type, may_delete_stored_member_type, may_grant_custom_permissions,
-        may_manage_member_type, may_revoke_stored_member_type,
+        CustomRolePermissions as Perms, may_change_member_type, may_delete_stored_member_type,
+        may_grant_custom_permissions, may_manage_member_type, may_revoke_stored_member_type,
     };
     use crate::db::models::{Membership, MembershipStatus, MembershipType, OrganizationId, UserId};
+    use MembershipType::{Admin, Custom, Owner, User};
 
     /// An `atype` this build cannot interpret: a future build, a partial rollback or a hand-edited row.
     const UNKNOWN_ATYPE: i32 = 99;
 
     /// Every permission, with the way to set it on a request and on a stored membership.
-    type SetRequested = fn(&mut CustomRolePermissions);
+    type SetRequested = fn(&mut Perms);
     type SetStored = fn(&mut Membership);
     const PERMISSIONS: [(&str, SetRequested, SetStored); 9] = [
         ("manageUsers", |p| p.manage_users = true, |m| m.manage_users = true),
@@ -3943,8 +3944,8 @@ mod tests {
         membership
     }
 
-    fn requested(set: SetRequested) -> CustomRolePermissions {
-        let mut permissions = CustomRolePermissions::default();
+    fn requested(set: SetRequested) -> Perms {
+        let mut permissions = Perms::default();
         set(&mut permissions);
         permissions
     }
@@ -3959,8 +3960,6 @@ mod tests {
     /// member dialog, but only over the half of the organization below Admin.
     #[test]
     fn member_type_authority_matrix() {
-        use MembershipType::{Admin, Custom, Owner, User};
-
         // (caller, may manage [Owner, Admin, Custom, User])
         let cases = [
             ("Owner", Owner, [true, true, true, true]),
@@ -3973,12 +3972,7 @@ mod tests {
 
         for (name, caller, expected) in cases {
             for (target, allowed) in [Owner, Admin, Custom, User].into_iter().zip(expected) {
-                assert_eq!(
-                    may_manage_member_type(caller, target),
-                    allowed,
-                    "{name} acting on the role stored as {}",
-                    target as i32
-                );
+                assert_eq!(may_manage_member_type(caller, target), allowed, "{name} acting on role {}", target as i32);
             }
         }
 
@@ -3987,29 +3981,20 @@ mod tests {
         assert!(may_change_member_type(Admin, Custom as i32, User));
         assert!(!may_change_member_type(Admin, Custom as i32, Owner), "an Admin must not promote anyone to Owner");
         assert!(!may_change_member_type(Custom, Admin as i32, User), "a Custom member must not demote an Admin");
-        assert!(
-            !may_change_member_type(Custom, User as i32, Admin),
-            "a Custom member must not promote anyone to Admin"
-        );
+        assert!(!may_change_member_type(Custom, User as i32, Admin), "a Custom member must not promote to Admin");
 
         // A stored role this build cannot interpret holds no authority, but somebody still has to be
         // able to get rid of the row. Only an Owner may, and only with the two actions that reduce what
         // the row can become: editing or restoring it would preserve a role the server cannot reason
         // about.
         for caller in [Owner, Admin, Custom, User] {
-            let is_owner = caller == Owner;
-            assert_eq!(
-                may_delete_stored_member_type(caller, UNKNOWN_ATYPE),
-                is_owner,
-                "deleting an unknown stored role as the role stored as {}",
-                caller as i32
-            );
-            assert_eq!(
-                may_revoke_stored_member_type(caller, UNKNOWN_ATYPE),
-                is_owner,
-                "revoking an unknown stored role as the role stored as {}",
-                caller as i32
-            );
+            let owner_only = caller == Owner;
+            for (action, allowed) in [
+                ("deleting", may_delete_stored_member_type(caller, UNKNOWN_ATYPE)),
+                ("revoking", may_revoke_stored_member_type(caller, UNKNOWN_ATYPE)),
+            ] {
+                assert_eq!(allowed, owner_only, "{action} an unknown stored role as role {}", caller as i32);
+            }
             assert!(
                 !may_change_member_type(caller, UNKNOWN_ATYPE, User),
                 "an unknown stored role must never be edited into a known one"
@@ -4030,21 +4015,17 @@ mod tests {
     fn custom_permissions_cannot_be_escalated() {
         // Each permission is its own gate: holding one lets a caller pass on that one and no other.
         for (granted, _, hold) in PERMISSIONS {
-            let caller = member(MembershipType::Custom, hold);
+            let caller = member(Custom, hold);
             for (asked_for, set, _) in PERMISSIONS {
-                assert_eq!(
-                    requested(set).is_subset_of(&caller),
-                    asked_for == granted,
-                    "a caller holding {granted} granting {asked_for}"
-                );
+                let allowed = requested(set).is_subset_of(&caller);
+                assert_eq!(allowed, asked_for == granted, "a caller holding {granted} granting {asked_for}");
             }
-            // Asking for nothing is always within the caller's own set.
-            assert!(CustomRolePermissions::default().is_subset_of(&caller), "{granted}: empty request");
+            assert!(Perms::default().is_subset_of(&caller), "{granted}: an empty request is always within the set");
         }
 
         // The same permissions on a stale, non-Custom membership are inert, so their holder can pass on
         // nothing at all.
-        let stale = member(MembershipType::User, |m| {
+        let stale = member(User, |m| {
             for (_, _, hold) in PERMISSIONS {
                 hold(m);
             }
@@ -4053,39 +4034,35 @@ mod tests {
             assert!(!requested(set).is_subset_of(&stale), "a stale {asked_for} flag must not be delegatable");
         }
 
-        // The endpoint guard. A Custom delegator is held to their own set...
-        let delegator = member(MembershipType::Custom, |m| {
+        // The endpoint guard, which contains only what a *Custom* delegator may pass on.
+        let delegator = member(Custom, |m| {
             m.manage_users = true;
             m.edit_any_collection = true;
         });
-        assert!(may_grant_custom_permissions(
-            &delegator,
-            MembershipType::Custom,
-            Some(requested(|p| p.edit_any_collection = true))
-        ));
-        assert!(
-            !may_grant_custom_permissions(
+        let admin = member(Admin, |_| {});
+        let policies = || Some(requested(|p| p.manage_policies = true));
+
+        // (case, caller, target role, requested permissions, allowed)
+        let grants = [
+            (
+                "a permission the delegator holds",
                 &delegator,
-                MembershipType::Custom,
-                Some(requested(|p| p.manage_policies = true))
+                Custom,
+                Some(requested(|p| p.edit_any_collection = true)),
+                true,
             ),
-            "a Custom member must not grant a permission they do not hold"
-        );
-        // ...while an Admin or Owner delegator holds every permission by role and is not constrained.
-        assert!(may_grant_custom_permissions(
-            &member(MembershipType::Admin, |_| {}),
-            MembershipType::Custom,
-            Some(requested(|p| p.manage_policies = true))
-        ));
-        // A target that is not Custom cannot carry permissions at all, so there is nothing to contain.
-        assert!(may_grant_custom_permissions(
-            &delegator,
-            MembershipType::User,
-            Some(requested(|p| p.manage_policies = true))
-        ));
-        // No permissions object in the request means no grant to check. Whether the caller may reach
-        // the endpoint at all is `ManageUsersHeaders`, not this guard.
-        assert!(may_grant_custom_permissions(&delegator, MembershipType::Custom, None));
+            ("a permission the delegator lacks", &delegator, Custom, policies(), false),
+            // An Admin or Owner holds every permission by role and is not constrained by this guard.
+            ("an Admin granting anything", &admin, Custom, policies(), true),
+            // A target that is not Custom cannot carry permissions, so there is nothing to contain.
+            ("a non-Custom target", &delegator, User, policies(), true),
+            // No permissions object means no grant to check. Whether the caller may reach the endpoint
+            // at all is `ManageUsersHeaders`, not this guard.
+            ("no permissions object", &delegator, Custom, None, true),
+        ];
+        for (case, caller, target, permissions, allowed) in grants {
+            assert_eq!(may_grant_custom_permissions(caller, target, permissions), allowed, "{case}");
+        }
     }
 
     /// How a permissions object is read off the wire.
@@ -4095,84 +4072,66 @@ mod tests {
     /// silent permission removal that still answered 200.
     #[test]
     fn custom_permissions_are_parsed_strictly() {
-        let custom = MembershipType::Custom;
-
         // A present key must be a JSON boolean; an absent one is simply false.
-        let parsed = CustomRolePermissions::from_request(
-            custom,
-            &object(&[("editAnyCollection", json!(true)), ("manageUsers", json!(false))]),
-        )
-        .expect("booleans parse");
-        assert_eq!(parsed, requested(|p| p.edit_any_collection = true));
+        let booleans = object(&[("editAnyCollection", json!(true)), ("manageUsers", json!(false))]);
+        assert_eq!(
+            Perms::from_request(Custom, &booleans).expect("booleans parse"),
+            requested(|p| p.edit_any_collection = true)
+        );
 
         for bad in [json!(null), json!("true"), json!(1), json!([true]), json!({"value": true})] {
+            let malformed = object(&[("editAnyCollection", bad.clone())]);
             assert!(
-                CustomRolePermissions::from_request(custom, &object(&[("editAnyCollection", bad.clone())])).is_err(),
+                Perms::from_request(Custom, &malformed).is_err(),
                 "{bad} must be rejected rather than read as a permission removal"
             );
-            // ...and the check runs before the role is considered, so the same request fails the same
-            // way whatever role it names.
-            assert!(
-                CustomRolePermissions::from_request(
-                    MembershipType::User,
-                    &object(&[("editAnyCollection", bad.clone())])
-                )
-                .is_err(),
-                "{bad} must be rejected for a non-Custom role too"
-            );
+            // The check runs before the role is considered, so the same request fails the same way
+            // whatever role it names.
+            assert!(Perms::from_request(User, &malformed).is_err(), "{bad} must be rejected for a non-Custom role too");
         }
 
         // Bitwarden sends permissions Vaultwarden does not implement; rejecting them would break the
-        // official clients.
-        assert_eq!(
-            CustomRolePermissions::from_request(
-                custom,
-                &object(&[
-                    ("manageSso", json!(true)),
-                    ("manageScim", json!("whatever")),
-                    ("manageResetPassword", json!(1))
-                ])
-            )
-            .expect("unknown keys are ignored"),
-            CustomRolePermissions::default()
-        );
+        // official clients. And only a Custom member carries permissions at all.
+        let unknown_keys = object(&[("manageSso", json!(true)), ("manageScim", json!("x")), ("manageReset", json!(1))]);
+        let known_key = object(&[("managePolicies", json!(true))]);
+        for (case, member_type, permissions) in
+            [("unknown keys", Custom, &unknown_keys), ("a non-Custom role", Admin, &known_key)]
+        {
+            assert_eq!(
+                Perms::from_request(member_type, permissions).expect("valid object"),
+                Perms::default(),
+                "{case}"
+            );
+        }
 
-        // Only a Custom member carries permissions, so the flags are dropped for every other role.
+        // Editing an existing member. An *omitted* object is not an instruction to clear every grant,
+        // because older clients send the legacy role value without one; an explicitly empty object is.
+        let held = member(Custom, |m| m.access_reports = true);
+        let stale = member(User, |m| m.access_reports = true);
         assert_eq!(
-            CustomRolePermissions::from_request(MembershipType::Admin, &object(&[("managePolicies", json!(true))]))
-                .expect("valid object"),
-            CustomRolePermissions::default()
-        );
-
-        // Editing an existing member: an *omitted* object is not an instruction to clear every grant,
-        // because older clients send the legacy role value without one...
-        let held = member(MembershipType::Custom, |m| m.access_reports = true);
-        assert_eq!(
-            CustomRolePermissions::from_edit_request(custom, None, &held).expect("omitted object"),
+            Perms::from_edit_request(Custom, None, &held).expect("omitted object"),
             requested(|p| p.access_reports = true)
         );
-        // ...but an explicitly empty object is, and so is any role change away from Custom.
-        assert_eq!(
-            CustomRolePermissions::from_edit_request(custom, Some(&object(&[])), &held).expect("empty object"),
-            CustomRolePermissions::default()
-        );
-        assert_eq!(
-            CustomRolePermissions::from_edit_request(MembershipType::User, None, &held).expect("role change"),
-            CustomRolePermissions::default()
-        );
-        // A stale set on a membership that is not Custom is never carried forward either.
-        let stale = member(MembershipType::User, |m| m.access_reports = true);
-        assert_eq!(
-            CustomRolePermissions::from_edit_request(custom, None, &stale).expect("stale flags"),
-            CustomRolePermissions::default()
-        );
+        // (case, requested role, permissions object, stored membership)
+        let cleared = [
+            ("an explicitly empty object", Custom, Some(&object(&[])), &held),
+            ("a role change away from Custom", User, None, &held),
+            ("a stale set on a non-Custom membership", Custom, None, &stale),
+        ];
+        for (case, member_type, permissions, membership) in cleared {
+            assert_eq!(
+                Perms::from_edit_request(member_type, permissions, membership).expect("valid request"),
+                Perms::default(),
+                "{case}"
+            );
+        }
 
         // Applying has to reach all nine columns; a forgotten one would drop a granted permission.
-        let mut everything = CustomRolePermissions::default();
+        let mut everything = Perms::default();
         for (_, set, _) in PERMISSIONS {
             set(&mut everything);
         }
-        let mut target = member(MembershipType::Custom, |_| {});
+        let mut target = member(Custom, |_| {});
         everything.apply_to(&mut target);
         assert!(
             target.has_manage_users()

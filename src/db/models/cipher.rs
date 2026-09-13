@@ -1378,15 +1378,18 @@ pub struct CipherId(String);
 #[cfg(test)]
 mod tests {
     use super::CipherAccessScope;
-    use crate::db::models::{Membership, MembershipStatus, MembershipType, OrganizationId, UserId};
+    use crate::db::models::{Membership, MembershipStatus as Status, MembershipType, OrganizationId, UserId};
 
+    const OWNER: i32 = MembershipType::Owner as i32;
+    const ADMIN: i32 = MembershipType::Admin as i32;
+    const USER: i32 = MembershipType::User as i32;
+    const CUSTOM: i32 = MembershipType::Custom as i32;
     /// An `atype` this build cannot interpret: a future build, a partial rollback or a hand-edited row.
-    const UNKNOWN_ATYPE: i32 = 99;
+    const UNKNOWN: i32 = 99;
 
-    /// A membership of `atype`/`status`, optionally holding the Custom `Edit any collection`
-    /// permission. `atype` is a raw `i32` and the flag is set regardless of the role on purpose, so
-    /// the tests can also cover a stale flag and a role this build does not know.
-    fn membership(atype: i32, status: MembershipStatus, edit_any_collection: bool) -> Membership {
+    /// `atype` is a raw `i32` and the permission flag is set regardless of the role on purpose, so the
+    /// tests can cover a stale flag and a role this build does not know.
+    fn membership(atype: i32, status: Status, edit_any_collection: bool) -> Membership {
         let mut member = Membership::new(
             UserId::from(String::from("test-user")),
             OrganizationId::from(String::from("test-org")),
@@ -1398,47 +1401,34 @@ mod tests {
         member
     }
 
-    fn confirmed(atype: MembershipType, edit_any_collection: bool) -> Membership {
-        membership(atype as i32, MembershipStatus::Confirmed, edit_any_collection)
+    fn confirmed(atype: i32, edit_any_collection: bool) -> Membership {
+        membership(atype, Status::Confirmed, edit_any_collection)
     }
 
     /// Who reaches *every* cipher of an organization, in each of the two scopes.
     ///
-    /// The regular vault scope answers by role alone. The administrative scope additionally admits a
+    /// The regular vault scope answers by role alone; the administrative scope additionally admits a
     /// confirmed Custom member holding `Edit any collection` -- upstream's `CanEditAllCiphersAsync`,
     /// which every `/ciphers/.../admin` route resolves through.
     #[test]
     fn cipher_access_scope_matrix() {
         // (case, atype, status, edit_any_collection, regular vault scope, administrative scope)
         let cases = [
-            ("Owner", MembershipType::Owner as i32, MembershipStatus::Confirmed, false, true, true),
-            ("Admin", MembershipType::Admin as i32, MembershipStatus::Confirmed, false, true, true),
+            ("Owner", OWNER, Status::Confirmed, false, true, true),
+            ("Admin", ADMIN, Status::Confirmed, false, true, true),
             // The role this change adds: administrative authority, and nothing beyond it.
-            ("Custom + EditAny", MembershipType::Custom as i32, MembershipStatus::Confirmed, true, false, true),
-            ("Custom without EditAny", MembershipType::Custom as i32, MembershipStatus::Confirmed, false, false, false),
-            // The permission flags are only meaningful on a Custom membership, so one left behind by
-            // a role change grants nothing.
-            (
-                "User with a stale EditAny flag",
-                MembershipType::User as i32,
-                MembershipStatus::Confirmed,
-                true,
-                false,
-                false,
-            ),
+            ("Custom + EditAny", CUSTOM, Status::Confirmed, true, false, true),
+            ("Custom without EditAny", CUSTOM, Status::Confirmed, false, false, false),
+            ("User", USER, Status::Confirmed, false, false, false),
+            // A permission flag is only meaningful on a Custom membership, so one left behind by a
+            // role change grants nothing.
+            ("User with a stale EditAny flag", USER, Status::Confirmed, true, false, false),
             // The permission only activates once the membership is confirmed.
-            ("Custom + EditAny, invited", MembershipType::Custom as i32, MembershipStatus::Invited, true, false, false),
-            (
-                "Custom + EditAny, accepted",
-                MembershipType::Custom as i32,
-                MembershipStatus::Accepted,
-                true,
-                false,
-                false,
-            ),
-            ("Custom + EditAny, revoked", MembershipType::Custom as i32, MembershipStatus::Revoked, true, false, false),
+            ("Custom + EditAny, invited", CUSTOM, Status::Invited, true, false, false),
+            ("Custom + EditAny, accepted", CUSTOM, Status::Accepted, true, false, false),
+            ("Custom + EditAny, revoked", CUSTOM, Status::Revoked, true, false, false),
             // A role this build cannot interpret holds nothing, in either scope.
-            ("unknown role", UNKNOWN_ATYPE, MembershipStatus::Confirmed, true, false, false),
+            ("unknown role", UNKNOWN, Status::Confirmed, true, false, false),
         ];
 
         for (case, atype, status, edit_any_collection, user_scope, admin_scope) in cases {
@@ -1454,6 +1444,9 @@ mod tests {
                 admin_scope,
                 "{case}: administrative scope"
             );
+            // A route picks which scope it runs under, so the administrative one must never be the
+            // narrower of the two -- the worst case of picking it is the regular answer.
+            assert!(!user_scope || admin_scope, "{case}: this row expects the administrative scope to narrow");
         }
     }
 
@@ -1462,7 +1455,7 @@ mod tests {
     /// `GET|PUT /ciphers/<id>` keep answering from the member's own collection assignments.
     #[test]
     fn edit_any_collection_does_not_widen_the_regular_vault_scope() {
-        let member = confirmed(MembershipType::Custom, true);
+        let member = confirmed(CUSTOM, true);
 
         assert!(!CipherAccessScope::User.grants_org_wide_cipher_access(&member));
         // The two scopes must genuinely disagree for this member; that difference *is* the fix.
@@ -1483,9 +1476,7 @@ mod tests {
         assert_eq!(CipherAccessScope::requested(Some(false)), CipherAccessScope::User);
         assert_eq!(CipherAccessScope::requested(None), CipherAccessScope::User);
 
-        // Custom + `Edit any collection` holds administrative authority only, so it reaches the
-        // organization's ciphers exactly when the request asks for the administrative flow.
-        let member = confirmed(MembershipType::Custom, true);
+        let member = confirmed(CUSTOM, true);
         assert!(CipherAccessScope::requested(Some(true)).grants_org_wide_cipher_access(&member));
         assert!(!CipherAccessScope::requested(Some(false)).grants_org_wide_cipher_access(&member));
         assert!(!CipherAccessScope::requested(None).grants_org_wide_cipher_access(&member));
@@ -1495,20 +1486,21 @@ mod tests {
     /// administrative one still asks whether this member actually holds the authority.
     #[test]
     fn admin_request_flag_cannot_be_abused_for_escalation() {
+        let scope = CipherAccessScope::requested(Some(true));
+        assert_eq!(scope, CipherAccessScope::OrganizationAdmin);
+
         let escalation_attempts = [
-            confirmed(MembershipType::User, false),
+            confirmed(USER, false),
             // A plain User carrying a stale `edit_any_collection` flag.
-            confirmed(MembershipType::User, true),
-            confirmed(MembershipType::Custom, false),
-            membership(MembershipType::Custom as i32, MembershipStatus::Invited, true),
-            membership(MembershipType::Custom as i32, MembershipStatus::Accepted, true),
-            membership(MembershipType::Custom as i32, MembershipStatus::Revoked, true),
-            membership(UNKNOWN_ATYPE, MembershipStatus::Confirmed, true),
+            confirmed(USER, true),
+            confirmed(CUSTOM, false),
+            membership(CUSTOM, Status::Invited, true),
+            membership(CUSTOM, Status::Accepted, true),
+            membership(CUSTOM, Status::Revoked, true),
+            membership(UNKNOWN, Status::Confirmed, true),
         ];
 
         for member in &escalation_attempts {
-            let scope = CipherAccessScope::requested(Some(true));
-            assert_eq!(scope, CipherAccessScope::OrganizationAdmin);
             assert!(
                 !scope.grants_org_wide_cipher_access(member),
                 "atype {} / status {} must not reach org ciphers via adminRequest",
@@ -1522,64 +1514,21 @@ mod tests {
     /// nothing in the request can talk that route into an administrative scope.
     #[test]
     fn upload_scope_is_resolved_from_the_membership() {
-        assert_eq!(
-            CipherAccessScope::for_member(Some(&confirmed(MembershipType::Custom, true))),
-            CipherAccessScope::OrganizationAdmin
-        );
-        assert_eq!(
-            CipherAccessScope::for_member(Some(&confirmed(MembershipType::Owner, false))),
-            CipherAccessScope::OrganizationAdmin
-        );
-        assert_eq!(
-            CipherAccessScope::for_member(Some(&confirmed(MembershipType::Custom, false))),
-            CipherAccessScope::User
-        );
-        // Stale flag on a plain User, an unconfirmed Custom member, and a role this build cannot read.
-        assert_eq!(
-            CipherAccessScope::for_member(Some(&confirmed(MembershipType::User, true))),
-            CipherAccessScope::User
-        );
-        assert_eq!(
-            CipherAccessScope::for_member(Some(&membership(
-                MembershipType::Custom as i32,
-                MembershipStatus::Revoked,
-                true
-            ))),
-            CipherAccessScope::User
-        );
-        assert_eq!(
-            CipherAccessScope::for_member(Some(&membership(UNKNOWN_ATYPE, MembershipStatus::Confirmed, true))),
-            CipherAccessScope::User
-        );
-        // No membership at all, e.g. a personal cipher.
-        assert_eq!(CipherAccessScope::for_member(None), CipherAccessScope::User);
-    }
-
-    /// Whichever way a scope is chosen, `OrganizationAdmin` never answers "no" where `User` answers
-    /// "yes". That is what makes it safe for a route to resolve the scope from a request flag or from
-    /// the membership: the worst case is the regular answer, never a narrower one.
-    #[test]
-    fn organization_admin_scope_is_a_superset_of_user_scope() {
-        let members = [
-            confirmed(MembershipType::Owner, false),
-            confirmed(MembershipType::Admin, false),
-            confirmed(MembershipType::Custom, true),
-            confirmed(MembershipType::Custom, false),
-            confirmed(MembershipType::User, false),
-            confirmed(MembershipType::User, true),
-            membership(MembershipType::Custom as i32, MembershipStatus::Invited, true),
-            membership(UNKNOWN_ATYPE, MembershipStatus::Confirmed, true),
+        // (case, membership, scope)
+        let cases = [
+            ("Custom + EditAny", confirmed(CUSTOM, true), CipherAccessScope::OrganizationAdmin),
+            ("Owner", confirmed(OWNER, false), CipherAccessScope::OrganizationAdmin),
+            ("Custom without EditAny", confirmed(CUSTOM, false), CipherAccessScope::User),
+            ("User with a stale EditAny flag", confirmed(USER, true), CipherAccessScope::User),
+            ("revoked Custom + EditAny", membership(CUSTOM, Status::Revoked, true), CipherAccessScope::User),
+            ("unknown role", membership(UNKNOWN, Status::Confirmed, true), CipherAccessScope::User),
         ];
 
-        for member in &members {
-            if CipherAccessScope::User.grants_org_wide_cipher_access(member) {
-                assert!(
-                    CipherAccessScope::OrganizationAdmin.grants_org_wide_cipher_access(member),
-                    "atype {} loses access in the administrative scope",
-                    member.atype
-                );
-            }
+        for (case, member, expected) in cases {
+            assert_eq!(CipherAccessScope::for_member(Some(&member)), expected, "{case}");
         }
+        // No membership at all, e.g. a personal cipher.
+        assert_eq!(CipherAccessScope::for_member(None), CipherAccessScope::User);
     }
 }
 

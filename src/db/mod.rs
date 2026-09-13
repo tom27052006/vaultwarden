@@ -2037,8 +2037,8 @@ mod custom_role_migration_sql_tests {
 #[cfg(test)]
 mod custom_role_migration_preflight_tests {
     use super::{
-        CUSTOM_ROLE_PERMISSION_COLUMNS, CustomRoleMigrationFacts, CustomRolePreflightDecision,
-        EXPECTED_MEMBERSHIP_COLUMNS, LegacyUserAccessAllPolicy, custom_role_preflight_decision,
+        CUSTOM_ROLE_PERMISSION_COLUMNS, CustomRoleMigrationFacts as Facts, CustomRolePreflightDecision as Decision,
+        EXPECTED_MEMBERSHIP_COLUMNS, LegacyUserAccessAllPolicy as Policy, custom_role_preflight_decision,
     };
 
     /// MySQL and MariaDB commit each `ALTER TABLE` on its own, so an upgrade can be interrupted
@@ -2046,13 +2046,19 @@ mod custom_role_migration_preflight_tests {
     const INTERRUPTIBLE: bool = true;
     const ATOMIC: bool = false;
 
-    fn columns(count: usize) -> i64 {
-        i64::try_from(count).unwrap()
+    /// The nine permission columns the migration adds.
+    fn permission_columns() -> i64 {
+        i64::try_from(CUSTOM_ROLE_PERMISSION_COLUMNS.len()).unwrap()
+    }
+
+    /// The eighteen columns the finished table has.
+    fn membership_columns() -> i64 {
+        i64::try_from(EXPECTED_MEMBERSHIP_COLUMNS.len()).unwrap()
     }
 
     /// A database that has not been upgraded yet and has nothing to decide.
-    fn pending() -> CustomRoleMigrationFacts {
-        CustomRoleMigrationFacts {
+    fn pending() -> Facts {
+        Facts {
             memberships_table_exists: true,
             migration_applied: false,
             access_all_column_exists: true,
@@ -2069,19 +2075,19 @@ mod custom_role_migration_preflight_tests {
     }
 
     /// The migration ran to completion but its ledger entry never committed.
-    fn completed_but_unrecorded() -> CustomRoleMigrationFacts {
-        CustomRoleMigrationFacts {
+    fn completed_but_unrecorded() -> Facts {
+        Facts {
             access_all_column_exists: false,
-            permission_columns_present: columns(CUSTOM_ROLE_PERMISSION_COLUMNS.len()),
-            permission_columns_not_null: columns(CUSTOM_ROLE_PERMISSION_COLUMNS.len()),
-            membership_column_count: columns(EXPECTED_MEMBERSHIP_COLUMNS.len()),
-            expected_membership_columns_present: columns(EXPECTED_MEMBERSHIP_COLUMNS.len()),
+            permission_columns_present: permission_columns(),
+            permission_columns_not_null: permission_columns(),
+            membership_column_count: membership_columns(),
+            expected_membership_columns_present: membership_columns(),
             ..pending()
         }
     }
 
-    fn applied() -> CustomRoleMigrationFacts {
-        CustomRoleMigrationFacts {
+    fn applied() -> Facts {
+        Facts {
             migration_applied: true,
             ..completed_but_unrecorded()
         }
@@ -2089,157 +2095,127 @@ mod custom_role_migration_preflight_tests {
 
     /// What an interrupted MySQL/MariaDB upgrade leaves behind: the nine permission columns are there,
     /// `access_all` has not been dropped yet, and the ledger entry never committed.
-    fn interrupted() -> CustomRoleMigrationFacts {
-        CustomRoleMigrationFacts {
-            permission_columns_present: columns(CUSTOM_ROLE_PERMISSION_COLUMNS.len()),
-            permission_columns_not_null: columns(CUSTOM_ROLE_PERMISSION_COLUMNS.len()),
+    fn interrupted() -> Facts {
+        Facts {
+            permission_columns_present: permission_columns(),
+            permission_columns_not_null: permission_columns(),
             // the finished table plus the legacy column that still has to go
-            membership_column_count: columns(EXPECTED_MEMBERSHIP_COLUMNS.len() + 1),
-            expected_membership_columns_present: columns(EXPECTED_MEMBERSHIP_COLUMNS.len()),
+            membership_column_count: membership_columns() + 1,
+            expected_membership_columns_present: membership_columns(),
             ..pending()
         }
     }
 
+    /// `interrupted()` with one fact changed, for the states that only look like an interruption.
+    fn interrupted_but(change: impl FnOnce(&mut Facts)) -> Facts {
+        let mut facts = interrupted();
+        change(&mut facts);
+        facts
+    }
+
     /// Migrate, resume or refuse -- the whole decision, state by state.
     ///
-    /// Every refusal below is a state where continuing could change or lose a member's access, so the
-    /// only safe answer is to stop before the first mutation.
+    /// Every refusal is a state where continuing could change or lose a member's access, so the only
+    /// safe answer is to stop before the first mutation.
     #[test]
     fn custom_role_preflight_decision_table() {
-        let mut partial_columns = interrupted();
-        partial_columns.permission_columns_present = 4;
-        let mut nullable_column = interrupted();
-        nullable_column.permission_columns_not_null -= 1;
-        let mut extra_column = interrupted();
-        extra_column.membership_column_count += 1;
-        let mut tampered_ledger = interrupted();
-        tampered_ledger.newer_migration_recorded = true;
-        let mut applied_without_schema = applied();
-        applied_without_schema.access_all_column_exists = true;
-        let mut pending_without_access_all = pending();
-        pending_without_access_all.access_all_column_exists = false;
-
         // (case, facts, backend commits each schema step on its own, decision)
         let cases = [
             // Nothing to do: run the migration.
-            (
-                "fresh installation",
-                CustomRoleMigrationFacts::default(),
-                INTERRUPTIBLE,
-                CustomRolePreflightDecision::Proceed,
-            ),
-            ("untouched legacy database", pending(), INTERRUPTIBLE, CustomRolePreflightDecision::Proceed),
-            ("untouched legacy database, atomic backend", pending(), ATOMIC, CustomRolePreflightDecision::Proceed),
-            // Already upgraded, and the schema proves it.
-            ("recorded and upgraded", applied(), INTERRUPTIBLE, CustomRolePreflightDecision::Proceed),
-            // Diesel will never run a recorded migration again, so a schema that disagrees with the
-            // ledger has to stop startup rather than fail at runtime.
+            ("fresh installation", Facts::default(), INTERRUPTIBLE, Decision::Proceed),
+            ("untouched legacy database", pending(), INTERRUPTIBLE, Decision::Proceed),
+            ("untouched legacy database, atomic backend", pending(), ATOMIC, Decision::Proceed),
+            ("recorded and upgraded", applied(), INTERRUPTIBLE, Decision::Proceed),
+            // Diesel never runs a recorded migration again, so a schema that disagrees with the ledger
+            // has to stop startup rather than fail at runtime.
             (
                 "recorded but schema missing",
-                applied_without_schema,
+                Facts {
+                    access_all_column_exists: true,
+                    ..applied()
+                },
                 INTERRUPTIBLE,
-                CustomRolePreflightDecision::RefuseMigrationHistorySchemaMismatch,
+                Decision::RefuseMigrationHistorySchemaMismatch,
             ),
             // The migration finished and only the ledger insert was lost: record it, do not migrate.
-            (
-                "finished but unrecorded",
-                completed_but_unrecorded(),
-                INTERRUPTIBLE,
-                CustomRolePreflightDecision::RecordCompletedMigration,
-            ),
+            ("finished but unrecorded", completed_but_unrecorded(), INTERRUPTIBLE, Decision::RecordCompletedMigration),
             // Interrupted after the columns were added: finish it, but only where an interruption can
             // actually produce this state.
-            (
-                "interrupted upgrade",
-                interrupted(),
-                INTERRUPTIBLE,
-                CustomRolePreflightDecision::ResumeInterruptedMigration,
-            ),
-            (
-                "same schema on an atomic backend",
-                interrupted(),
-                ATOMIC,
-                CustomRolePreflightDecision::RefuseAmbiguousPartialMigration,
-            ),
+            ("interrupted upgrade", interrupted(), INTERRUPTIBLE, Decision::ResumeInterruptedMigration),
+            ("same schema on an atomic backend", interrupted(), ATOMIC, Decision::RefuseAmbiguousPartialMigration),
             // Anything that is not exactly the fingerprint an interruption leaves behind: something
             // other than this migration changed the table, so nothing may be assumed about it.
             (
                 "only some permission columns",
-                partial_columns,
+                interrupted_but(|f| f.permission_columns_present = 4),
                 INTERRUPTIBLE,
-                CustomRolePreflightDecision::RefuseAmbiguousPartialMigration,
+                Decision::RefuseAmbiguousPartialMigration,
             ),
             (
                 "a nullable permission column",
-                nullable_column,
+                interrupted_but(|f| f.permission_columns_not_null -= 1),
                 INTERRUPTIBLE,
-                CustomRolePreflightDecision::RefuseAmbiguousPartialMigration,
+                Decision::RefuseAmbiguousPartialMigration,
             ),
             (
                 "an unknown extra column",
-                extra_column,
+                interrupted_but(|f| f.membership_column_count += 1),
                 INTERRUPTIBLE,
-                CustomRolePreflightDecision::RefuseAmbiguousPartialMigration,
+                Decision::RefuseAmbiguousPartialMigration,
             ),
             (
                 "a newer migration recorded",
-                tampered_ledger,
+                interrupted_but(|f| f.newer_migration_recorded = true),
                 INTERRUPTIBLE,
-                CustomRolePreflightDecision::RefuseAmbiguousPartialMigration,
+                Decision::RefuseAmbiguousPartialMigration,
             ),
             // Pending, but the column the conversion reads is gone.
             (
                 "pending without access_all",
-                pending_without_access_all,
+                Facts {
+                    access_all_column_exists: false,
+                    ..pending()
+                },
                 INTERRUPTIBLE,
-                CustomRolePreflightDecision::RefuseMissingAccessAll,
+                Decision::RefuseMissingAccessAll,
             ),
         ];
 
         for (case, facts, interruptible, expected) in cases {
-            assert_eq!(
-                custom_role_preflight_decision(facts, LegacyUserAccessAllPolicy::Refuse, interruptible),
-                expected,
-                "{case}"
-            );
+            assert_eq!(custom_role_preflight_decision(facts, Policy::Refuse, interruptible), expected, "{case}");
         }
 
         // A legacy `User + access_all` membership is answered before anything else may happen to the
         // database, on a database that *also* needs a resume. The configured policy decides only that
         // question.
-        let mut affected = interrupted();
-        affected.legacy_user_access_all_count = 3;
-        let mut resolved = affected;
-        resolved.legacy_user_access_all_count = 0;
+        let affected = interrupted_but(|f| f.legacy_user_access_all_count = 3);
+        let resolved = interrupted();
+        let broken = interrupted_but(|f| {
+            f.legacy_user_access_all_count = 3;
+            f.access_all_column_exists = false;
+        });
 
         for (policy, expected) in [
-            (LegacyUserAccessAllPolicy::Refuse, CustomRolePreflightDecision::RefuseLegacyUserAccessAll),
-            (LegacyUserAccessAllPolicy::Drop, CustomRolePreflightDecision::DropLegacyUserAccessAll),
-            (LegacyUserAccessAllPolicy::Materialize, CustomRolePreflightDecision::MaterializeLegacyUserAccessAll),
+            (Policy::Refuse, Decision::RefuseLegacyUserAccessAll),
+            (Policy::Drop, Decision::DropLegacyUserAccessAll),
+            (Policy::Materialize, Decision::MaterializeLegacyUserAccessAll),
         ] {
             assert_eq!(
                 custom_role_preflight_decision(affected, policy, INTERRUPTIBLE),
                 expected,
                 "{policy:?}: the legacy rows come first"
             );
-            // Once they are resolved, the resume still happens rather than the file going back to
+            // Once they are resolved the resume still happens, rather than the file going back to
             // Diesel, which would abort on a duplicate column.
             assert_eq!(
                 custom_role_preflight_decision(resolved, policy, INTERRUPTIBLE),
-                CustomRolePreflightDecision::ResumeInterruptedMigration,
+                Decision::ResumeInterruptedMigration,
                 "{policy:?}: after resolution the interrupted upgrade is still finished"
             );
             // And the policy is not a way to talk the preflight past a broken schema.
             assert_eq!(
-                custom_role_preflight_decision(
-                    CustomRoleMigrationFacts {
-                        access_all_column_exists: false,
-                        ..affected
-                    },
-                    policy,
-                    INTERRUPTIBLE
-                ),
-                CustomRolePreflightDecision::RefuseMissingAccessAll,
+                custom_role_preflight_decision(broken, policy, INTERRUPTIBLE),
+                Decision::RefuseMissingAccessAll,
                 "{policy:?} must not override a schema refusal"
             );
         }
@@ -2249,18 +2225,15 @@ mod custom_role_migration_preflight_tests {
     /// an unrecognised value must never be read as the permissive one.
     #[test]
     fn legacy_user_access_all_policy_parsing() {
-        assert_eq!(LegacyUserAccessAllPolicy::from_config("refuse"), Some(LegacyUserAccessAllPolicy::Refuse));
-        assert_eq!(LegacyUserAccessAllPolicy::from_config("drop"), Some(LegacyUserAccessAllPolicy::Drop));
-        assert_eq!(LegacyUserAccessAllPolicy::from_config("materialize"), Some(LegacyUserAccessAllPolicy::Materialize));
+        assert_eq!(Policy::from_config("refuse"), Some(Policy::Refuse));
+        assert_eq!(Policy::from_config("drop"), Some(Policy::Drop));
+        assert_eq!(Policy::from_config("materialize"), Some(Policy::Materialize));
         // Case and surrounding whitespace are tolerated, because a .env value carries both.
-        assert_eq!(
-            LegacyUserAccessAllPolicy::from_config("  Materialize \n"),
-            Some(LegacyUserAccessAllPolicy::Materialize)
-        );
+        assert_eq!(Policy::from_config("  Materialize \n"), Some(Policy::Materialize));
 
         for rejected in ["", " ", "Materialise", "materialize!", "yes", "true", "0", "drop;refuse"] {
             assert_eq!(
-                LegacyUserAccessAllPolicy::from_config(rejected),
+                Policy::from_config(rejected),
                 None,
                 "{rejected:?} must not parse; `validate_config` rejects it at startup"
             );
@@ -2268,6 +2241,6 @@ mod custom_role_migration_preflight_tests {
 
         // Refusing is the default, so a value that somehow got past validation still stops startup
         // rather than silently changing a member's access.
-        assert_eq!(LegacyUserAccessAllPolicy::default(), LegacyUserAccessAllPolicy::Refuse);
+        assert_eq!(Policy::default(), Policy::Refuse);
     }
 }

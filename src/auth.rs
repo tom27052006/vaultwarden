@@ -1788,14 +1788,18 @@ mod tests {
         collection_read_access, collection_read_with_access, may_manage_groups, may_manage_policies, may_manage_users,
         may_manage_users_or_groups,
     };
-    use crate::db::models::{Membership, MembershipStatus, MembershipType, OrganizationId, UserId};
+    use crate::db::models::{Membership, MembershipStatus as Status, MembershipType, OrganizationId, UserId};
 
+    const OWNER: i32 = MembershipType::Owner as i32;
+    const ADMIN: i32 = MembershipType::Admin as i32;
+    const USER: i32 = MembershipType::User as i32;
+    const CUSTOM: i32 = MembershipType::Custom as i32;
     /// An `atype` this build cannot interpret: a future build, a partial rollback or a hand-edited row.
-    const UNKNOWN_ATYPE: i32 = 99;
+    const UNKNOWN: i32 = 99;
 
-    /// A membership of `atype`/`status` with `set` applied to its permission columns. The columns are
-    /// set regardless of the role on purpose, so a flag left behind by a role change can be covered.
-    fn member(atype: i32, status: MembershipStatus, set: impl FnOnce(&mut Membership)) -> Membership {
+    /// The permission columns are set regardless of the role on purpose, so a flag left behind by a
+    /// role change can be covered too.
+    fn member(atype: i32, status: Status, set: impl FnOnce(&mut Membership)) -> Membership {
         let mut membership = Membership::new(
             UserId::from(String::from("test-user")),
             OrganizationId::from(String::from("test-org")),
@@ -1807,252 +1811,129 @@ mod tests {
         membership
     }
 
-    fn confirmed(atype: MembershipType, set: impl FnOnce(&mut Membership)) -> Membership {
-        member(atype as i32, MembershipStatus::Confirmed, set)
+    fn confirmed(atype: i32, set: impl FnOnce(&mut Membership)) -> Membership {
+        member(atype, Status::Confirmed, set)
     }
 
     fn nothing(_: &mut Membership) {}
 
+    /// Every permission this file's guards read, so a row can show that none of them help.
+    fn all_permissions(m: &mut Membership) {
+        m.edit_any_collection = true;
+        m.delete_any_collection = true;
+        m.manage_users = true;
+        m.manage_groups = true;
+        m.manage_policies = true;
+    }
+
     /// Who may edit, read, read-with-access, rewrite the access of, and delete a collection.
     ///
     /// These five predicates model five *different* upstream operations and are deliberately not the
-    /// same rule; the differences between the columns below are the point of this table. A change that
-    /// makes any two of them agree where they must not is what this test exists to catch.
+    /// same rule; the differences between the columns are the point of this table. A change that makes
+    /// any two of them agree where they must not is what this test exists to catch.
     ///
     /// `Any` reaches every collection of the organization, `ExplicitManage` only those carrying a real
     /// `users_collections.manage` / `collections_groups.manage` grant, `Denied` none at all.
     #[test]
     fn collection_operation_access_matrix() {
-        use CollectionManageAccess::{Any, Denied, ExplicitManage};
+        use CollectionManageAccess::{Any, Denied, ExplicitManage as Explicit};
+
+        let owner = confirmed(OWNER, nothing);
+        let admin = confirmed(ADMIN, nothing);
+        let edit_any = confirmed(CUSTOM, |m| m.edit_any_collection = true);
+        let delete_any = confirmed(CUSTOM, |m| m.delete_any_collection = true);
+        let manage_users = confirmed(CUSTOM, |m| m.manage_users = true);
+        let manage_groups = confirmed(CUSTOM, |m| m.manage_groups = true);
+        let manage_both = confirmed(CUSTOM, |m| {
+            m.manage_users = true;
+            m.manage_groups = true;
+        });
+        let bare_custom = confirmed(CUSTOM, nothing);
+        let user = confirmed(USER, nothing);
+        let stale_user = confirmed(USER, all_permissions);
+        let revoked = member(CUSTOM, Status::Revoked, all_permissions);
+        let unknown = member(UNKNOWN, Status::Confirmed, all_permissions);
 
         // (case, membership, edit, read, read-with-access, modify access, delete)
         let cases = [
-            ("Owner", confirmed(MembershipType::Owner, nothing), Any, Any, Any, Any, Any),
-            ("Admin", confirmed(MembershipType::Admin, nothing), Any, Any, Any, Any, Any),
-            // Edit any collection reaches every collection for editing, and may read the access lists,
-            // but deletion never follows from it: Vaultwarden always serializes
+            ("Owner", &owner, Any, Any, Any, Any, Any),
+            ("Admin", &admin, Any, Any, Any, Any, Any),
+            // Edit-any reaches every collection for editing and may read the access lists, but
+            // deletion never follows from it: Vaultwarden always serializes
             // `limitCollectionDeletion = true`.
-            (
-                "Custom + editAnyCollection",
-                confirmed(MembershipType::Custom, |m| m.edit_any_collection = true),
-                Any,
-                Any,
-                Any,
-                Any,
-                Denied,
-            ),
-            // Delete any collection is the mirror image: it deletes and reads, but does not edit.
-            (
-                "Custom + deleteAnyCollection",
-                confirmed(MembershipType::Custom, |m| m.delete_any_collection = true),
-                ExplicitManage,
-                Any,
-                Any,
-                ExplicitManage,
-                Any,
-            ),
-            // Manage users reaches the single collection *details* view (upstream's `ReadWithAccess`)
+            ("Custom + editAnyCollection", &edit_any, Any, Any, Any, Any, Denied),
+            // Delete-any is the mirror image: it deletes and reads, but does not edit.
+            ("Custom + deleteAnyCollection", &delete_any, Explicit, Any, Any, Explicit, Any),
+            // Manage-users reaches the single collection *details* view (upstream's `ReadWithAccess`)
             // but not the `/users` access list (`ReadAccess`), which is a narrower operation.
-            (
-                "Custom + manageUsers",
-                confirmed(MembershipType::Custom, |m| m.manage_users = true),
-                ExplicitManage,
-                ExplicitManage,
-                Any,
-                ExplicitManage,
-                Denied,
-            ),
-            // Manage groups reaches neither: upstream grants it the collection *list*, not the single
+            ("Custom + manageUsers", &manage_users, Explicit, Explicit, Any, Explicit, Denied),
+            // Manage-groups reaches neither: upstream grants it the collection *list*, not the single
             // collection with its access.
-            (
-                "Custom + manageGroups",
-                confirmed(MembershipType::Custom, |m| m.manage_groups = true),
-                ExplicitManage,
-                ExplicitManage,
-                ExplicitManage,
-                ExplicitManage,
-                Denied,
-            ),
+            ("Custom + manageGroups", &manage_groups, Explicit, Explicit, Explicit, Explicit, Denied),
             // `bulk-access` rewrites user *and* group assignments in one request, so upstream requires
-            // both permissions. Either one alone still falls back to the regular update authorization.
-            (
-                "Custom + manageUsers + manageGroups",
-                confirmed(MembershipType::Custom, |m| {
-                    m.manage_users = true;
-                    m.manage_groups = true;
-                }),
-                ExplicitManage,
-                ExplicitManage,
-                Any,
-                Any,
-                Denied,
-            ),
-            // Without an org-wide permission a Custom member is exactly a User: only real per-collection
-            // Manage grants count, and deleting is out of reach entirely.
-            (
-                "Custom without permissions",
-                confirmed(MembershipType::Custom, nothing),
-                ExplicitManage,
-                ExplicitManage,
-                ExplicitManage,
-                ExplicitManage,
-                Denied,
-            ),
-            (
-                "User",
-                confirmed(MembershipType::User, nothing),
-                ExplicitManage,
-                ExplicitManage,
-                ExplicitManage,
-                ExplicitManage,
-                Denied,
-            ),
-            // A plain User carrying every flag a role change left behind gains nothing from any of them.
-            (
-                "User with stale permission flags",
-                confirmed(MembershipType::User, |m| {
-                    m.edit_any_collection = true;
-                    m.delete_any_collection = true;
-                    m.manage_users = true;
-                    m.manage_groups = true;
-                }),
-                ExplicitManage,
-                ExplicitManage,
-                ExplicitManage,
-                ExplicitManage,
-                Denied,
-            ),
-            // An unconfirmed membership holds nothing, whatever it carries...
-            (
-                "revoked Custom holding every permission",
-                member(MembershipType::Custom as i32, MembershipStatus::Revoked, |m| {
-                    m.edit_any_collection = true;
-                    m.delete_any_collection = true;
-                    m.manage_users = true;
-                    m.manage_groups = true;
-                }),
-                Denied,
-                Denied,
-                Denied,
-                Denied,
-                Denied,
-            ),
-            // ...and neither does a role this build cannot interpret.
-            (
-                "unknown role holding every permission",
-                member(UNKNOWN_ATYPE, MembershipStatus::Confirmed, |m| {
-                    m.edit_any_collection = true;
-                    m.delete_any_collection = true;
-                    m.manage_users = true;
-                    m.manage_groups = true;
-                }),
-                Denied,
-                Denied,
-                Denied,
-                Denied,
-                Denied,
-            ),
+            // both permissions. Either alone still falls back to the regular update authorization.
+            ("Custom + manageUsers + manageGroups", &manage_both, Explicit, Explicit, Any, Any, Denied),
+            // Without an org-wide permission a Custom member is exactly a User: only real
+            // per-collection Manage grants count, and deleting is out of reach entirely.
+            ("Custom without permissions", &bare_custom, Explicit, Explicit, Explicit, Explicit, Denied),
+            ("User", &user, Explicit, Explicit, Explicit, Explicit, Denied),
+            // Flags a role change left behind, an unconfirmed membership and a role this build cannot
+            // interpret all fail closed.
+            ("User with stale permission flags", &stale_user, Explicit, Explicit, Explicit, Explicit, Denied),
+            ("revoked Custom holding everything", &revoked, Denied, Denied, Denied, Denied, Denied),
+            ("unknown role holding everything", &unknown, Denied, Denied, Denied, Denied, Denied),
         ];
 
-        for (case, membership, edit, read, read_with_access, modify, delete) in cases {
-            assert_eq!(collection_edit_access(&membership), edit, "{case}: edit");
-            assert_eq!(collection_read_access(&membership), read, "{case}: read access lists");
-            assert_eq!(collection_read_with_access(&membership), read_with_access, "{case}: read with access");
-            assert_eq!(collection_modify_access(&membership), modify, "{case}: modify user and group access");
-            assert_eq!(collection_delete_access(&membership), delete, "{case}: delete");
+        for (case, m, edit, read, read_with_access, modify, delete) in cases {
+            assert_eq!(collection_edit_access(m), edit, "{case}: edit");
+            assert_eq!(collection_read_access(m), read, "{case}: read access lists");
+            assert_eq!(collection_read_with_access(m), read_with_access, "{case}: read with access");
+            assert_eq!(collection_modify_access(m), modify, "{case}: modify user and group access");
+            assert_eq!(collection_delete_access(m), delete, "{case}: delete");
         }
     }
 
-    /// The organization-wide permission guards behind `ManageUsersHeaders` and friends.
+    /// The organization-wide permission guards behind `ManageUsersHeaders` and friends: a confirmed
+    /// Owner/Admin, or a Custom member holding *that* permission.
     ///
-    /// Each one is a confirmed Owner/Admin, or a Custom member holding *that* permission -- so this
-    /// catches a guard wired to the wrong flag, a lost status gate, and an unknown stored role slipping
-    /// through any of them.
+    /// Catches a guard wired to the wrong flag, a lost status gate, and an unknown stored role
+    /// slipping through any of them.
     #[test]
     fn org_permission_guards_require_a_confirmed_role_or_the_matching_flag() {
+        let owner = confirmed(OWNER, nothing);
+        let admin = confirmed(ADMIN, nothing);
+        let invited_owner = member(OWNER, Status::Invited, nothing);
+        let users = confirmed(CUSTOM, |m| m.manage_users = true);
+        let groups = confirmed(CUSTOM, |m| m.manage_groups = true);
+        let policies = confirmed(CUSTOM, |m| m.manage_policies = true);
+        let bare_custom = confirmed(CUSTOM, nothing);
+        let user = confirmed(USER, nothing);
+        let stale_user = confirmed(USER, all_permissions);
+        let revoked = member(CUSTOM, Status::Revoked, all_permissions);
+        let unknown = member(UNKNOWN, Status::Confirmed, all_permissions);
+
         // (case, membership, manage users, manage groups, either, manage policies)
         let cases = [
-            ("Owner", confirmed(MembershipType::Owner, nothing), true, true, true, true),
-            ("Admin", confirmed(MembershipType::Admin, nothing), true, true, true, true),
+            ("Owner", &owner, true, true, true, true),
+            ("Admin", &admin, true, true, true, true),
             // Admins and Owners hold every permission by role, but only once confirmed.
-            (
-                "invited Owner",
-                member(MembershipType::Owner as i32, MembershipStatus::Invited, nothing),
-                false,
-                false,
-                false,
-                false,
-            ),
-            (
-                "Custom + manageUsers",
-                confirmed(MembershipType::Custom, |m| m.manage_users = true),
-                true,
-                false,
-                true,
-                false,
-            ),
-            (
-                "Custom + manageGroups",
-                confirmed(MembershipType::Custom, |m| m.manage_groups = true),
-                false,
-                true,
-                true,
-                false,
-            ),
-            (
-                "Custom + managePolicies",
-                confirmed(MembershipType::Custom, |m| m.manage_policies = true),
-                false,
-                false,
-                false,
-                true,
-            ),
-            ("Custom without permissions", confirmed(MembershipType::Custom, nothing), false, false, false, false),
-            ("User", confirmed(MembershipType::User, nothing), false, false, false, false),
+            ("invited Owner", &invited_owner, false, false, false, false),
+            ("Custom + manageUsers", &users, true, false, true, false),
+            ("Custom + manageGroups", &groups, false, true, true, false),
+            ("Custom + managePolicies", &policies, false, false, false, true),
+            ("Custom without permissions", &bare_custom, false, false, false, false),
+            ("User", &user, false, false, false, false),
             // Stale flags, an unconfirmed membership and an unknown role all fail closed.
-            (
-                "User with stale permission flags",
-                confirmed(MembershipType::User, |m| {
-                    m.manage_users = true;
-                    m.manage_groups = true;
-                    m.manage_policies = true;
-                }),
-                false,
-                false,
-                false,
-                false,
-            ),
-            (
-                "revoked Custom holding every permission",
-                member(MembershipType::Custom as i32, MembershipStatus::Revoked, |m| {
-                    m.manage_users = true;
-                    m.manage_groups = true;
-                    m.manage_policies = true;
-                }),
-                false,
-                false,
-                false,
-                false,
-            ),
-            (
-                "unknown role holding every permission",
-                member(UNKNOWN_ATYPE, MembershipStatus::Confirmed, |m| {
-                    m.manage_users = true;
-                    m.manage_groups = true;
-                    m.manage_policies = true;
-                }),
-                false,
-                false,
-                false,
-                false,
-            ),
+            ("User with stale permission flags", &stale_user, false, false, false, false),
+            ("revoked Custom holding everything", &revoked, false, false, false, false),
+            ("unknown role holding everything", &unknown, false, false, false, false),
         ];
 
-        for (case, membership, users, groups, users_or_groups, policies) in cases {
-            assert_eq!(may_manage_users(&membership), users, "{case}: manage users");
-            assert_eq!(may_manage_groups(&membership), groups, "{case}: manage groups");
-            assert_eq!(may_manage_users_or_groups(&membership), users_or_groups, "{case}: manage users or groups");
-            assert_eq!(may_manage_policies(&membership), policies, "{case}: manage policies");
+        for (case, m, users, groups, users_or_groups, policies) in cases {
+            assert_eq!(may_manage_users(m), users, "{case}: manage users");
+            assert_eq!(may_manage_groups(m), groups, "{case}: manage groups");
+            assert_eq!(may_manage_users_or_groups(m), users_or_groups, "{case}: manage users or groups");
+            assert_eq!(may_manage_policies(m), policies, "{case}: manage policies");
         }
     }
 }
