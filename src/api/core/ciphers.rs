@@ -345,7 +345,11 @@ pub struct Attachments2Data {
 /// Called when an org admin clones an org cipher.
 #[post("/ciphers/admin", data = "<data>")]
 async fn post_ciphers_admin(data: Json<ShareCipherData>, headers: Headers, conn: DbConn, nt: Notify<'_>) -> JsonResult {
-    post_ciphers_create(data, headers, conn, nt).await
+    // Only the response differs from `/ciphers/create`: the cipher is created owned by the caller
+    // and then shared, so the authorization along the way is the regular one either way. Without
+    // this, an administrative caller without a personal assignment to the target collection is
+    // answered `edit: false` for the cipher they just created.
+    post_ciphers_create_impl(data, headers, CipherAccessScope::OrganizationAdmin, conn, nt).await
 }
 
 /// Called when creating a new org-owned cipher, or cloning a cipher (whether
@@ -355,6 +359,16 @@ async fn post_ciphers_admin(data: Json<ShareCipherData>, headers: Headers, conn:
 async fn post_ciphers_create(
     data: Json<ShareCipherData>,
     headers: Headers,
+    conn: DbConn,
+    nt: Notify<'_>,
+) -> JsonResult {
+    post_ciphers_create_impl(data, headers, CipherAccessScope::User, conn, nt).await
+}
+
+async fn post_ciphers_create_impl(
+    data: Json<ShareCipherData>,
+    headers: Headers,
+    response_scope: CipherAccessScope,
     conn: DbConn,
     nt: Notify<'_>,
 ) -> JsonResult {
@@ -377,7 +391,7 @@ async fn post_ciphers_create(
     // or otherwise), we can just ignore this field entirely.
     data.cipher.last_known_revision_date = None;
 
-    let res = share_cipher_by_uuid(&cipher.uuid, data, &headers, &conn, &nt, None).await;
+    let res = share_cipher_by_uuid(&cipher.uuid, data, &headers, response_scope, &conn, &nt, None).await;
     if res.is_err() {
         cipher.delete(&conn).await?;
     }
@@ -1062,7 +1076,7 @@ async fn post_cipher_share(
 ) -> JsonResult {
     let data: ShareCipherData = data.into_inner();
 
-    share_cipher_by_uuid(&cipher_id, data, &headers, &conn, &nt, None).await
+    share_cipher_by_uuid(&cipher_id, data, &headers, CipherAccessScope::User, &conn, &nt, None).await
 }
 
 #[put("/ciphers/<cipher_id>/share", data = "<data>")]
@@ -1075,7 +1089,7 @@ async fn put_cipher_share(
 ) -> JsonResult {
     let data: ShareCipherData = data.into_inner();
 
-    share_cipher_by_uuid(&cipher_id, data, &headers, &conn, &nt, None).await
+    share_cipher_by_uuid(&cipher_id, data, &headers, CipherAccessScope::User, &conn, &nt, None).await
 }
 
 #[derive(Deserialize)]
@@ -1115,7 +1129,16 @@ async fn put_cipher_share_selected(
         };
 
         if let Some(id) = shared_cipher_data.cipher.id.take() {
-            share_cipher_by_uuid(&id, shared_cipher_data, &headers, &conn, &nt, Some(UpdateType::None)).await?
+            share_cipher_by_uuid(
+                &id,
+                shared_cipher_data,
+                &headers,
+                CipherAccessScope::User,
+                &conn,
+                &nt,
+                Some(UpdateType::None),
+            )
+            .await?
         } else {
             err!("Request missing ids field")
         };
@@ -1131,6 +1154,10 @@ async fn share_cipher_by_uuid(
     cipher_id: &CipherId,
     data: ShareCipherData,
     headers: &Headers,
+    // Only the response is serialized with this. The entry check below deliberately stays
+    // `CipherAccessScope::User`: sharing is a regular vault operation, and `/ciphers/admin` reaches
+    // it with a cipher it has just created and therefore owns.
+    response_scope: CipherAccessScope,
     conn: &DbConn,
     nt: &Notify<'_>,
     override_ut: Option<UpdateType>,
@@ -1191,7 +1218,7 @@ async fn share_cipher_by_uuid(
     )
     .await?;
 
-    Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, conn).await?))
+    Ok(Json(cipher_json_for_scope(&cipher, headers, response_scope, conn).await?))
 }
 
 /// v2 API for downloading an attachment. This just redirects the client to
@@ -1247,15 +1274,22 @@ async fn post_attachment_v2(
     headers: Headers,
     conn: DbConn,
 ) -> JsonResult {
+    let data: AttachmentRequestData = data.into_inner();
+
+    // Upstream's `PostAttachment` branches on `adminRequest`: it authorizes the administrative
+    // request with `CanEditCipherAsAdminAsync` and answers it with a `CipherMiniResponse`. The flag
+    // picks the predicate, not its answer -- a caller without organization-wide cipher authority is
+    // refused here either way.
+    let scope = CipherAccessScope::requested(data.admin_request);
+
     let Some(cipher) = Cipher::find_by_uuid(&cipher_id, &conn).await else {
         err!("Cipher doesn't exist")
     };
 
-    if !cipher.is_write_accessible_to_user(&headers.user.uuid, CipherAccessScope::User, &conn).await {
+    if !cipher.is_write_accessible_to_user(&headers.user.uuid, scope, &conn).await {
         err!("Cipher is not write accessible")
     }
 
-    let data: AttachmentRequestData = data.into_inner();
     let file_size = data.file_size.into_i64()?;
 
     if file_size < 0 {
@@ -1267,9 +1301,11 @@ async fn post_attachment_v2(
     attachment.save(&conn).await.expect("Error saving attachment");
 
     let url = format!("/ciphers/{}/attachment/{attachment_id}", cipher.uuid);
-    let response_key = match data.admin_request {
-        Some(b) if b => "cipherMiniResponse",
-        _ => "cipherResponse",
+    // Derived from the same `scope` the request was authorized with, so the response key and the
+    // serialization below can never disagree about which flow this is.
+    let response_key = match scope {
+        CipherAccessScope::OrganizationAdmin => "cipherMiniResponse",
+        CipherAccessScope::User => "cipherResponse",
     };
 
     Ok(Json(json!({ // AttachmentUploadDataResponseModel
@@ -1277,7 +1313,7 @@ async fn post_attachment_v2(
         "attachmentId": attachment_id,
         "url": url,
         "fileUploadType": FileUploadType::Direct as i32,
-        response_key: cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, &conn).await?,
+        response_key: cipher_json_for_scope(&cipher, &headers, scope, &conn).await?,
     })))
 }
 
@@ -1478,9 +1514,29 @@ async fn post_attachment_v2_data(
         None => err!("Attachment doesn't exist"),
     };
 
-    save_attachment(attachment, cipher_id, data, &headers, CipherAccessScope::User, conn, nt).await?;
+    // This leg of the v2 upload carries no `adminRequest` field, so the administrative context is
+    // recomputed from the caller's own membership in *this cipher's* organization, exactly as
+    // upstream's `PostFileForExistingAttachment` does. Nothing in the request feeds into it, so the
+    // upload route cannot be talked into an administrative scope.
+    let Some(cipher) = Cipher::find_by_uuid(&cipher_id, &conn).await else {
+        err!("Cipher doesn't exist")
+    };
+    let scope = cipher_scope_for_member(&cipher, &headers.user.uuid, &conn).await;
+
+    save_attachment(attachment, cipher_id, data, &headers, scope, conn, nt).await?;
 
     Ok(())
+}
+
+/// The [`CipherAccessScope`] for a route the client cannot state one for: resolved from the
+/// caller's own confirmed membership in the cipher's organization, never from the request.
+async fn cipher_scope_for_member(cipher: &Cipher, user_id: &UserId, conn: &DbConn) -> CipherAccessScope {
+    let Some(org_id) = cipher.organization_uuid.as_ref() else {
+        // A personal cipher has no organization to administer.
+        return CipherAccessScope::User;
+    };
+
+    CipherAccessScope::for_member(Membership::find_confirmed_by_user_and_org(user_id, org_id, conn).await.as_ref())
 }
 
 /// Legacy API for creating an attachment associated with a cipher.
@@ -2097,7 +2153,9 @@ async fn restore_cipher_by_uuid(
         .await;
     }
 
-    Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, conn).await?))
+    // Answer with the scope the restore was authorized under, so an administrative caller without a
+    // personal assignment is not told `edit: false` for a cipher they just restored.
+    Ok(Json(cipher_json_for_scope(&cipher, headers, scope, conn).await?))
 }
 
 async fn restore_multiple_ciphers(
@@ -2175,7 +2233,8 @@ async fn delete_cipher_attachment_by_id(
         )
         .await;
     }
-    let cipher_json = cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, conn).await?;
+    // Same scope the deletion was authorized under; see `cipher_json_for_scope`.
+    let cipher_json = cipher_json_for_scope(&cipher, headers, scope, conn).await?;
     Ok(Json(json!({"cipher":cipher_json})))
 }
 

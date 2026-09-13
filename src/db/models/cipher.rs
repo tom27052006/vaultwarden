@@ -118,6 +118,38 @@ impl CipherAccessScope {
             Self::OrganizationAdmin => may_administer_org_ciphers(membership),
         }
     }
+
+    /// The scope a request asks for, for the one route that states it: the v2 attachment create.
+    ///
+    /// Upstream's `PostAttachment` branches on the request's `adminRequest` flag -- `true`
+    /// authorizes with `CanEditCipherAsAdminAsync` and answers with a `CipherMiniResponse`,
+    /// anything else authorizes and answers as the regular vault route.
+    ///
+    /// The flag only selects *which* predicate is evaluated, never what it answers:
+    /// [`Self::OrganizationAdmin`] still requires the caller to hold organization-wide cipher
+    /// authority, so a member without it gains nothing by setting the flag.
+    pub fn requested(admin_request: Option<bool>) -> Self {
+        if admin_request == Some(true) {
+            Self::OrganizationAdmin
+        } else {
+            Self::User
+        }
+    }
+
+    /// The scope for a route that cannot be told which one to use, resolved from the caller's own
+    /// membership in the cipher's organization.
+    ///
+    /// The second leg of the v2 attachment upload is a bare file POST with no `adminRequest` field,
+    /// so upstream's `PostFileForExistingAttachment` recomputes the administrative context from the
+    /// caller instead (`orgAdmin = CanEditCipherAsAdminAsync(...)`). Nothing from the request feeds
+    /// into this, so that route cannot be talked into an administrative scope.
+    pub fn for_member(membership: Option<&Membership>) -> Self {
+        if membership.is_some_and(may_administer_org_ciphers) {
+            Self::OrganizationAdmin
+        } else {
+            Self::User
+        }
+    }
 }
 
 /// Local methods
@@ -1462,5 +1494,105 @@ mod tests {
         assert!(!may_administer_org_ciphers(&member));
         assert!(!CipherAccessScope::OrganizationAdmin.grants_org_wide_cipher_access(&member));
         assert!(!CipherAccessScope::User.grants_org_wide_cipher_access(&member));
+    }
+
+    // ---- Scope selection for the two attachment flows ----
+
+    /// The v2 attachment *create* is the one route upstream lets the request pick the flow for
+    /// (`adminRequest`), so the mapping is pinned here.
+    #[test]
+    fn admin_request_flag_selects_the_scope() {
+        assert_eq!(CipherAccessScope::requested(Some(true)), CipherAccessScope::OrganizationAdmin);
+        assert_eq!(CipherAccessScope::requested(Some(false)), CipherAccessScope::User);
+        assert_eq!(CipherAccessScope::requested(None), CipherAccessScope::User);
+    }
+
+    /// The flag must not be usable as a privilege escalation: it picks which predicate runs, and the
+    /// administrative one still asks whether this member actually holds the authority.
+    #[test]
+    fn admin_request_flag_cannot_be_abused_for_escalation() {
+        let escalation_attempts = [
+            confirmed(MembershipType::User, false),
+            // A plain User carrying a stale `edit_any_collection` flag.
+            confirmed(MembershipType::User, true),
+            confirmed(MembershipType::Custom, false),
+            membership(MembershipType::Custom, MembershipStatus::Invited, true),
+            membership(MembershipType::Custom, MembershipStatus::Accepted, true),
+            membership(MembershipType::Custom, MembershipStatus::Revoked, true),
+        ];
+
+        for member in &escalation_attempts {
+            let scope = CipherAccessScope::requested(Some(true));
+            assert_eq!(scope, CipherAccessScope::OrganizationAdmin);
+            assert!(
+                !scope.grants_org_wide_cipher_access(member),
+                "atype {} / status {} must not reach org ciphers via adminRequest",
+                member.atype,
+                member.status
+            );
+        }
+    }
+
+    /// Custom + `Edit any collection` is the one member the flag actually changes the answer for.
+    #[test]
+    fn admin_request_flag_admits_custom_with_edit_any_collection() {
+        let member = confirmed(MembershipType::Custom, true);
+
+        assert!(CipherAccessScope::requested(Some(true)).grants_org_wide_cipher_access(&member));
+        assert!(!CipherAccessScope::requested(None).grants_org_wide_cipher_access(&member));
+    }
+
+    /// The v2 upload leg carries no `adminRequest`, so its scope comes from the membership alone.
+    #[test]
+    fn upload_scope_is_resolved_from_the_membership() {
+        assert_eq!(
+            CipherAccessScope::for_member(Some(&confirmed(MembershipType::Custom, true))),
+            CipherAccessScope::OrganizationAdmin
+        );
+        assert_eq!(
+            CipherAccessScope::for_member(Some(&confirmed(MembershipType::Owner, false))),
+            CipherAccessScope::OrganizationAdmin
+        );
+        assert_eq!(
+            CipherAccessScope::for_member(Some(&confirmed(MembershipType::Custom, false))),
+            CipherAccessScope::User
+        );
+        // Stale flag on a plain User, and an unconfirmed Custom member.
+        assert_eq!(
+            CipherAccessScope::for_member(Some(&confirmed(MembershipType::User, true))),
+            CipherAccessScope::User
+        );
+        assert_eq!(
+            CipherAccessScope::for_member(Some(&membership(MembershipType::Custom, MembershipStatus::Revoked, true))),
+            CipherAccessScope::User
+        );
+        // No membership at all, e.g. a personal cipher.
+        assert_eq!(CipherAccessScope::for_member(None), CipherAccessScope::User);
+    }
+
+    /// Whichever way a scope is chosen, `OrganizationAdmin` never answers "no" where `User` answers
+    /// "yes". That is what makes it safe for a route to resolve the scope from a request flag or
+    /// from the membership: the worst case is the regular answer, never a narrower one.
+    #[test]
+    fn organization_admin_scope_is_a_superset_of_user_scope() {
+        let members = [
+            confirmed(MembershipType::Owner, false),
+            confirmed(MembershipType::Admin, false),
+            confirmed(MembershipType::Custom, true),
+            confirmed(MembershipType::Custom, false),
+            confirmed(MembershipType::User, false),
+            confirmed(MembershipType::User, true),
+            membership(MembershipType::Custom, MembershipStatus::Invited, true),
+        ];
+
+        for member in &members {
+            if CipherAccessScope::User.grants_org_wide_cipher_access(member) {
+                assert!(
+                    CipherAccessScope::OrganizationAdmin.grants_org_wide_cipher_access(member),
+                    "atype {} loses access in the administrative scope",
+                    member.atype
+                );
+            }
+        }
     }
 }
