@@ -1397,12 +1397,146 @@ pub struct OrgApiKeyId(String);
 mod tests {
     use super::*;
 
+    /// An `atype` this build cannot interpret: a future build, a partial rollback or a hand-edited row.
+    const UNKNOWN_ATYPE: i32 = 99;
+
+    fn membership(atype: i32) -> Membership {
+        let mut member = Membership::new(
+            UserId::from(String::from("test-user")),
+            OrganizationId::from(String::from("test-org")),
+            None,
+        );
+        member.atype = atype;
+        member.status = MembershipStatus::Confirmed as i32;
+        member
+    }
+
+    /// How roles rank against each other, and how a stored `atype` is read.
+    ///
+    /// Every authorization guard in the tree asks `atype >= MembershipType::X` or
+    /// `atype < MembershipType::X` against a value straight from the database, so those two answers --
+    /// including the answers for a value this build does not know -- are the security semantics here.
     #[test]
-    #[allow(non_snake_case)]
-    fn partial_cmp_MembershipType() {
+    fn membership_type_ordering_and_parsing() {
+        // Roles rank by authority, not by the stored discriminant: Custom is stored as 4 but sits
+        // between User and Admin.
         assert!(MembershipType::Owner > MembershipType::Admin);
         assert!(MembershipType::Admin > MembershipType::Custom);
         assert!(MembershipType::Custom > MembershipType::User);
-        assert!(MembershipType::Custom == MembershipType::from_str("4").unwrap());
+
+        // (stored atype, reaches Admin authority, is below Admin)
+        let stored = [
+            (MembershipType::Owner as i32, true, false),
+            (MembershipType::Admin as i32, true, false),
+            (MembershipType::Custom as i32, false, true),
+            (MembershipType::User as i32, false, true),
+            // An unknown role answers "no" to authority *and* "yes" to being below Admin. Both are
+            // deliberate: it never reaches administrative authority, and it stays sweepable by policy
+            // enforcement instead of becoming a row nothing can act on.
+            (UNKNOWN_ATYPE, false, true),
+            (-1, false, true),
+        ];
+        for (atype, reaches_admin, below_admin) in stored {
+            assert_eq!(atype >= MembershipType::Admin, reaches_admin, "atype {atype} >= Admin");
+            assert_eq!(atype < MembershipType::Admin, below_admin, "atype {atype} < Admin");
+        }
+
+        // Wire values. Modern clients no longer offer the Manager role, but an old client or a stored
+        // request may still send 3; Custom supersedes it, so it is accepted and folded on.
+        let accepted = [
+            ("0", MembershipType::Owner),
+            ("Owner", MembershipType::Owner),
+            ("1", MembershipType::Admin),
+            ("Admin", MembershipType::Admin),
+            ("2", MembershipType::User),
+            ("User", MembershipType::User),
+            ("3", MembershipType::Custom),
+            ("Manager", MembershipType::Custom),
+            ("4", MembershipType::Custom),
+            ("Custom", MembershipType::Custom),
+        ];
+        for (wire, expected) in accepted {
+            assert!(
+                MembershipType::from_str(wire) == Some(expected),
+                "{wire:?} must parse as the role stored as {}",
+                expected as i32
+            );
+        }
+        for rejected in ["", " ", "3 ", "5", "-1", "manager", "custom", "Manager\n"] {
+            assert!(MembershipType::from_str(rejected).is_none(), "{rejected:?} must not parse");
+        }
+    }
+
+    /// The nine granular permissions are stored as plain columns, so they outlive a role change. Every
+    /// reader gates them on the Custom type for that reason: a flag left behind on a User, an Admin or
+    /// a role this build cannot read must grant nothing.
+    #[test]
+    fn custom_permission_flags_are_type_gated() {
+        type Reader = fn(&Membership) -> bool;
+        type Setter = fn(&mut Membership, bool);
+
+        let permissions: [(&str, Reader, Setter); 9] = [
+            ("manageUsers", Membership::has_manage_users, |m, v| m.manage_users = v),
+            ("manageGroups", Membership::has_manage_groups, |m, v| m.manage_groups = v),
+            ("managePolicies", Membership::has_manage_policies, |m, v| m.manage_policies = v),
+            ("createNewCollections", Membership::has_create_new_collections, |m, v| m.create_new_collections = v),
+            ("editAnyCollection", Membership::has_edit_any_collection, |m, v| m.edit_any_collection = v),
+            ("deleteAnyCollection", Membership::has_delete_any_collection, |m, v| m.delete_any_collection = v),
+            ("accessEventLogs", Membership::has_access_event_logs, |m, v| m.access_event_logs = v),
+            ("accessImportExport", Membership::has_access_import_export, |m, v| m.access_import_export = v),
+            ("accessReports", Membership::has_access_reports, |m, v| m.access_reports = v),
+        ];
+
+        for (name, read, set) in permissions {
+            for atype in [
+                MembershipType::Owner as i32,
+                MembershipType::Admin as i32,
+                MembershipType::User as i32,
+                MembershipType::Custom as i32,
+                UNKNOWN_ATYPE,
+            ] {
+                let mut member = membership(atype);
+                assert!(!read(&member), "{name} must be off while its column is false (atype {atype})");
+
+                set(&mut member, true);
+                assert_eq!(
+                    read(&member),
+                    atype == MembershipType::Custom as i32,
+                    "{name} is only meaningful on a Custom membership (atype {atype})"
+                );
+            }
+        }
+
+        // Clearing has to reach every one of the nine; a forgotten field would leave authority behind
+        // on a member that was just moved off the Custom role.
+        let mut member = membership(MembershipType::Custom as i32);
+        for (_, _, set) in permissions {
+            set(&mut member, true);
+        }
+        member.clear_custom_permissions();
+        for (name, read, _) in permissions {
+            assert!(!read(&member), "{name} survived clear_custom_permissions");
+        }
+
+        // `manageAllCollections` is a client-side aggregate: selected exactly when all three child
+        // permissions are.
+        let all_collections = |atype, create, edit, delete| {
+            let mut member = membership(atype);
+            member.create_new_collections = create;
+            member.edit_any_collection = edit;
+            member.delete_any_collection = delete;
+            member
+        };
+        let custom = MembershipType::Custom as i32;
+        assert!(all_collections(custom, true, true, true).has_manage_all_collections());
+        for (missing, member) in [
+            ("createNewCollections", all_collections(custom, false, true, true)),
+            ("editAnyCollection", all_collections(custom, true, false, true)),
+            ("deleteAnyCollection", all_collections(custom, true, true, false)),
+            // And, like every other reader, the aggregate is gated on the type.
+            ("the Custom role", all_collections(MembershipType::User as i32, true, true, true)),
+        ] {
+            assert!(!member.has_manage_all_collections(), "{missing} missing must clear the aggregate");
+        }
     }
 }

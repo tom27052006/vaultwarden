@@ -1377,40 +1377,88 @@ pub struct CipherId(String);
 
 #[cfg(test)]
 mod tests {
-    use super::{CipherAccessScope, may_administer_org_ciphers};
+    use super::CipherAccessScope;
     use crate::db::models::{Membership, MembershipStatus, MembershipType, OrganizationId, UserId};
 
+    /// An `atype` this build cannot interpret: a future build, a partial rollback or a hand-edited row.
+    const UNKNOWN_ATYPE: i32 = 99;
+
     /// A membership of `atype`/`status`, optionally holding the Custom `Edit any collection`
-    /// permission. The flag is set regardless of the role on purpose, so the tests can also cover a
-    /// stale flag left on a non-Custom membership.
-    fn membership(atype: MembershipType, status: MembershipStatus, edit_any_collection: bool) -> Membership {
+    /// permission. `atype` is a raw `i32` and the flag is set regardless of the role on purpose, so
+    /// the tests can also cover a stale flag and a role this build does not know.
+    fn membership(atype: i32, status: MembershipStatus, edit_any_collection: bool) -> Membership {
         let mut member = Membership::new(
             UserId::from(String::from("test-user")),
             OrganizationId::from(String::from("test-org")),
             None,
         );
-        member.atype = atype as i32;
+        member.atype = atype;
         member.status = status as i32;
         member.edit_any_collection = edit_any_collection;
         member
     }
 
     fn confirmed(atype: MembershipType, edit_any_collection: bool) -> Membership {
-        membership(atype, MembershipStatus::Confirmed, edit_any_collection)
+        membership(atype as i32, MembershipStatus::Confirmed, edit_any_collection)
     }
 
-    /// A: a confirmed Custom member holding `Edit any collection` administers the organization's
-    /// ciphers -- upstream's `CanEditAllCiphersAsync` -- but that authority is administrative only.
+    /// Who reaches *every* cipher of an organization, in each of the two scopes.
+    ///
+    /// The regular vault scope answers by role alone. The administrative scope additionally admits a
+    /// confirmed Custom member holding `Edit any collection` -- upstream's `CanEditAllCiphersAsync`,
+    /// which every `/ciphers/.../admin` route resolves through.
     #[test]
-    fn confirmed_custom_with_edit_any_collection_administers_org_ciphers() {
-        let member = confirmed(MembershipType::Custom, true);
+    fn cipher_access_scope_matrix() {
+        // (case, atype, status, edit_any_collection, regular vault scope, administrative scope)
+        let cases = [
+            ("Owner", MembershipType::Owner as i32, MembershipStatus::Confirmed, false, true, true),
+            ("Admin", MembershipType::Admin as i32, MembershipStatus::Confirmed, false, true, true),
+            // The role this change adds: administrative authority, and nothing beyond it.
+            ("Custom + EditAny", MembershipType::Custom as i32, MembershipStatus::Confirmed, true, false, true),
+            ("Custom without EditAny", MembershipType::Custom as i32, MembershipStatus::Confirmed, false, false, false),
+            // The permission flags are only meaningful on a Custom membership, so one left behind by
+            // a role change grants nothing.
+            (
+                "User with a stale EditAny flag",
+                MembershipType::User as i32,
+                MembershipStatus::Confirmed,
+                true,
+                false,
+                false,
+            ),
+            // The permission only activates once the membership is confirmed.
+            ("Custom + EditAny, invited", MembershipType::Custom as i32, MembershipStatus::Invited, true, false, false),
+            (
+                "Custom + EditAny, accepted",
+                MembershipType::Custom as i32,
+                MembershipStatus::Accepted,
+                true,
+                false,
+                false,
+            ),
+            ("Custom + EditAny, revoked", MembershipType::Custom as i32, MembershipStatus::Revoked, true, false, false),
+            // A role this build cannot interpret holds nothing, in either scope.
+            ("unknown role", UNKNOWN_ATYPE, MembershipStatus::Confirmed, true, false, false),
+        ];
 
-        assert!(may_administer_org_ciphers(&member));
-        assert!(CipherAccessScope::OrganizationAdmin.grants_org_wide_cipher_access(&member));
+        for (case, atype, status, edit_any_collection, user_scope, admin_scope) in cases {
+            let member = membership(atype, status, edit_any_collection);
+
+            assert_eq!(
+                CipherAccessScope::User.grants_org_wide_cipher_access(&member),
+                user_scope,
+                "{case}: regular vault scope"
+            );
+            assert_eq!(
+                CipherAccessScope::OrganizationAdmin.grants_org_wide_cipher_access(&member),
+                admin_scope,
+                "{case}: administrative scope"
+            );
+        }
     }
 
-    /// G: the regression this separation exists for. The administrative authority above must not
-    /// leak into the regular vault routes, so `/sync`, `GET /ciphers` and the non-admin
+    /// The regression this separation exists for. The administrative authority above must not leak
+    /// into the regular vault routes, so `/sync`, `GET /ciphers` and the non-admin
     /// `GET|PUT /ciphers/<id>` keep answering from the member's own collection assignments.
     #[test]
     fn edit_any_collection_does_not_widen_the_regular_vault_scope() {
@@ -1424,87 +1472,23 @@ mod tests {
         );
     }
 
-    /// B: Custom without the permission gains nothing on the administrative routes.
-    #[test]
-    fn confirmed_custom_without_edit_any_collection_has_no_authority() {
-        let member = confirmed(MembershipType::Custom, false);
-
-        assert!(!may_administer_org_ciphers(&member));
-        assert!(!CipherAccessScope::OrganizationAdmin.grants_org_wide_cipher_access(&member));
-        assert!(!CipherAccessScope::User.grants_org_wide_cipher_access(&member));
-    }
-
-    /// C: the permission flags are only meaningful on a Custom membership, so a flag left behind by
-    /// a role change grants nothing.
-    #[test]
-    fn stale_edit_any_collection_on_a_plain_user_grants_nothing() {
-        let member = confirmed(MembershipType::User, true);
-
-        assert!(!may_administer_org_ciphers(&member));
-        assert!(!CipherAccessScope::OrganizationAdmin.grants_org_wide_cipher_access(&member));
-        assert!(!CipherAccessScope::User.grants_org_wide_cipher_access(&member));
-    }
-
-    /// D: the permission only activates once the membership is confirmed.
-    #[test]
-    fn unconfirmed_custom_with_edit_any_collection_has_no_authority() {
-        for status in [MembershipStatus::Invited, MembershipStatus::Accepted, MembershipStatus::Revoked] {
-            let member = membership(MembershipType::Custom, status, true);
-
-            assert!(!may_administer_org_ciphers(&member), "status {} must not grant authority", member.status);
-            assert!(!CipherAccessScope::OrganizationAdmin.grants_org_wide_cipher_access(&member));
-        }
-    }
-
-    /// E: Owner and Admin are untouched by this change -- they already reached every cipher of the
-    /// organization in both scopes, without holding any Custom permission.
-    #[test]
-    fn owner_and_admin_reach_org_ciphers_in_both_scopes() {
-        for atype in [MembershipType::Owner, MembershipType::Admin] {
-            let member = confirmed(atype, false);
-
-            assert!(may_administer_org_ciphers(&member), "atype {} must administer org ciphers", member.atype);
-            assert!(CipherAccessScope::OrganizationAdmin.grants_org_wide_cipher_access(&member));
-            assert!(CipherAccessScope::User.grants_org_wide_cipher_access(&member));
-        }
-    }
-
-    /// F: upstream resolves `CanDeleteOrRestoreCipherAsAdminAsync` through the same
-    /// `CanEditAllCiphersAsync` as `CanEditCipherAsAdminAsync`, so delete and restore answer to the
-    /// same authority as edit and need no separate permission. This pins that down: if upstream ever
-    /// splits them, one predicate will no longer be enough and this test should be the thing that
-    /// fails.
-    #[test]
-    fn delete_and_restore_share_the_edit_authority() {
-        let allowed = confirmed(MembershipType::Custom, true);
-        let denied = confirmed(MembershipType::Custom, false);
-
-        // One predicate backs every administrative cipher route, so edit, delete and restore all
-        // read the same answer for the same member.
-        assert!(may_administer_org_ciphers(&allowed));
-        assert!(!may_administer_org_ciphers(&denied));
-    }
-
-    /// An `atype` this build cannot interpret holds no authority in either scope.
-    #[test]
-    fn unknown_role_has_no_authority() {
-        let mut member = confirmed(MembershipType::Custom, true);
-        member.atype = 99;
-
-        assert!(!may_administer_org_ciphers(&member));
-        assert!(!CipherAccessScope::OrganizationAdmin.grants_org_wide_cipher_access(&member));
-        assert!(!CipherAccessScope::User.grants_org_wide_cipher_access(&member));
-    }
-
     // ---- Scope selection for the two attachment flows ----
 
     /// The v2 attachment *create* is the one route upstream lets the request pick the flow for
-    /// (`adminRequest`), so the mapping is pinned here.
+    /// (`adminRequest`), so the mapping is pinned here together with the one member it changes the
+    /// answer for.
     #[test]
-    fn admin_request_flag_selects_the_scope() {
+    fn admin_request_scope_selection() {
         assert_eq!(CipherAccessScope::requested(Some(true)), CipherAccessScope::OrganizationAdmin);
         assert_eq!(CipherAccessScope::requested(Some(false)), CipherAccessScope::User);
         assert_eq!(CipherAccessScope::requested(None), CipherAccessScope::User);
+
+        // Custom + `Edit any collection` holds administrative authority only, so it reaches the
+        // organization's ciphers exactly when the request asks for the administrative flow.
+        let member = confirmed(MembershipType::Custom, true);
+        assert!(CipherAccessScope::requested(Some(true)).grants_org_wide_cipher_access(&member));
+        assert!(!CipherAccessScope::requested(Some(false)).grants_org_wide_cipher_access(&member));
+        assert!(!CipherAccessScope::requested(None).grants_org_wide_cipher_access(&member));
     }
 
     /// The flag must not be usable as a privilege escalation: it picks which predicate runs, and the
@@ -1516,9 +1500,10 @@ mod tests {
             // A plain User carrying a stale `edit_any_collection` flag.
             confirmed(MembershipType::User, true),
             confirmed(MembershipType::Custom, false),
-            membership(MembershipType::Custom, MembershipStatus::Invited, true),
-            membership(MembershipType::Custom, MembershipStatus::Accepted, true),
-            membership(MembershipType::Custom, MembershipStatus::Revoked, true),
+            membership(MembershipType::Custom as i32, MembershipStatus::Invited, true),
+            membership(MembershipType::Custom as i32, MembershipStatus::Accepted, true),
+            membership(MembershipType::Custom as i32, MembershipStatus::Revoked, true),
+            membership(UNKNOWN_ATYPE, MembershipStatus::Confirmed, true),
         ];
 
         for member in &escalation_attempts {
@@ -1533,16 +1518,8 @@ mod tests {
         }
     }
 
-    /// Custom + `Edit any collection` is the one member the flag actually changes the answer for.
-    #[test]
-    fn admin_request_flag_admits_custom_with_edit_any_collection() {
-        let member = confirmed(MembershipType::Custom, true);
-
-        assert!(CipherAccessScope::requested(Some(true)).grants_org_wide_cipher_access(&member));
-        assert!(!CipherAccessScope::requested(None).grants_org_wide_cipher_access(&member));
-    }
-
-    /// The v2 upload leg carries no `adminRequest`, so its scope comes from the membership alone.
+    /// The v2 upload leg carries no `adminRequest`, so its scope comes from the membership alone and
+    /// nothing in the request can talk that route into an administrative scope.
     #[test]
     fn upload_scope_is_resolved_from_the_membership() {
         assert_eq!(
@@ -1557,13 +1534,21 @@ mod tests {
             CipherAccessScope::for_member(Some(&confirmed(MembershipType::Custom, false))),
             CipherAccessScope::User
         );
-        // Stale flag on a plain User, and an unconfirmed Custom member.
+        // Stale flag on a plain User, an unconfirmed Custom member, and a role this build cannot read.
         assert_eq!(
             CipherAccessScope::for_member(Some(&confirmed(MembershipType::User, true))),
             CipherAccessScope::User
         );
         assert_eq!(
-            CipherAccessScope::for_member(Some(&membership(MembershipType::Custom, MembershipStatus::Revoked, true))),
+            CipherAccessScope::for_member(Some(&membership(
+                MembershipType::Custom as i32,
+                MembershipStatus::Revoked,
+                true
+            ))),
+            CipherAccessScope::User
+        );
+        assert_eq!(
+            CipherAccessScope::for_member(Some(&membership(UNKNOWN_ATYPE, MembershipStatus::Confirmed, true))),
             CipherAccessScope::User
         );
         // No membership at all, e.g. a personal cipher.
@@ -1571,8 +1556,8 @@ mod tests {
     }
 
     /// Whichever way a scope is chosen, `OrganizationAdmin` never answers "no" where `User` answers
-    /// "yes". That is what makes it safe for a route to resolve the scope from a request flag or
-    /// from the membership: the worst case is the regular answer, never a narrower one.
+    /// "yes". That is what makes it safe for a route to resolve the scope from a request flag or from
+    /// the membership: the worst case is the regular answer, never a narrower one.
     #[test]
     fn organization_admin_scope_is_a_superset_of_user_scope() {
         let members = [
@@ -1582,7 +1567,8 @@ mod tests {
             confirmed(MembershipType::Custom, false),
             confirmed(MembershipType::User, false),
             confirmed(MembershipType::User, true),
-            membership(MembershipType::Custom, MembershipStatus::Invited, true),
+            membership(MembershipType::Custom as i32, MembershipStatus::Invited, true),
+            membership(UNKNOWN_ATYPE, MembershipStatus::Confirmed, true),
         ];
 
         for member in &members {
@@ -1594,5 +1580,171 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+/// The scope decision as the database actually answers it.
+///
+/// The tests above pin the predicate; this one pins the query path that consumes it. It is the only
+/// place that shows a Custom member holding `Edit any collection` reaching a cipher they have no
+/// assignment for -- and not reaching it in the regular vault scope.
+#[cfg(all(test, sqlite))]
+mod db_scope_tests {
+    use super::{Cipher, CipherAccessScope};
+    use crate::db::models::UserId;
+    use crate::db::test_db::{TestDb, block_on};
+
+    /// Two organizations, and one cipher in each.
+    ///
+    /// `u_custom` is a confirmed Custom member of org 1 holding `Edit any collection`, with **no**
+    /// `users_collections` row and no group -- exactly the member whose administrative reach is not
+    /// backed by an assignment. `u_assigned` is the plain User the collection is actually assigned
+    /// to, so the fixture proves the cipher is reachable at all. `u_revoked` holds the same Custom
+    /// permission with a revoked membership.
+    const FIXTURE: &str = "
+        INSERT INTO collections (uuid, org_uuid, name) VALUES
+            ('col1', 'org1', 'c'),
+            ('col2', 'org2', 'c');
+        INSERT INTO ciphers (uuid, created_at, updated_at, organization_uuid, atype, name, data) VALUES
+            ('cipher1', '2026-01-01 00:00:00', '2026-01-01 00:00:00', 'org1', 1, 'n', '{}'),
+            ('cipher2', '2026-01-01 00:00:00', '2026-01-01 00:00:00', 'org2', 1, 'n', '{}');
+        INSERT INTO ciphers_collections (cipher_uuid, collection_uuid) VALUES
+            ('cipher1', 'col1'),
+            ('cipher2', 'col2');
+        INSERT INTO users_organizations (uuid, user_uuid, org_uuid, akey, status, atype, edit_any_collection) VALUES
+            ('m_custom',   'u_custom',   'org1', '', 2, 4, TRUE),
+            ('m_revoked',  'u_revoked',  'org1', '', -1, 4, TRUE),
+            ('m_assigned', 'u_assigned', 'org1', '', 2, 2, FALSE);
+        INSERT INTO users_collections (user_uuid, collection_uuid, read_only, hide_passwords, manage) VALUES
+            ('u_assigned', 'col1', FALSE, FALSE, FALSE);
+    ";
+
+    /// Only the tables the cipher access queries join.
+    const SCHEMA: &str = "
+        CREATE TABLE collections (
+            uuid TEXT NOT NULL PRIMARY KEY,
+            org_uuid TEXT NOT NULL,
+            name TEXT NOT NULL,
+            external_id TEXT
+        );
+        CREATE TABLE ciphers (
+            uuid TEXT NOT NULL PRIMARY KEY,
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL,
+            user_uuid TEXT,
+            organization_uuid TEXT,
+            key TEXT,
+            atype INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            notes TEXT,
+            fields TEXT,
+            data TEXT NOT NULL,
+            password_history TEXT,
+            deleted_at DATETIME,
+            reprompt INTEGER
+        );
+        CREATE TABLE ciphers_collections (
+            cipher_uuid TEXT NOT NULL,
+            collection_uuid TEXT NOT NULL,
+            PRIMARY KEY (cipher_uuid, collection_uuid)
+        );
+        CREATE TABLE users_collections (
+            user_uuid TEXT NOT NULL,
+            collection_uuid TEXT NOT NULL,
+            read_only BOOLEAN NOT NULL DEFAULT FALSE,
+            hide_passwords BOOLEAN NOT NULL DEFAULT FALSE,
+            manage BOOLEAN NOT NULL DEFAULT FALSE,
+            PRIMARY KEY (user_uuid, collection_uuid)
+        );
+        CREATE TABLE users_organizations (
+            uuid TEXT NOT NULL PRIMARY KEY,
+            user_uuid TEXT NOT NULL,
+            org_uuid TEXT NOT NULL,
+            invited_by_email TEXT,
+            akey TEXT NOT NULL,
+            status INTEGER NOT NULL,
+            atype INTEGER NOT NULL,
+            reset_password_key TEXT,
+            external_id TEXT,
+            manage_users BOOLEAN NOT NULL DEFAULT FALSE,
+            manage_groups BOOLEAN NOT NULL DEFAULT FALSE,
+            manage_policies BOOLEAN NOT NULL DEFAULT FALSE,
+            create_new_collections BOOLEAN NOT NULL DEFAULT FALSE,
+            edit_any_collection BOOLEAN NOT NULL DEFAULT FALSE,
+            delete_any_collection BOOLEAN NOT NULL DEFAULT FALSE,
+            access_event_logs BOOLEAN NOT NULL DEFAULT FALSE,
+            access_import_export BOOLEAN NOT NULL DEFAULT FALSE,
+            access_reports BOOLEAN NOT NULL DEFAULT FALSE
+        );
+    ";
+
+    /// A cipher in `org_uuid`, matching the seeded row of the same id.
+    fn cipher(uuid: &str, org_uuid: &str) -> Cipher {
+        let mut cipher = Cipher::new(1, String::from("n"));
+        cipher.uuid = uuid.to_owned().into();
+        cipher.organization_uuid = Some(org_uuid.to_owned().into());
+        cipher.data = String::from("{}");
+        cipher
+    }
+
+    #[test]
+    fn cipher_scope_is_enforced_against_the_database() {
+        let db = TestDb::new(&format!("{SCHEMA}{FIXTURE}"));
+
+        let own_org = cipher("cipher1", "org1");
+        let other_org = cipher("cipher2", "org2");
+        let custom: UserId = String::from("u_custom").into();
+        let revoked: UserId = String::from("u_revoked").into();
+        let assigned: UserId = String::from("u_assigned").into();
+
+        // `DbConn` has to be created *and* dropped inside the runtime: its `Drop` uses
+        // `spawn_blocking` to return the connection to the pool.
+        block_on(async {
+            let conn = db.conn();
+            // The fixture is meaningful: the cipher is reachable through a real assignment.
+            assert!(
+                own_org.is_accessible_to_user(&assigned, CipherAccessScope::User, &conn).await,
+                "the assigned member must reach the cipher, otherwise this fixture proves nothing"
+            );
+
+            // Custom + `Edit any collection`, with no assignment of its own: administrative reach...
+            assert!(
+                own_org.is_accessible_to_user(&custom, CipherAccessScope::OrganizationAdmin, &conn).await,
+                "Custom + EditAny must reach an unassigned org cipher on the administrative routes"
+            );
+            assert!(
+                own_org.is_write_accessible_to_user(&custom, CipherAccessScope::OrganizationAdmin, &conn).await,
+                "administrative reach includes writing"
+            );
+
+            // ...and nothing at all in the regular vault, which is what `/sync` and `GET /ciphers`
+            // answer from. A query that resolved the scope from the membership instead of from the
+            // route would make this true and hand the member the whole organization vault.
+            assert!(
+                !own_org.is_accessible_to_user(&custom, CipherAccessScope::User, &conn).await,
+                "Custom + EditAny must not reach an unassigned org cipher in the regular vault scope"
+            );
+            assert!(
+                !own_org.is_write_accessible_to_user(&custom, CipherAccessScope::User, &conn).await,
+                "Custom + EditAny must not write an unassigned org cipher in the regular vault scope"
+            );
+
+            // A revoked membership holds the same flag and reaches nothing, in either scope.
+            for scope in [CipherAccessScope::User, CipherAccessScope::OrganizationAdmin] {
+                assert!(
+                    !own_org.is_accessible_to_user(&revoked, scope, &conn).await,
+                    "a revoked membership must not reach org ciphers in any scope"
+                );
+            }
+
+            // Another organization's cipher stays out of reach even in the administrative scope:
+            // the authority is bound to the organization the membership belongs to.
+            for scope in [CipherAccessScope::User, CipherAccessScope::OrganizationAdmin] {
+                assert!(
+                    !other_org.is_accessible_to_user(&custom, scope, &conn).await,
+                    "a cipher of another organization must never be reachable"
+                );
+            }
+        });
     }
 }
