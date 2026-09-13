@@ -1031,11 +1031,7 @@ async fn assigned_org_ciphers_json(membership: &Membership, host: &str, conn: &D
 
     // Assigned ciphers keep the user's actual collection restrictions.
     for cipher in ciphers {
-        ciphers_json.push(
-            cipher
-                .to_json(host, user_id, Some(&cipher_sync_data), CipherSyncType::User, conn)
-                .await?,
-        );
+        ciphers_json.push(cipher.to_json(host, user_id, Some(&cipher_sync_data), CipherSyncType::User, conn).await?);
     }
 
     // Bitwarden exposes unassigned ciphers with full edit/password access to
@@ -1049,33 +1045,26 @@ async fn assigned_org_ciphers_json(membership: &Membership, host: &str, conn: &D
             // Use Organization serialization here so the normal user-access
             // assertion is deliberately skipped for this already-authorized
             // special case. Add the user-specific fields below explicitly.
-            let mut cipher_json = cipher
-                .to_json(
-                    host,
-                    user_id,
-                    Some(&cipher_sync_data),
-                    CipherSyncType::Organization,
-                    conn,
-                )
-                .await?;
+            let mut unassigned_cipher_json =
+                cipher.to_json(host, user_id, Some(&cipher_sync_data), CipherSyncType::Organization, conn).await?;
 
-            cipher_json["folderId"] = json!(cipher_sync_data.cipher_folders.get(&cipher.uuid).cloned());
-            cipher_json["favorite"] = json!(cipher_sync_data.cipher_favorites.contains(&cipher.uuid));
-            cipher_json["archivedDate"] = json!(
+            unassigned_cipher_json["folderId"] = json!(cipher_sync_data.cipher_folders.get(&cipher.uuid).cloned());
+            unassigned_cipher_json["favorite"] = json!(cipher_sync_data.cipher_favorites.contains(&cipher.uuid));
+            unassigned_cipher_json["archivedDate"] = json!(
                 cipher_sync_data
                     .cipher_archives
                     .get(&cipher.uuid)
                     .map_or(Value::Null, |date| Value::String(crate::util::format_date(date)))
             );
 
-            cipher_json["edit"] = json!(true);
-            cipher_json["viewPassword"] = json!(true);
-            cipher_json["permissions"] = json!({
+            unassigned_cipher_json["edit"] = json!(true);
+            unassigned_cipher_json["viewPassword"] = json!(true);
+            unassigned_cipher_json["permissions"] = json!({
                 "delete": true,
                 "restore": true,
             });
 
-            ciphers_json.push(cipher_json);
+            ciphers_json.push(unassigned_cipher_json);
         }
     }
 
