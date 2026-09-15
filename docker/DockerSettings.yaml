@@ -1,6 +1,15 @@
 ---
 vault_version: "v2026.7.0"
 vault_image_digest: "sha256:ba8bab66d4330ab9dbafa8f245bcbe99cf6ee3f2c8ce9b5fbb10e9c49658451c"
+# TEST BUILD ONLY - not part of PR #7534.
+# The stock web vault, docker.io/vaultwarden/web-vault at the digest above, does not carry the
+# "Device approvals" page of the organization settings: upstream keeps it in the licensed part of
+# bitwarden/clients, so no AGPL build has it and the endpoints of this branch have no caller.
+# This is the same web vault, v2026.7.0, built from tom27052006/vw_web_builds @
+# feature/device-approvals-v2026.7.0 with that page added, through the ordinary
+# dani-garcia/bw_web_builds structure with only its checkout step pointed at that branch.
+# It is built locally and cannot be pulled, so build it before this image.
+vault_image: "tom27052006/web-vault:tde-v2026.7.0-c76f4418"
 # Cross Compile Docker Helper Scripts v1.9.0
 # We use the linux/amd64 platform shell scripts since there is no difference between the different platform scripts
 # https://github.com/tonistiigi/xx | https://hub.docker.com/r/tonistiigi/xx/tags
