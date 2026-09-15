@@ -9,7 +9,7 @@ vault_image_digest: "sha256:ba8bab66d4330ab9dbafa8f245bcbe99cf6ee3f2c8ce9b5fbb10
 # feature/device-approvals-v2026.7.0 with that page added, through the ordinary
 # dani-garcia/bw_web_builds structure with only its checkout step pointed at that branch.
 # It is built locally and cannot be pulled, so build it before this image.
-vault_image: "tom27052006/web-vault:tde-v2026.7.0-c76f4418"
+vault_image: "tom27052006/web-vault:tde-v2026.7.0-54dd44fa"
 # Cross Compile Docker Helper Scripts v1.9.0
 # We use the linux/amd64 platform shell scripts since there is no difference between the different platform scripts
 # https://github.com/tonistiigi/xx | https://hub.docker.com/r/tonistiigi/xx/tags
