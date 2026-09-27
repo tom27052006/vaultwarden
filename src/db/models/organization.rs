@@ -215,7 +215,7 @@ impl Organization {
             "selfHost": true,
             "useApi": true,
             "useDisableSMAdsForUsers": true, // Hide Secrets Manager ads
-            "useInviteLinks": true,
+            "useInviteLinks": OrgInviteLink::is_available(),
             "useMyItems": false, // Not (yet) supported
             "useOrganizationDomains": false, // Not supported (Linked to SSO)
             "usePam": false, // Not supported
@@ -492,7 +492,7 @@ impl Membership {
             "useAdminSponsoredFamilies": false,
             "useRiskInsights": false, // Not supported (Not AGPLv3 Licensed)
             "useDisableSMAdsForUsers": true, // Hide Secrets Manager ads
-            "useInviteLinks": true,
+            "useInviteLinks": OrgInviteLink::is_available(),
             "useMyItems": false, // Not (yet) supported
             "useOrganizationDomains": false, // Not supported (Linked to SSO)
             "usePam": false, // Not supported
@@ -745,8 +745,11 @@ impl Membership {
     pub async fn insert_new(&self, conn: &DbConn) -> ApiResult<bool> {
         User::update_uuid_revision(&self.user_uuid, conn).await;
 
+        // In a transaction, which is a savepoint inside one. On PostgreSQL a failed statement aborts the transaction.
         let inserted: EmptyResult = conn
-            .run(move |conn| diesel::insert_into(users_organizations::table).values(self).execute(conn))
+            .run(move |conn| {
+                conn.transaction(|conn| diesel::insert_into(users_organizations::table).values(self).execute(conn))
+            })
             .await
             .map_res("Error adding user to organization");
         if inserted.is_err() && Self::find_by_user_and_org(&self.user_uuid, &self.org_uuid, conn).await.is_some() {

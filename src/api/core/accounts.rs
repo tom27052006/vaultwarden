@@ -245,15 +245,19 @@ fn enforce_password_hint_setting(password_hint: Option<&String>) -> EmptyResult 
     }
     Ok(())
 }
+/// Whether a user registering with a verified address gets email 2FA: if the organization of their invitation requires
+/// 2FA, or with `EMAIL_2FA_ENFORCE_ON_VERIFIED_INVITE` if they register through an invitation at all. `invited` means
+/// the user existed before, as invitations create the user, `open_invite_org` a checked invite link.
 async fn is_email_2fa_required(
     member_id: Option<MembershipId>,
     open_invite_org: Option<&OrganizationId>,
+    invited: bool,
     conn: &DbConn,
 ) -> bool {
     if !CONFIG._enable_email_2fa() {
         return false;
     }
-    if CONFIG.email_2fa_enforce_on_verified_invite() {
+    if CONFIG.email_2fa_enforce_on_verified_invite() && (invited || open_invite_org.is_some()) {
         return true;
     }
     if let Some(member_id) = member_id {
@@ -340,10 +344,12 @@ pub async fn register(data: Json<RegisterData>, email_verification: bool, conn: 
         }
     }
 
-    // An invite link stands in for an allowed signup like an email invitation, but only for a verified address
-    let invite_allows_signup = match &data.open_org_invite {
-        Some(invite) if email_verification => invite.allows_signup(&email, &conn).await? && email_verified,
-        _ => false,
+    // An invite link stands in for an allowed signup like an email invitation, but only for a verified address.
+    // `allows_signup` fails for a link which can't be used with the address.
+    let open_invite = data.open_org_invite.as_ref().filter(|_| email_verification);
+    let invite_allows_signup = match open_invite {
+        Some(invite) => invite.allows_signup(&email, &conn).await? && email_verified,
+        None => false,
     };
 
     // Check if the length of the username exceeds 50 characters (Same is Upstream Bitwarden)
@@ -359,7 +365,9 @@ pub async fn register(data: Json<RegisterData>, email_verification: bool, conn: 
     let password_hint = clean_password_hint(data.master_password_hint.as_ref());
     enforce_password_hint_setting(password_hint.as_ref())?;
 
-    let mut user = match User::find_by_mail(&email, &conn).await {
+    let existing_user = User::find_by_mail(&email, &conn).await;
+    let invited = existing_user.is_some();
+    let mut user = match existing_user {
         Some(user) => {
             if !user.password_hash.is_empty() {
                 err!("Registration not allowed or user already exists")
@@ -439,10 +447,10 @@ pub async fn register(data: Json<RegisterData>, email_verification: bool, conn: 
     user.save(&conn).await?;
 
     // Only once the user is stored, as a user registering through an invite link is new
-    let open_invite_org = data.open_org_invite.as_ref().map(OpenOrgInvite::org_id);
+    let open_invite_org = open_invite.map(OpenOrgInvite::org_id);
     if CONFIG.mail_enabled()
         && email_verified
-        && is_email_2fa_required(data.organization_user_id, open_invite_org, &conn).await
+        && is_email_2fa_required(data.organization_user_id, open_invite_org, invited, &conn).await
     {
         email::activate_email_2fa(&user, &conn).await.ok();
     }

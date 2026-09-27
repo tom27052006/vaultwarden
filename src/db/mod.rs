@@ -450,6 +450,69 @@ pub async fn get_sql_server_version(conn: &DbConn) -> String {
     }
 }
 
+impl DbConn {
+    /// Runs `f` in a transaction which first locks the row of the user, so these transactions run one after another
+    /// for the same user and each one sees what the ones before it stored. PostgreSQL and MySQL lock the row with
+    /// `SELECT ... FOR UPDATE`, SQLite has no row locks and takes the write lock of the database with `BEGIN IMMEDIATE`.
+    /// `f` has to run all its queries on this connection. The transaction is committed if `f` succeeds and rolled back
+    /// otherwise. If `f` panics or is dropped, diesel reports the connection with the open transaction as broken, so
+    /// the pool closes it.
+    pub async fn run_locked_for_user<R>(
+        &self,
+        user_uuid: &models::UserId,
+        f: impl Future<Output = Result<R, Error>>,
+    ) -> Result<R, Error> {
+        use diesel::{
+            ExpressionMethods, QueryDsl,
+            connection::{AnsiTransactionManager, TransactionManager},
+        };
+        use schema::users;
+
+        let conn = self;
+        db_run! { conn:
+            sqlite {
+                AnsiTransactionManager::begin_transaction_sql(conn, "BEGIN IMMEDIATE")
+            }
+            mysql, postgresql {
+                AnsiTransactionManager::begin_transaction(conn)
+            }
+        }
+        .map_res("Error starting transaction")?;
+
+        let result = async {
+            db_run! { conn:
+                sqlite {
+                    // `BEGIN IMMEDIATE` already locked the database
+                    users::table.filter(users::uuid.eq(user_uuid)).select(users::uuid).first::<models::UserId>(conn)
+                }
+                mysql, postgresql {
+                    users::table
+                        .filter(users::uuid.eq(user_uuid))
+                        .select(users::uuid)
+                        .for_update()
+                        .first::<models::UserId>(conn)
+                }
+            }
+            .map_res("Error locking user")?;
+            f.await
+        }
+        .await;
+
+        let commit = result.is_ok();
+        let ended = db_run! { conn:
+            sqlite, mysql, postgresql {
+                if commit {
+                    AnsiTransactionManager::commit_transaction(conn)
+                } else {
+                    AnsiTransactionManager::rollback_transaction(conn)
+                }
+            }
+        };
+        // If the rollback failed, diesel reports the connection as broken as well
+        result.and_then(|r| ended.map(|()| r).map_res("Error committing transaction"))
+    }
+}
+
 /// Attempts to retrieve a single connection from the managed database pool. If
 /// no pool is currently managed, fails with an `InternalServerError` status. If
 /// no connections are available, fails with a `ServiceUnavailable` status.

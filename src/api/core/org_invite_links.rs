@@ -189,14 +189,20 @@ async fn find_org_link(org_id: &OrganizationId, headers: &AdminHeaders, conn: &D
     if org_id != &headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
-    let Some(link) = OrgInviteLink::find_by_org(org_id, conn).await? else {
-        err_code!(NOT_FOUND, Status::NotFound.code)
-    };
-    Ok(link)
+    match OrgInviteLink::find_by_org(org_id, conn).await? {
+        Some(link) => Ok(link),
+        // The code can't be decrypted, which `find_by_org` logged
+        None if OrgInviteLink::exists_for_org(org_id, conn).await? => {
+            err!(
+                "This invite link can no longer be used because the server's keys changed. Delete it and create a new one."
+            )
+        }
+        None => err_code!(NOT_FOUND, Status::NotFound.code),
+    }
 }
 
 async fn conflict_if_link_exists(org_id: &OrganizationId, conn: &DbConn) -> EmptyResult {
-    if OrgInviteLink::find_by_org(org_id, conn).await?.is_some() {
+    if OrgInviteLink::exists_for_org(org_id, conn).await? {
         err_code!("An invite link already exists for this organization.", Status::Conflict.code)
     }
     Ok(())
@@ -216,6 +222,9 @@ async fn create_invite_link(
 ) -> ApiResult<status::Created<Json<Value>>> {
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
+    }
+    if !OrgInviteLink::is_available() {
+        err!("Invite links need email to be configured on this server, to verify the email addresses of new users.")
     }
     let data = data.into_inner();
     let domains = OrgInviteLink::clean_domains(data.allowed_domains)?;
@@ -285,9 +294,14 @@ async fn delete_invite_link(
     headers: AdminHeaders,
     conn: DbConn,
 ) -> ApiResult<status::NoContent> {
-    find_org_link(&org_id, &headers, &conn).await?;
-    // Members who joined through the link stay members
-    OrgInviteLink::delete_all_by_organization(&org_id, &conn).await?;
+    if org_id != headers.org_id {
+        err!("Organization not found", "Organization id's do not match");
+    }
+    // Without decrypting the code, so a link whose code can't be decrypted anymore can be deleted too.
+    // Members who joined through the link stay members.
+    if !OrgInviteLink::delete_all_by_organization(&org_id, &conn).await? {
+        err_code!(NOT_FOUND, Status::NotFound.code)
+    }
 
     headers.log_event(EventType::OrganizationInviteLinkDeleted, &org_id, &org_id, &conn).await;
     Ok(status::NoContent)
@@ -401,7 +415,8 @@ async fn joining_member(
 }
 
 /// Checks the policies of the organization and stores the joined membership. Nothing is stored if a check fails,
-/// and a concurrent request can neither create a second membership nor get a revocation undone.
+/// and a concurrent request can neither create a second membership nor get a revocation undone. The joins of a user
+/// run one after another, so the SingleOrg checks of each one see the memberships the joins before it stored.
 async fn save_joined_member(
     member: &mut Membership,
     previous_status: Option<i32>,
@@ -410,40 +425,46 @@ async fn save_joined_member(
     org: &Organization,
     conn: &DbConn,
 ) -> EmptyResult {
-    // The checks of `OrgPolicy::check_user_allowed`, in the order and with the messages of upstream
-    let violations = OrgPolicy::find_violations(member, conn).await;
-    if violations.contains(&PolicyViolation::SingleOrgOther) {
-        err!(
-            "Member cannot join this organization's vault because they are a member of another organization which forbids it."
-        )
-    }
-    if violations.contains(&PolicyViolation::SingleOrgThis) {
-        err!("Member cannot join this organization vault until they leave all other organization vaults.")
-    }
-    let activate_email_2fa = violations.contains(&PolicyViolation::TwoFactorMissing);
-    if activate_email_2fa && !CONFIG.email_2fa_auto_fallback() {
-        err!("You cannot join this organization vault until you enable two-step login on your user account.")
-    }
+    let auto_enroll = conn
+        .run_locked_for_user(&headers.user.uuid, async {
+            // The checks of `OrgPolicy::check_user_allowed`, in the order and with the messages of upstream
+            let violations = OrgPolicy::find_violations(member, conn).await;
+            if violations.contains(&PolicyViolation::SingleOrgOther) {
+                err!(
+                    "Member cannot join this organization's vault because they are a member of another organization which forbids it."
+                )
+            }
+            if violations.contains(&PolicyViolation::SingleOrgThis) {
+                err!("Member cannot join this organization vault until they leave all other organization vaults.")
+            }
+            let activate_email_2fa = violations.contains(&PolicyViolation::TwoFactorMissing);
+            if activate_email_2fa && !CONFIG.email_2fa_auto_fallback() {
+                err!("You cannot join this organization vault until you enable two-step login on your user account.")
+            }
 
-    // Like upstream, the recovery key is only required and stored when the organization enrolls members automatically
-    let auto_enroll = OrgPolicy::org_is_reset_password_auto_enroll(&org.uuid, conn).await;
-    if auto_enroll {
-        match reset_password_key {
-            Some(key) if !key.trim().is_empty() => member.reset_password_key = Some(key),
-            _ => err!("Master Password reset is required, but not provided."),
-        }
-    }
+            // Like upstream, the recovery key is only required and stored when the organization enrolls members
+            // automatically
+            let auto_enroll = OrgPolicy::org_is_reset_password_auto_enroll(&org.uuid, conn).await;
+            if auto_enroll {
+                match reset_password_key {
+                    Some(key) if !key.trim().is_empty() => member.reset_password_key = Some(key),
+                    _ => err!("Master Password reset is required, but not provided."),
+                }
+            }
 
-    if activate_email_2fa {
-        email::activate_email_2fa(&headers.user, conn).await?;
-    }
-    let saved = match previous_status {
-        Some(status) => member.update_status_if(status, conn).await?,
-        None => member.insert_new(conn).await?,
-    };
-    if !saved {
-        err!(format!("You're already a member of {}.", org.name))
-    }
+            if activate_email_2fa {
+                email::activate_email_2fa(&headers.user, conn).await?;
+            }
+            let saved = match previous_status {
+                Some(status) => member.update_status_if(status, conn).await?,
+                None => member.insert_new(conn).await?,
+            };
+            if !saved {
+                err!(format!("You're already a member of {}.", org.name))
+            }
+            Ok(auto_enroll)
+        })
+        .await?;
 
     if auto_enroll {
         log_member_event(EventType::OrganizationUserResetPasswordEnroll, member, headers, conn).await;

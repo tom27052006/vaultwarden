@@ -27,7 +27,7 @@ use crate::{
     config::INVITE_LINK_AUTO_CONFIRM_FEATURE,
     db::{
         DbConn,
-        models::{Membership, MembershipStatus, OrgPolicy, Organization, User},
+        models::{Membership, MembershipStatus, OrgInviteLink, OrgPolicy, Organization, User},
     },
     error::Error,
     http_client::make_http_request,
@@ -225,7 +225,8 @@ fn config(client_version: OptionalClientVersion) -> Json<Value> {
     );
     feature_states.insert("pm-19148-innovation-archive".to_owned(), true);
     // Organization invite links. Older web vaults only have the admin part, without a way to join through the link.
-    let invite_links = client_version.0.is_some_and(|v| semver::VersionReq::parse(">=2026.8.1").unwrap().matches(&v));
+    let invite_links = OrgInviteLink::is_available()
+        && client_version.0.is_some_and(|v| semver::VersionReq::parse(">=2026.8.1").unwrap().matches(&v));
     feature_states.insert("pm-32497-generate-invite-link".to_owned(), invite_links);
     feature_states.entry(INVITE_LINK_AUTO_CONFIRM_FEATURE.to_owned()).or_insert(false);
 

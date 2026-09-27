@@ -5,6 +5,7 @@ use diesel::prelude::*;
 use serde_json::Value;
 
 use crate::{
+    CONFIG,
     api::{ApiResult, EmptyResult},
     crypto,
     db::{DbConn, schema::org_invite_links},
@@ -38,6 +39,12 @@ impl OrgInviteLink {
     /// The largest valid list still fits in MySQL/MariaDB TEXT even if every domain is 253 ASCII bytes:
     /// `255 * (253 + JSON quotes/comma) + brackets == 65_281` bytes, below the 65_535-byte limit.
     pub const MAX_ALLOWED_DOMAINS: usize = 255;
+
+    /// Whether this server can offer invite links. Joining through one needs a verified email address, which a new
+    /// user only gets through the verification email.
+    pub fn is_available() -> bool {
+        CONFIG.mail_enabled()
+    }
 
     pub fn new(org_uuid: OrganizationId, allowed_domains: String, invite: String, supports_confirmation: bool) -> Self {
         let now = Utc::now().naive_utc();
@@ -164,17 +171,41 @@ fn email_domain(email: &str) -> Option<String> {
 
 /// Database methods
 impl OrgInviteLink {
+    /// The link of the organization. A link whose code can't be decrypted counts as no link, as the key protecting
+    /// the codes is derived from `rsa_key.pem`: replacing that file leaves links which can only be deleted.
     pub async fn find_by_org(org_uuid: &OrganizationId, conn: &DbConn) -> ApiResult<Option<Self>> {
+        let link = conn
+            .run(move |conn| {
+                org_invite_links::table
+                    .filter(org_invite_links::org_uuid.eq(org_uuid))
+                    .first::<Self>(conn)
+                    .optional()
+                    .map_res("Error finding organization invite link")
+            })
+            .await?;
+        Ok(link.and_then(|link| {
+            link.unprotect_code()
+                .inspect_err(|e| {
+                    error!(
+                        "The code of the invite link of organization {org_uuid} can't be decrypted ({e:?}). It was probably \
+                        protected with a different rsa_key.pem, the link can only be deleted and a new one created."
+                    );
+                })
+                .ok()
+        }))
+    }
+
+    /// Whether the organization has a link, also one whose code can't be decrypted
+    pub async fn exists_for_org(org_uuid: &OrganizationId, conn: &DbConn) -> ApiResult<bool> {
         conn.run(move |conn| {
             org_invite_links::table
                 .filter(org_invite_links::org_uuid.eq(org_uuid))
-                .first::<Self>(conn)
-                .optional()
+                .count()
+                .first::<i64>(conn)
+                .map(|count| count > 0)
                 .map_res("Error finding organization invite link")
         })
-        .await?
-        .map(Self::unprotect_code)
-        .transpose()
+        .await
     }
 
     /// Fails if the organization already has a link, the unique index also covers concurrent requests
@@ -237,10 +268,12 @@ impl OrgInviteLink {
         .await
     }
 
-    pub async fn delete_all_by_organization(org_uuid: &OrganizationId, conn: &DbConn) -> EmptyResult {
+    /// Deletes the link without decrypting its code, returns whether there was one
+    pub async fn delete_all_by_organization(org_uuid: &OrganizationId, conn: &DbConn) -> ApiResult<bool> {
         conn.run(move |conn| {
             diesel::delete(org_invite_links::table.filter(org_invite_links::org_uuid.eq(org_uuid)))
                 .execute(conn)
+                .map(|rows| rows > 0)
                 .map_res("Error deleting invite link")
         })
         .await
