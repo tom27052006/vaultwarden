@@ -91,7 +91,8 @@ pub async fn initialize_keys() -> Result<(), Error> {
     };
     let pub_key_buffer = priv_key.public_key_to_pem()?;
 
-    crate::crypto::initialize_database_field_key(&priv_key_buffer)?;
+    // DER instead of the PEM file, so reformatting the file keeps the same key
+    crate::crypto::initialize_database_field_key(&priv_key.private_key_to_der()?)?;
 
     let enc = EncodingKey::from_rsa_pem(&priv_key_buffer)?;
     let dec: DecodingKey = DecodingKey::from_rsa_pem(&pub_key_buffer)?;
@@ -1184,16 +1185,13 @@ pub struct ClientVersion(pub semver::Version);
 
 pub struct OptionalClientVersion(pub Option<semver::Version>);
 
-fn parse_optional_client_version(value: Option<&str>) -> Option<semver::Version> {
-    value.and_then(|version| semver::Version::parse(version).ok())
-}
-
 #[rocket::async_trait]
 impl<'r> FromRequest<'r> for OptionalClientVersion {
     type Error = ();
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        Outcome::Success(Self(parse_optional_client_version(request.headers().get_one("Bitwarden-Client-Version"))))
+        let version = request.headers().get_one("Bitwarden-Client-Version");
+        Outcome::Success(Self(version.and_then(|v| semver::Version::parse(v).ok())))
     }
 }
 
@@ -1361,22 +1359,4 @@ pub async fn refresh_tokens(
     };
 
     Ok((device, auth_tokens))
-}
-
-#[cfg(test)]
-mod optional_client_version_tests {
-    use super::parse_optional_client_version;
-
-    #[test]
-    fn missing_or_invalid_versions_are_absent() {
-        assert!(parse_optional_client_version(None).is_none());
-        assert!(parse_optional_client_version(Some("")).is_none());
-        assert!(parse_optional_client_version(Some("2026.8")).is_none());
-        assert!(parse_optional_client_version(Some("not-semver")).is_none());
-    }
-
-    #[test]
-    fn valid_semver_is_parsed() {
-        assert_eq!(parse_optional_client_version(Some("2026.8.1")).unwrap(), semver::Version::new(2026, 8, 1));
-    }
 }

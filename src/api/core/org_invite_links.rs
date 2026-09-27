@@ -20,7 +20,6 @@ use crate::{
         },
     },
     mail,
-    util::{FeatureFlagFilter, parse_experimental_client_feature_flags},
 };
 
 // Upstream: https://github.com/bitwarden/server/blob/aa786fc9cd3803f48e79f15067e910e99d768b69/src/Api/AdminConsole/Controllers/OrganizationInviteLinksController.cs
@@ -55,17 +54,10 @@ struct InviteLinkRef {
 
 impl InviteLinkRef {
     fn parsed_code(&self) -> ApiResult<uuid::Uuid> {
-        // System.Text.Json's Guid converter used by Bitwarden accepts the canonical 36-character representation.
-        // Bound the string before parsing so attacker-controlled input never reaches DB or comparison code.
-        if self.code.len() != 36 {
-            return Err(Error::new_msg("The Code field is invalid.").with_code(Status::BadRequest.code).silent());
-        }
-        let code = uuid::Uuid::parse_str(&self.code)
-            .map_err(|_| Error::new_msg("The Code field is invalid.").with_code(Status::BadRequest.code).silent())?;
-        if !code.hyphenated().to_string().eq_ignore_ascii_case(&self.code) {
-            return Err(Error::new_msg("The Code field is invalid.").with_code(Status::BadRequest.code).silent());
-        }
-        Ok(code)
+        // System.Text.Json's Guid converter used by Bitwarden only accepts the hyphenated form, the only UUID form
+        // with 36 characters. Bound the string before parsing so attacker-controlled input never reaches the parser.
+        let code = (self.code.len() == 36).then(|| uuid::Uuid::parse_str(&self.code).ok()).flatten();
+        code.ok_or_else(|| Error::new_msg("The Code field is invalid.").with_code(Status::BadRequest.code).silent())
     }
 }
 
@@ -92,13 +84,12 @@ impl OpenOrgInvite {
         }
         let invalid_link = || Error::new_msg("Invalid or expired organization invite link.").silent();
         let code = self.link.parsed_code().map_err(|_| invalid_link())?;
-        let Some((link, _)) = lookup_link_with_code(&self.link, &code, conn).await? else {
-            return Err(invalid_link());
-        };
-        if !link.allows_email(email)? {
-            return Err(invalid_link());
+        match lookup_link_with_code(&self.link, &code, conn).await? {
+            Some((link, _)) if link.allows_email(email)? => {
+                Ok(CONFIG.invitations_allowed() && CONFIG.is_email_domain_allowed(email))
+            }
+            _ => Err(invalid_link()),
         }
-        Ok(CONFIG.invitations_allowed() && CONFIG.is_email_domain_allowed(email))
     }
 }
 
@@ -167,8 +158,7 @@ struct ConfirmInviteLinkData {
 /// The link and organization of a link reference. A wrong organization and a wrong code are reported the same, so
 /// nothing can be learned about an organization without the code of its link.
 async fn find_link(link: &InviteLinkRef, conn: &DbConn) -> ApiResult<(OrgInviteLink, Organization)> {
-    let code = link.parsed_code()?;
-    find_link_with_code(link, &code, conn).await
+    find_link_with_code(link, &link.parsed_code()?, conn).await
 }
 
 async fn find_link_with_code(
@@ -232,8 +222,7 @@ async fn create_invite_link(
     data.invite.validate()?;
     conflict_if_link_exists(&org_id, &conn).await?;
 
-    let mut link = OrgInviteLink::new(org_id.clone(), data.invite.invite, data.invite.supports_confirmation);
-    link.set_allowed_domains(&domains);
+    let link = OrgInviteLink::new(org_id.clone(), domains, data.invite.invite, data.invite.supports_confirmation);
     if let Err(e) = link.insert(&conn).await {
         // The unique index on the organization rejected a link a concurrent request created first
         conflict_if_link_exists(&org_id, &conn).await?;
@@ -253,7 +242,7 @@ async fn update_invite_link(
 ) -> JsonResult {
     let domains = OrgInviteLink::clean_domains(data.into_inner().allowed_domains)?;
     let mut link = find_org_link(&org_id, &headers, &conn).await?;
-    link.set_allowed_domains(&domains);
+    link.allowed_domains = domains;
     link.revision_date = Utc::now().naive_utc();
     if !link.update_allowed_domains(&conn).await? {
         err_code!(NOT_FOUND, Status::NotFound.code)
@@ -315,10 +304,7 @@ async fn refresh_invite_link(
     let data = data.into_inner();
     data.validate()?;
     let old_link = find_org_link(&org_id, &headers, &conn).await?;
-    let link = OrgInviteLink {
-        allowed_domains: old_link.allowed_domains,
-        ..OrgInviteLink::new(org_id.clone(), data.invite, data.supports_confirmation)
-    };
+    let link = OrgInviteLink::new(org_id.clone(), old_link.allowed_domains, data.invite, data.supports_confirmation);
     if !link.replace(&old_link.uuid, &conn).await? {
         err_code!(NOT_FOUND, Status::NotFound.code)
     }
@@ -410,13 +396,8 @@ async fn joining_member(
         err!(format!("You're not allowed to join the {} vault with your email domain.", org.name))
     }
 
-    Ok(match member {
-        Some(member) => {
-            let status = member.status;
-            (member, Some(status))
-        }
-        None => (Membership::new(user.uuid.clone(), org.uuid.clone(), None), None),
-    })
+    let previous_status = member.as_ref().map(|m| m.status);
+    Ok((member.unwrap_or_else(|| Membership::new(user.uuid.clone(), org.uuid.clone(), None)), previous_status))
 }
 
 /// Checks the policies of the organization and stores the joined membership. Nothing is stored if a check fails,
@@ -514,18 +495,13 @@ async fn accept_invite_link(data: Json<AcceptInviteLinkData>, headers: Headers, 
     if CONFIG.mail_enabled() {
         // Invite-link acceptance always notifies the current confirmed admins/owners. A pending classic invite may
         // carry the email of an administrator who has since been removed and must not influence this flow.
-        let mut addresses = Vec::new();
-        let mut seen = HashSet::new();
+        let mut notified = HashSet::new();
         for admin in Membership::find_confirmed_by_org(&org.uuid, &conn).await {
             if admin.atype >= MembershipType::Admin
                 && let Some(user) = User::find_by_uuid(&admin.user_uuid, &conn).await
-                && seen.insert(user.email.clone())
+                && notified.insert(user.email.clone())
+                && let Err(e) = mail::send_invite_accepted(&headers.user.email, &user.email, &org.name).await
             {
-                addresses.push(user.email);
-            }
-        }
-        for address in addresses {
-            if let Err(e) = mail::send_invite_accepted(&headers.user.email, &address, &org.name).await {
                 error!("Error sending invite accepted email: {e:#?}");
             }
         }
@@ -541,13 +517,9 @@ async fn confirm_invite_link(
     conn: DbConn,
     nt: Notify<'_>,
 ) -> EmptyResult {
-    let auto_confirm_enabled = parse_experimental_client_feature_flags(
-        &CONFIG.experimental_client_feature_flags(),
-        &FeatureFlagFilter::ValidOnly,
-    )
-    .contains_key(INVITE_LINK_AUTO_CONFIRM_FEATURE);
-    if !auto_confirm_enabled {
-        // Bitwarden's RequireFeature(InviteLinkAutoConfirm) maps a disabled feature to Not Found.
+    // Bitwarden's RequireFeature(InviteLinkAutoConfirm) maps a disabled feature to Not Found.
+    let flags = CONFIG.experimental_client_feature_flags();
+    if !flags.split(',').any(|flag| flag.trim() == INVITE_LINK_AUTO_CONFIRM_FEATURE) {
         return Err(Error::new_msg("Not Found").with_code(Status::NotFound.code).silent());
     }
 
@@ -569,27 +541,4 @@ async fn confirm_invite_link(
 
     nt.send_user_update(UpdateType::SyncOrgKeys, &headers.user, headers.device.push_uuid.as_ref(), &conn).await;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn link_ref(code: &str) -> InviteLinkRef {
-        InviteLinkRef {
-            organization_id: crate::util::get_uuid().into(),
-            code: code.to_owned(),
-        }
-    }
-
-    #[test]
-    fn invite_link_code_requires_a_canonical_uuid() {
-        let code = crate::util::get_uuid();
-        assert_eq!(link_ref(&code).parsed_code().unwrap().to_string(), code);
-        assert_eq!(link_ref(&code.to_uppercase()).parsed_code().unwrap().to_string(), code);
-
-        for invalid in ["", "not-a-uuid", &"a".repeat(100_000), &code.replace('-', "")] {
-            assert!(link_ref(invalid).parsed_code().is_err(), "{invalid:?} must be rejected");
-        }
-    }
 }

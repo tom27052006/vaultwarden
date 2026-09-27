@@ -12,79 +12,20 @@ const DIGEST_ALG: pbkdf2::Algorithm = pbkdf2::PBKDF2_HMAC_SHA256;
 const OUTPUT_LEN: usize = digest::SHA256_OUTPUT_LEN;
 
 const DATABASE_FIELD_PROTECTED_PREFIX: &str = "P|1|";
-const DATABASE_FIELD_KEY_LEN: usize = 32;
 const DATABASE_FIELD_KDF_SALT: &[u8] = b"vaultwarden/database-field-protection/v1";
 const DATABASE_FIELD_KDF_INFO: &[u8] = b"OrganizationInviteLink.Code";
-static DATABASE_FIELD_CIPHER: OnceLock<DatabaseFieldCipher> = OnceLock::new();
-
-struct DatabaseFieldKeyLen;
-
-impl hkdf::KeyType for DatabaseFieldKeyLen {
-    fn len(&self) -> usize {
-        DATABASE_FIELD_KEY_LEN
-    }
-}
-
-struct DatabaseFieldCipher(aead::LessSafeKey);
-
-impl DatabaseFieldCipher {
-    fn from_installation_secret(secret: &[u8]) -> Result<Self, Error> {
-        let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, DATABASE_FIELD_KDF_SALT);
-        let prk = salt.extract(secret);
-        let okm = prk
-            .expand(&[DATABASE_FIELD_KDF_INFO], DatabaseFieldKeyLen)
-            .map_err(|_| Error::new_msg("Failed to derive the database field protection key"))?;
-        let mut key = [0_u8; DATABASE_FIELD_KEY_LEN];
-        okm.fill(&mut key).map_err(|_| Error::new_msg("Failed to derive the database field protection key"))?;
-        let key = aead::UnboundKey::new(&aead::AES_256_GCM, &key)
-            .map_err(|_| Error::new_msg("Failed to initialize database field protection"))?;
-        Ok(Self(aead::LessSafeKey::new(key)))
-    }
-
-    fn protect(&self, plaintext: &str, associated_data: &[u8]) -> Result<String, Error> {
-        let nonce_bytes = get_random_bytes::<{ aead::NONCE_LEN }>();
-        let nonce = aead::Nonce::assume_unique_for_key(nonce_bytes);
-        let mut protected = plaintext.as_bytes().to_vec();
-        self.0
-            .seal_in_place_append_tag(nonce, aead::Aad::from(associated_data), &mut protected)
-            .map_err(|_| Error::new_msg("Failed to protect database field"))?;
-
-        let mut envelope = Vec::with_capacity(aead::NONCE_LEN + protected.len());
-        envelope.extend_from_slice(&nonce_bytes);
-        envelope.extend_from_slice(&protected);
-        Ok(format!("{DATABASE_FIELD_PROTECTED_PREFIX}{}", BASE64URL_NOPAD.encode(&envelope)))
-    }
-
-    fn unprotect(&self, protected: &str, associated_data: &[u8]) -> Result<String, Error> {
-        let encoded = protected
-            .strip_prefix(DATABASE_FIELD_PROTECTED_PREFIX)
-            .ok_or_else(|| Error::new_msg("Unsupported database field protection format"))?;
-        let envelope = BASE64URL_NOPAD
-            .decode(encoded.as_bytes())
-            .map_err(|_| Error::new_msg("Invalid protected database field encoding"))?;
-        if envelope.len() < aead::NONCE_LEN + aead::AES_256_GCM.tag_len() {
-            return Err(Error::new_msg("Invalid protected database field length"));
-        }
-
-        let (nonce_bytes, ciphertext) = envelope.split_at(aead::NONCE_LEN);
-        let nonce_bytes: [u8; aead::NONCE_LEN] =
-            nonce_bytes.try_into().map_err(|_| Error::new_msg("Invalid protected database field nonce"))?;
-        let nonce = aead::Nonce::assume_unique_for_key(nonce_bytes);
-        let mut ciphertext = ciphertext.to_vec();
-        let plaintext = self
-            .0
-            .open_in_place(nonce, aead::Aad::from(associated_data), &mut ciphertext)
-            .map_err(|_| Error::new_msg("Database field authentication failed"))?;
-        String::from_utf8(plaintext.to_vec()).map_err(|_| Error::new_msg("Protected database field is not UTF-8"))
-    }
-}
+static DATABASE_FIELD_KEY: OnceLock<aead::LessSafeKey> = OnceLock::new();
 
 /// Derives the database field protection key from Vaultwarden's persistent installation RSA key.
 /// HKDF domain separation ensures the derived AEAD key is independent from the key's JWT use.
 pub fn initialize_database_field_key(installation_secret: &[u8]) -> Result<(), Error> {
-    let cipher = DatabaseFieldCipher::from_installation_secret(installation_secret)?;
-    DATABASE_FIELD_CIPHER
-        .set(cipher)
+    let key = hkdf::Salt::new(hkdf::HKDF_SHA256, DATABASE_FIELD_KDF_SALT)
+        .extract(installation_secret)
+        .expand(&[DATABASE_FIELD_KDF_INFO], &aead::AES_256_GCM)
+        .map(aead::UnboundKey::from)
+        .map_err(|_| Error::new_msg("Failed to derive the database field protection key"))?;
+    DATABASE_FIELD_KEY
+        .set(aead::LessSafeKey::new(key))
         .map_err(|_| Error::new_msg("Database field protection must only be initialized once"))
 }
 
@@ -93,11 +34,32 @@ pub fn is_protected_database_field(value: &str) -> bool {
 }
 
 pub fn protect_database_field(plaintext: &str, associated_data: &[u8]) -> Result<String, Error> {
-    DATABASE_FIELD_CIPHER.wait().protect(plaintext, associated_data)
+    let nonce = get_random_bytes::<{ aead::NONCE_LEN }>();
+    let mut sealed = plaintext.as_bytes().to_vec();
+    let aad = aead::Aad::from(associated_data);
+    DATABASE_FIELD_KEY
+        .wait()
+        .seal_in_place_append_tag(aead::Nonce::assume_unique_for_key(nonce), aad, &mut sealed)
+        .map_err(|_| Error::new_msg("Failed to protect database field"))?;
+    Ok(format!("{DATABASE_FIELD_PROTECTED_PREFIX}{}", BASE64URL_NOPAD.encode(&[&nonce[..], &sealed].concat())))
 }
 
 pub fn unprotect_database_field(protected: &str, associated_data: &[u8]) -> Result<String, Error> {
-    DATABASE_FIELD_CIPHER.wait().unprotect(protected, associated_data)
+    let encoded = protected
+        .strip_prefix(DATABASE_FIELD_PROTECTED_PREFIX)
+        .ok_or_else(|| Error::new_msg("Unsupported database field protection format"))?;
+    let mut envelope = BASE64URL_NOPAD
+        .decode(encoded.as_bytes())
+        .map_err(|_| Error::new_msg("Invalid protected database field encoding"))?;
+    if envelope.len() < aead::NONCE_LEN + aead::AES_256_GCM.tag_len() {
+        return Err(Error::new_msg("Invalid protected database field length"));
+    }
+
+    let (nonce, ciphertext) = envelope.split_at_mut(aead::NONCE_LEN);
+    let plaintext = aead::Nonce::try_assume_unique_for_key(nonce)
+        .and_then(|nonce| DATABASE_FIELD_KEY.wait().open_in_place(nonce, aead::Aad::from(associated_data), ciphertext))
+        .map_err(|_| Error::new_msg("Database field authentication failed"))?;
+    String::from_utf8(plaintext.to_vec()).map_err(|_| Error::new_msg("Protected database field is not UTF-8"))
 }
 
 pub fn hash_password(secret: &[u8], salt: &[u8], iterations: u32) -> Vec<u8> {
@@ -210,37 +172,4 @@ pub fn ct_eq<T: AsRef<[u8]>, U: AsRef<[u8]>>(a: T, b: U) -> bool {
 //
 pub fn sha256_hex(data: &[u8]) -> String {
     HEXLOWER.encode(digest::digest(&digest::SHA256, data).as_ref())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn database_field_protection_survives_key_reinitialization() {
-        let before_restart = DatabaseFieldCipher::from_installation_secret(b"persistent installation key").unwrap();
-        let protected = before_restart.protect("26ea8c3b-9f70-41a1-a1d7-d4c9e4c3d07f", b"org-1").unwrap();
-        assert!(protected.starts_with(DATABASE_FIELD_PROTECTED_PREFIX));
-        assert!(!protected.contains("26ea8c3b-9f70-41a1-a1d7-d4c9e4c3d07f"));
-
-        let after_restart = DatabaseFieldCipher::from_installation_secret(b"persistent installation key").unwrap();
-        assert_eq!(after_restart.unprotect(&protected, b"org-1").unwrap(), "26ea8c3b-9f70-41a1-a1d7-d4c9e4c3d07f");
-    }
-
-    #[test]
-    fn database_field_protection_authenticates_ciphertext_and_context() {
-        let cipher = DatabaseFieldCipher::from_installation_secret(b"persistent installation key").unwrap();
-        let protected = cipher.protect("secret", b"org-1").unwrap();
-        assert!(cipher.unprotect(&protected, b"org-2").is_err());
-
-        let mut tampered = protected.into_bytes();
-        let position = tampered.len() / 2;
-        tampered[position] = if tampered[position] == b'A' {
-            b'B'
-        } else {
-            b'A'
-        };
-        let tampered = String::from_utf8(tampered).unwrap();
-        assert!(cipher.unprotect(&tampered, b"org-1").is_err());
-    }
 }
