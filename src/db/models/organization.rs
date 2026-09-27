@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::{
     CONFIG,
-    api::EmptyResult,
+    api::{ApiResult, EmptyResult},
     db::{
         DbConn,
         schema::{
@@ -21,8 +21,8 @@ use crate::{
 use macros::UuidFromParam;
 
 use super::{
-    Cipher, CipherId, Collection, CollectionId, CollectionUser, Group, GroupId, GroupUser, OrgPolicy, OrgPolicyType,
-    TwoFactor, User, UserId,
+    Cipher, CipherId, Collection, CollectionId, CollectionUser, Group, GroupId, GroupUser, OrgInviteLink, OrgPolicy,
+    OrgPolicyType, TwoFactor, User, UserId,
 };
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
@@ -215,7 +215,7 @@ impl Organization {
             "selfHost": true,
             "useApi": true,
             "useDisableSMAdsForUsers": true, // Hide Secrets Manager ads
-            "useInviteLinks": false, // Not (yet) supported
+            "useInviteLinks": true,
             "useMyItems": false, // Not (yet) supported
             "useOrganizationDomains": false, // Not supported (Linked to SSO)
             "usePam": false, // Not supported
@@ -378,6 +378,7 @@ impl Organization {
         OrgPolicy::delete_all_by_organization(&self.uuid, conn).await?;
         Group::delete_all_by_organization(&self.uuid, conn).await?;
         OrganizationApiKey::delete_all_by_organization(&self.uuid, conn).await?;
+        OrgInviteLink::delete_all_by_organization(&self.uuid, conn).await?;
 
         conn.run(move |conn| {
             diesel::delete(organizations::table.filter(organizations::uuid.eq(self.uuid)))
@@ -491,7 +492,7 @@ impl Membership {
             "useAdminSponsoredFamilies": false,
             "useRiskInsights": false, // Not supported (Not AGPLv3 Licensed)
             "useDisableSMAdsForUsers": true, // Hide Secrets Manager ads
-            "useInviteLinks": false, // Not (yet) supported
+            "useInviteLinks": true,
             "useMyItems": false, // Not (yet) supported
             "useOrganizationDomains": false, // Not supported (Linked to SSO)
             "usePam": false, // Not supported
@@ -737,6 +738,45 @@ impl Membership {
                     .map_res("Error adding user to organization")
             }
         }
+    }
+
+    /// Inserts a new membership, unlike `save` it never overwrites one. Returns `false` if the user is already a
+    /// member, e.g. through a concurrent request, which the unique index on (user_uuid, org_uuid) prevents.
+    pub async fn insert_new(&self, conn: &DbConn) -> ApiResult<bool> {
+        User::update_uuid_revision(&self.user_uuid, conn).await;
+
+        let inserted: EmptyResult = conn
+            .run(move |conn| diesel::insert_into(users_organizations::table).values(self).execute(conn))
+            .await
+            .map_res("Error adding user to organization");
+        if inserted.is_err() && Self::find_by_user_and_org(&self.user_uuid, &self.org_uuid, conn).await.is_some() {
+            return Ok(false);
+        }
+        inserted.map(|()| true)
+    }
+
+    /// Stores the status and keys of the membership only if its status is still `status`, so a concurrent change like
+    /// a revocation is not overwritten, and neither are other fields changed meanwhile. Returns `false` if nothing was
+    /// stored.
+    pub async fn update_status_if(&self, status: i32, conn: &DbConn) -> ApiResult<bool> {
+        User::update_uuid_revision(&self.user_uuid, conn).await;
+
+        conn.run(move |conn| {
+            diesel::update(
+                users_organizations::table
+                    .filter(users_organizations::uuid.eq(&self.uuid))
+                    .filter(users_organizations::status.eq(status)),
+            )
+            .set((
+                users_organizations::status.eq(self.status),
+                users_organizations::akey.eq(&self.akey),
+                users_organizations::reset_password_key.eq(&self.reset_password_key),
+            ))
+            .execute(conn)
+            .map(|rows| rows == 1)
+            .map_res("Error saving membership")
+        })
+        .await
     }
 
     pub async fn delete(self, conn: &DbConn) -> EmptyResult {

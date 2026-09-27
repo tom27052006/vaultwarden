@@ -120,6 +120,19 @@ table! {
 }
 
 table! {
+    org_invite_links (uuid) {
+        uuid -> Text,
+        org_uuid -> Text,
+        code -> Text,
+        allowed_domains -> Text,
+        invite -> Text,
+        supports_confirmation -> Bool,
+        creation_date -> Timestamp,
+        revision_date -> Timestamp,
+    }
+}
+
+table! {
     organizations (uuid) {
         uuid -> Text,
         name -> Text,

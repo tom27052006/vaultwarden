@@ -17,8 +17,8 @@ use crate::{
         models::{
             Cipher, CipherId, Collection, CollectionCipher, CollectionGroup, CollectionId, CollectionUser, EventType,
             Group, GroupId, GroupUser, Invitation, Membership, MembershipId, MembershipStatus, MembershipType,
-            OrgPolicy, OrgPolicyType, Organization, OrganizationApiKey, OrganizationId, TwoFactor, TwoFactorType, User,
-            UserId,
+            OrgInviteLink, OrgPolicy, OrgPolicyType, Organization, OrganizationApiKey, OrganizationId, TwoFactor,
+            TwoFactorType, User, UserId,
         },
     },
     mail,
@@ -75,6 +75,7 @@ pub fn routes() -> Vec<Route> {
         post_org_keys,
         get_organization_keys,
         get_organization_public_key,
+        get_organization_private_key,
         bulk_public_keys,
         revoke_member,
         bulk_revoke_members,
@@ -2955,12 +2956,14 @@ struct OrganizationUserRecoverAccountRequest {
 }
 
 // Upstream reports this is the renamed endpoint instead of `/keys`
-// But the clients do not seem to use this at all
-// Just add it here in case they will
+// Users joining through an invite link request it before they are members, to enroll in account recovery
 #[get("/organizations/<org_id>/public-key")]
-async fn get_organization_public_key(org_id: OrganizationId, headers: OrgMemberHeaders, conn: DbConn) -> JsonResult {
-    if org_id != headers.membership.org_uuid {
-        err!("Organization not found", "Organization id's do not match");
+async fn get_organization_public_key(org_id: OrganizationId, headers: Headers, conn: DbConn) -> JsonResult {
+    let is_member = Membership::find_by_user_and_org(&headers.user.uuid, &org_id, &conn)
+        .await
+        .is_some_and(|m| m.status >= MembershipStatus::Invited as i32);
+    if !is_member && OrgInviteLink::find_by_org(&org_id, &conn).await.is_none() {
+        err_code!("Organization not found", Status::NotFound.code)
     }
     let Some(org) = Organization::find_by_uuid(&org_id, &conn).await else {
         err!("Organization not found")
@@ -2975,8 +2978,25 @@ async fn get_organization_public_key(org_id: OrganizationId, headers: OrgMemberH
 // Obsolete - Renamed to public-key (2023.8), left for backwards compatibility with older clients
 // https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Api/AdminConsole/Controllers/OrganizationsController.cs#L487-L492
 #[get("/organizations/<org_id>/keys")]
-async fn get_organization_keys(org_id: OrganizationId, headers: OrgMemberHeaders, conn: DbConn) -> JsonResult {
+async fn get_organization_keys(org_id: OrganizationId, headers: Headers, conn: DbConn) -> JsonResult {
     get_organization_public_key(org_id, headers, conn).await
+}
+
+// The clients need the encrypted private key to create the invite of an invite link
+// https://github.com/bitwarden/server/blob/aa786fc9cd3803f48e79f15067e910e99d768b69/src/Api/AdminConsole/Controllers/OrganizationsController.cs#L473-L484
+#[get("/organizations/<org_id>/private-key")]
+async fn get_organization_private_key(org_id: OrganizationId, headers: AdminHeaders, conn: DbConn) -> JsonResult {
+    if org_id != headers.org_id {
+        err!("Organization not found", "Organization id's do not match");
+    }
+    let Some(org) = Organization::find_by_uuid(&org_id, &conn).await else {
+        err!("Organization not found")
+    };
+
+    Ok(Json(json!({
+        "object": "organizationPrivateKey",
+        "privateKey": org.private_key,
+    })))
 }
 
 // Will allow to reset 2FA too

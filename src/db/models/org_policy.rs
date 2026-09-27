@@ -68,6 +68,16 @@ pub struct ResetPasswordDataModel {
     pub auto_enroll_enabled: bool,
 }
 
+/// A TwoFactor or SingleOrg requirement which a membership does not meet, see `OrgPolicy::find_violations`
+#[derive(PartialEq, Eq)]
+pub enum PolicyViolation {
+    TwoFactorMissing,
+    /// Another organization of the user does not allow being a member of other organizations
+    SingleOrgOther,
+    /// This organization does not allow being a member of other organizations
+    SingleOrgThis,
+}
+
 /// Local methods
 impl OrgPolicy {
     pub fn new(org_uuid: OrganizationId, atype: OrgPolicyType, enabled: bool, data: String) -> Self {
@@ -302,37 +312,53 @@ impl OrgPolicy {
         false
     }
 
-    pub async fn check_user_allowed(m: &Membership, action: &str, conn: &DbConn) -> EmptyResult {
+    /// The TwoFactor and SingleOrg requirements the membership does not meet, without changing anything
+    pub async fn find_violations(m: &Membership, conn: &DbConn) -> Vec<PolicyViolation> {
+        let mut violations = Vec::new();
         if m.atype < MembershipType::Admin && m.status > (MembershipStatus::Invited as i32) {
-            // Enforce TwoFactor/TwoStep login
             if let Some(p) = Self::find_by_org_and_type(&m.org_uuid, OrgPolicyType::TwoFactorAuthentication, conn).await
                 && p.enabled
                 && TwoFactor::find_by_user(&m.user_uuid, conn).await.is_empty()
             {
-                if CONFIG.email_2fa_auto_fallback() {
-                    two_factor::email::find_and_activate_email_2fa(&m.user_uuid, conn).await?;
-                } else {
-                    err!(format!("Cannot {} because 2FA is required (membership {})", action, m.uuid));
-                }
+                violations.push(PolicyViolation::TwoFactorMissing);
             }
 
             // Check if the user is part of another Organization with SingleOrg activated
             if Self::is_applicable_to_user(&m.user_uuid, OrgPolicyType::SingleOrg, Some(&m.org_uuid), conn).await {
-                err!(format!(
-                    "Cannot {} because another organization policy forbids it (membership {})",
-                    action, m.uuid
-                ));
+                violations.push(PolicyViolation::SingleOrgOther);
             }
 
             if let Some(p) = Self::find_by_org_and_type(&m.org_uuid, OrgPolicyType::SingleOrg, conn).await
                 && p.enabled
                 && Membership::count_accepted_and_confirmed_by_user(&m.user_uuid, &m.org_uuid, conn).await > 0
             {
-                err!(format!(
-                    "Cannot {} because the organization policy forbids being part of other organization (membership {})",
-                    action, m.uuid
-                ));
+                violations.push(PolicyViolation::SingleOrgThis);
             }
+        }
+        violations
+    }
+
+    pub async fn check_user_allowed(m: &Membership, action: &str, conn: &DbConn) -> EmptyResult {
+        let violations = Self::find_violations(m, conn).await;
+
+        // Enforce TwoFactor/TwoStep login
+        if violations.contains(&PolicyViolation::TwoFactorMissing) {
+            if CONFIG.email_2fa_auto_fallback() {
+                two_factor::email::find_and_activate_email_2fa(&m.user_uuid, conn).await?;
+            } else {
+                err!(format!("Cannot {} because 2FA is required (membership {})", action, m.uuid));
+            }
+        }
+
+        if violations.contains(&PolicyViolation::SingleOrgOther) {
+            err!(format!("Cannot {} because another organization policy forbids it (membership {})", action, m.uuid));
+        }
+
+        if violations.contains(&PolicyViolation::SingleOrgThis) {
+            err!(format!(
+                "Cannot {} because the organization policy forbids being part of other organization (membership {})",
+                action, m.uuid
+            ));
         }
 
         Ok(())

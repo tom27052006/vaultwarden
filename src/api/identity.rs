@@ -14,6 +14,7 @@ use crate::{
     api::{
         ApiResult, EmptyResult, JsonResult,
         core::{
+            OpenOrgInvite,
             accounts::{PreloginData, RegisterData, kdf_upgrade, prelogin, register},
             log_user_event,
             two_factor::{
@@ -1076,6 +1077,7 @@ struct RegisterVerificationData {
     email: String,
     name: Option<String>,
     // receiveMarketingEmails: bool,
+    open_org_invite: Option<OpenOrgInvite>,
 }
 
 #[derive(rocket::Responder)]
@@ -1102,14 +1104,21 @@ async fn register_verification_email(
 
     let data = data.into_inner();
 
+    // An invite link can only stand in for an allowed signup if the address gets verified, which joining needs
+    let invite_allows_signup = match &data.open_org_invite {
+        Some(invite) => invite.allows_signup(&data.email, &conn).await? && CONFIG.mail_enabled(),
+        None => false,
+    };
+
     // the registration can only continue if signup is allowed or there exists an invitation
     if !(CONFIG.is_signup_allowed(&data.email)
-        || (!CONFIG.mail_enabled() && Invitation::find_by_mail(&data.email, &conn).await.is_some()))
+        || (!CONFIG.mail_enabled() && Invitation::find_by_mail(&data.email, &conn).await.is_some())
+        || invite_allows_signup)
     {
         err!("Registration not allowed or user already exists")
     }
 
-    let should_send_mail = CONFIG.mail_enabled() && CONFIG.signups_verify();
+    let should_send_mail = CONFIG.mail_enabled() && (CONFIG.signups_verify() || data.open_org_invite.is_some());
 
     let token_claims = auth::generate_register_verify_claims(data.email.clone(), data.name.clone(), should_send_mail);
     let token = auth::encode_jwt(&token_claims);
@@ -1125,7 +1134,8 @@ async fn register_verification_email(
             let sleep_ms: u64 = rng.random_range(900..=1100);
             tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
         } else {
-            mail::send_register_verify_email(&data.email, &token).await?;
+            let sealed_invite = data.open_org_invite.as_ref().and_then(|i| i.sealed_open_org_invite_data.as_deref());
+            mail::send_register_verify_email(&data.email, &token, sealed_invite).await?;
         }
 
         Ok(RegisterVerificationResponse::NoContent(()))

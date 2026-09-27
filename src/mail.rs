@@ -204,9 +204,17 @@ pub async fn send_verify_email(address: &str, user_id: &UserId) -> EmptyResult {
     send_email(address, &subject, body_html, body_text).await
 }
 
-pub async fn send_register_verify_email(email: &str, token: &str) -> EmptyResult {
+/// `sealed_open_org_invite_data` lets the client continue joining through an invite link after the verification
+pub async fn send_register_verify_email(
+    email: &str,
+    token: &str,
+    sealed_open_org_invite_data: Option<&str>,
+) -> EmptyResult {
     let mut query = url::Url::parse("https://query.builder").unwrap();
     query.query_pairs_mut().append_pair("email", email).append_pair("token", token);
+    if let Some(sealed_data) = sealed_open_org_invite_data {
+        query.query_pairs_mut().append_pair("sealedOpenOrgInviteData", sealed_data);
+    }
     let Some(query_string) = query.query() else {
         err!("Failed to build verify URL query parameters")
     };

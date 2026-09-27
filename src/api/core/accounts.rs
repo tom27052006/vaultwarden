@@ -12,7 +12,7 @@ use crate::{
     CONFIG,
     api::{
         AnonymousNotify, ApiResult, EmptyResult, JsonResult, Notify, PasswordOrOtpData, UpdateType,
-        core::{accept_org_invite, log_user_event, two_factor::email},
+        core::{OpenOrgInvite, accept_org_invite, log_user_event, two_factor::email},
         master_password_policy, register_push_device, unregister_push_device,
     },
     auth::{ClientHeaders, ClientIp, Headers, decode_delete, decode_invite, decode_verify_email},
@@ -116,6 +116,7 @@ pub struct RegisterData {
     accept_emergency_access_invite_token: Option<String>,
     #[serde(alias = "token")]
     org_invite_token: Option<String>,
+    open_org_invite: Option<OpenOrgInvite>,
 }
 
 impl RegisterData {
@@ -244,7 +245,11 @@ fn enforce_password_hint_setting(password_hint: Option<&String>) -> EmptyResult 
     }
     Ok(())
 }
-async fn is_email_2fa_required(member_id: Option<MembershipId>, conn: &DbConn) -> bool {
+async fn is_email_2fa_required(
+    member_id: Option<MembershipId>,
+    open_invite_org: Option<&OrganizationId>,
+    conn: &DbConn,
+) -> bool {
     if !CONFIG._enable_email_2fa() {
         return false;
     }
@@ -253,6 +258,11 @@ async fn is_email_2fa_required(member_id: Option<MembershipId>, conn: &DbConn) -
     }
     if let Some(member_id) = member_id {
         return OrgPolicy::is_enabled_for_member(&member_id, OrgPolicyType::TwoFactorAuthentication, conn).await;
+    }
+    if let Some(org_id) = open_invite_org {
+        return OrgPolicy::find_by_org_and_type(org_id, OrgPolicyType::TwoFactorAuthentication, conn)
+            .await
+            .is_some_and(|p| p.enabled);
     }
     false
 }
@@ -330,6 +340,12 @@ pub async fn register(data: Json<RegisterData>, email_verification: bool, conn: 
         }
     }
 
+    // An invite link stands in for an allowed signup like an email invitation, but only for a verified address
+    let invite_allows_signup = match &data.open_org_invite {
+        Some(invite) if email_verification => invite.allows_signup(&email, &conn).await? && email_verified,
+        _ => false,
+    };
+
     // Check if the length of the username exceeds 50 characters (Same is Upstream Bitwarden)
     // This also prevents issues with very long usernames causing to large JWT's. See #2419
     if let Some(ref name) = data.name
@@ -364,6 +380,7 @@ pub async fn register(data: Json<RegisterData>, email_verification: bool, conn: 
             } else if CONFIG.is_signup_allowed(&email)
                 || (CONFIG.emergency_access_allowed()
                     && EmergencyAccess::find_invited_by_grantee_email(&email, &conn).await.is_some())
+                || invite_allows_signup
             {
                 user
             } else {
@@ -377,6 +394,7 @@ pub async fn register(data: Json<RegisterData>, email_verification: bool, conn: 
             if Invitation::take(&email, &conn).await
                 || CONFIG.is_signup_allowed(&email)
                 || pending_emergency_access.is_some()
+                || invite_allows_signup
             {
                 User::new(&email, None)
             } else {
@@ -416,13 +434,18 @@ pub async fn register(data: Json<RegisterData>, email_verification: bool, conn: 
         } else if let Err(e) = mail::send_welcome(&user.email).await {
             error!("Error sending welcome email: {e:#?}");
         }
-
-        if email_verified && is_email_2fa_required(data.organization_user_id, &conn).await {
-            email::activate_email_2fa(&user, &conn).await.ok();
-        }
     }
 
     user.save(&conn).await?;
+
+    // Only once the user is stored, as a user registering through an invite link is new
+    let open_invite_org = data.open_org_invite.as_ref().map(OpenOrgInvite::org_id);
+    if CONFIG.mail_enabled()
+        && email_verified
+        && is_email_2fa_required(data.organization_user_id, open_invite_org, &conn).await
+    {
+        email::activate_email_2fa(&user, &conn).await.ok();
+    }
 
     // accept any open emergency access invitations
     if !CONFIG.mail_enabled() && CONFIG.emergency_access_allowed() {

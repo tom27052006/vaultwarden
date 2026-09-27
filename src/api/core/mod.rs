@@ -5,6 +5,7 @@ mod ciphers;
 mod emergency_access;
 mod events;
 mod folders;
+mod org_invite_links;
 mod organizations;
 mod public;
 mod sends;
@@ -13,6 +14,7 @@ pub use accounts::purge_auth_requests;
 pub use ciphers::{CipherData, CipherSyncData, CipherSyncType, purge_trashed_ciphers};
 pub use emergency_access::{emergency_notification_reminder_job, emergency_request_timeout_job};
 pub use events::{event_cleanup_job, log_event, log_user_event};
+pub use org_invite_links::OpenOrgInvite;
 pub use sends::purge_sends;
 
 use reqwest::Method;
@@ -21,7 +23,7 @@ use rocket::{Catcher, Route, serde::json::Json, serde::json::Value};
 use crate::{
     CONFIG,
     api::{EmptyResult, JsonResult, Notify, UpdateType},
-    auth::Headers,
+    auth::{ClientVersion, Headers},
     db::{
         DbConn,
         models::{Membership, MembershipStatus, OrgPolicy, Organization, User},
@@ -43,6 +45,7 @@ pub fn routes() -> Vec<Route> {
     routes.append(&mut emergency_access::routes());
     routes.append(&mut events::routes());
     routes.append(&mut folders::routes());
+    routes.append(&mut org_invite_links::routes());
     routes.append(&mut organizations::routes());
     routes.append(&mut two_factor::routes());
     routes.append(&mut sends::routes());
@@ -208,7 +211,7 @@ fn get_api_webauthn(_headers: Headers) -> Json<Value> {
 }
 
 #[get("/config")]
-fn config() -> Json<Value> {
+fn config(client_version: Option<ClientVersion>) -> Json<Value> {
     let domain = CONFIG.domain();
     // Official available feature flags can be found here:
     // Server (v2026.2.1): https://github.com/bitwarden/server/blob/0e42725d0837bd1c0dabd864ff621a579959744b/src/Core/Constants.cs#L135
@@ -220,6 +223,10 @@ fn config() -> Json<Value> {
         &FeatureFlagFilter::ValidOnly,
     );
     feature_states.insert("pm-19148-innovation-archive".to_owned(), true);
+    // Organization invite links. Older web vaults only have the admin part, without a way to join through the link.
+    let invite_links = client_version.is_some_and(|v| semver::VersionReq::parse(">=2026.8.1").unwrap().matches(&v.0));
+    feature_states.insert("pm-32497-generate-invite-link".to_owned(), invite_links);
+    feature_states.insert("pm-34429-invite-link-auto-confirm".to_owned(), true);
 
     Json(json!({
         // Note: The clients use this version to handle backwards compatibility concerns
@@ -239,6 +246,9 @@ fn config() -> Json<Value> {
             // When enabled, this setting signals to clients that onboarding interstitials
             // (post-login welcome dialogs, extension install prompts, setup extension redirects, and premium upsell modals) should be suppressed
             "suppressOnboardingInterstitials": CONFIG.client_suppress_onboarding(),
+            // Only used to warn admins about invite links. Joining through one needs a verified email address, and
+            // registering through one sends a verification email whenever mail is enabled.
+            "enableEmailVerification": CONFIG.mail_enabled(),
         },
         "environment": {
           "vault": domain,

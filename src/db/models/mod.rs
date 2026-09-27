@@ -9,6 +9,7 @@ mod event;
 mod favorite;
 mod folder;
 mod group;
+mod org_invite_link;
 mod org_policy;
 mod organization;
 mod send;
@@ -29,7 +30,8 @@ pub use self::event::{Event, EventType};
 pub use self::favorite::Favorite;
 pub use self::folder::{Folder, FolderCipher, FolderId};
 pub use self::group::{CollectionGroup, Group, GroupId, GroupUser};
-pub use self::org_policy::{OrgPolicy, OrgPolicyId, OrgPolicyType};
+pub use self::org_invite_link::OrgInviteLink;
+pub use self::org_policy::{OrgPolicy, OrgPolicyId, OrgPolicyType, PolicyViolation};
 pub use self::organization::{
     Membership, MembershipId, MembershipStatus, MembershipType, OrgApiKeyId, Organization, OrganizationApiKey,
     OrganizationId,

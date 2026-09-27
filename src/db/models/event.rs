@@ -114,6 +114,8 @@ pub enum EventType {
     // OrganizationUserRevoked_TwoFactorNonCompliance = 1520,
     // OrganizationUserRevoked_SingleOrganizationNonCompliance = 1521,
     OrganizationUserNotificationBannerActionClicked = 1522,
+    OrganizationUserInviteLinkAccepted = 1524,
+    OrganizationUserInviteLinkConfirmed = 1526,
 
     // Organization
     OrganizationUpdated = 1600,
@@ -126,6 +128,13 @@ pub enum EventType {
     // OrganizationDisabledKeyConnector = 1607, // Not supported
     // OrganizationSponsorshipsSynced = 1608, // Not supported
     // OrganizationCollectionManagementUpdated = 1609, // Not supported
+    OrganizationInviteLinkCreated = 1624,
+    OrganizationInviteLinkDomainsEdited = 1625,
+    OrganizationInviteLinkDeleted = 1626,
+    // OrganizationInviteLinkClientCopied = 1627, // Sent by the clients to /collect
+    OrganizationInviteLinkRefreshed = 1628,
+    OrganizationInviteLinkConfirmEnabled = 1629,
+    OrganizationInviteLinkConfirmDisabled = 1630,
 
     // Policy
     PolicyUpdated = 1700,
