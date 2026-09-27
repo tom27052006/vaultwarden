@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{collections::HashSet, str::FromStr};
 
 use chrono::{NaiveDateTime, Utc};
 use diesel::prelude::*;
@@ -6,8 +6,9 @@ use serde_json::Value;
 
 use crate::{
     api::{ApiResult, EmptyResult},
+    crypto,
     db::{DbConn, schema::org_invite_links},
-    error::MapResult,
+    error::{Error, MapResult},
     util::format_date,
 };
 
@@ -15,7 +16,7 @@ use super::OrganizationId;
 
 /// A reusable link that lets users with an allowed email domain join an organization.
 // https://github.com/bitwarden/server/blob/aa786fc9cd3803f48e79f15067e910e99d768b69/src/Core/AdminConsole/Entities/OrganizationInviteLink.cs
-#[derive(Identifiable, Queryable, Insertable)]
+#[derive(Identifiable, Queryable)]
 #[diesel(table_name = org_invite_links)]
 #[diesel(primary_key(uuid))]
 pub struct OrgInviteLink {
@@ -34,6 +35,10 @@ pub struct OrgInviteLink {
 
 /// Local methods
 impl OrgInviteLink {
+    /// The largest valid list still fits in MySQL/MariaDB TEXT even if every domain is 253 ASCII bytes:
+    /// `255 * (253 + JSON quotes/comma) + brackets == 65_281` bytes, below the 65_535-byte limit.
+    pub const MAX_ALLOWED_DOMAINS: usize = 255;
+
     pub fn new(org_uuid: OrganizationId, invite: String, supports_confirmation: bool) -> Self {
         let now = Utc::now().naive_utc();
         Self {
@@ -51,26 +56,37 @@ impl OrgInviteLink {
 
     /// Checks the domains an admin entered like upstream and returns them normalized
     pub fn clean_domains(domains: Vec<String>) -> ApiResult<Vec<String>> {
-        let invalid: Vec<String> =
-            domains.iter().filter(|d| !is_valid_domain_name(d)).map(|d| format!("'{}'", d.escape_debug())).collect();
+        if domains.len() > Self::MAX_ALLOWED_DOMAINS {
+            err!(format!("No more than {} allowed domains may be provided.", Self::MAX_ALLOWED_DOMAINS))
+        }
+
+        let mut invalid = Vec::new();
+        let mut cleaned = Vec::with_capacity(domains.len());
+        let mut seen = HashSet::with_capacity(domains.len());
+        for domain in domains {
+            if !is_valid_domain_name(&domain) {
+                invalid.push(format!("'{}'", domain.escape_debug()));
+                continue;
+            }
+
+            let domain = domain.to_ascii_lowercase();
+            if seen.insert(domain.clone()) {
+                cleaned.push(domain);
+            }
+        }
         if !invalid.is_empty() {
             err!(format!("The following items are not valid: {}", invalid.join(", ")))
         }
 
-        let mut cleaned: Vec<String> = Vec::with_capacity(domains.len());
-        for domain in domains.into_iter().map(|d| d.to_ascii_lowercase()) {
-            if !cleaned.contains(&domain) {
-                cleaned.push(domain);
-            }
-        }
         if cleaned.is_empty() {
             err!("At least one allowed domain is required.")
         }
         Ok(cleaned)
     }
 
-    pub fn allowed_domains(&self) -> Vec<String> {
-        serde_json::from_str(&self.allowed_domains).unwrap_or_default()
+    pub fn allowed_domains(&self) -> ApiResult<Vec<String>> {
+        serde_json::from_str(&self.allowed_domains)
+            .map_res("Invalid allowed domains stored for organization invite link")
     }
 
     pub fn set_allowed_domains(&mut self, domains: &[String]) {
@@ -78,28 +94,56 @@ impl OrgInviteLink {
     }
 
     /// Constant time comparison with a code sent by a client, which like upstream may use any case
-    pub fn code_matches(&self, code: &str) -> bool {
-        crate::crypto::ct_eq(&self.code, code.to_ascii_lowercase())
+    pub fn code_matches(&self, code: &uuid::Uuid) -> bool {
+        crypto::ct_eq(&self.code, code.to_string())
     }
 
     /// Whether the domain of the email address is one of the allowed domains, subdomains are not included.
     /// Like upstream, this only protects anything if the address is verified.
-    pub fn allows_email(&self, email: &str) -> bool {
-        email_domain(email).is_some_and(|domain| self.allowed_domains().contains(&domain))
+    pub fn allows_email(&self, email: &str) -> ApiResult<bool> {
+        let Some(domain) = email_domain(email) else {
+            return Ok(false);
+        };
+        Ok(self.allowed_domains()?.contains(&domain))
     }
 
     // https://github.com/bitwarden/server/blob/aa786fc9cd3803f48e79f15067e910e99d768b69/src/Api/AdminConsole/Models/Response/Organizations/OrganizationInviteLinkResponseModel.cs
-    pub fn to_json(&self) -> Value {
-        json!({
+    pub fn to_json(&self) -> ApiResult<Value> {
+        Ok(json!({
             "id": self.uuid,
             "code": self.code,
             "organizationId": self.org_uuid,
-            "allowedDomains": self.allowed_domains(),
+            "allowedDomains": self.allowed_domains()?,
             "invite": self.invite,
             "supportsConfirmation": self.supports_confirmation,
             "creationDate": format_date(&self.creation_date),
             "object": "organizationInviteLink",
-        })
+        }))
+    }
+
+    fn code_associated_data(&self) -> String {
+        format!("OrganizationInviteLink.Code:{}", self.org_uuid)
+    }
+
+    fn protected_code(&self) -> ApiResult<String> {
+        let code = uuid::Uuid::parse_str(&self.code)
+            .map_err(|_| Error::new_msg("Organization invite link contains an invalid code"))?
+            .to_string();
+        crypto::protect_database_field(&code, self.code_associated_data().as_bytes())
+    }
+
+    fn unprotect_code(&mut self) -> EmptyResult {
+        let code = if crypto::is_protected_database_field(&self.code) {
+            crypto::unprotect_database_field(&self.code, self.code_associated_data().as_bytes())?
+        } else {
+            // Branch builds before at-rest protection stored a plain UUID. Only that exact legacy shape is accepted;
+            // a malformed or unknown envelope is corruption, not plaintext to silently trust.
+            self.code.clone()
+        };
+        self.code = uuid::Uuid::parse_str(&code)
+            .map_err(|_| Error::new_msg("Organization invite link contains an invalid protected code"))?
+            .to_string();
+        Ok(())
     }
 }
 
@@ -131,26 +175,50 @@ fn email_domain(email: &str) -> Option<String> {
 
 /// Database methods
 impl OrgInviteLink {
-    pub async fn find_by_org(org_uuid: &OrganizationId, conn: &DbConn) -> Option<Self> {
-        conn.run(move |conn| {
-            org_invite_links::table.filter(org_invite_links::org_uuid.eq(org_uuid)).first::<Self>(conn).ok()
-        })
-        .await
+    pub async fn find_by_org(org_uuid: &OrganizationId, conn: &DbConn) -> ApiResult<Option<Self>> {
+        let mut link = conn
+            .run(move |conn| {
+                org_invite_links::table
+                    .filter(org_invite_links::org_uuid.eq(org_uuid))
+                    .first::<Self>(conn)
+                    .optional()
+                    .map_res("Error finding organization invite link")
+            })
+            .await?;
+        if let Some(link) = &mut link {
+            link.unprotect_code()?;
+        }
+        Ok(link)
     }
 
     /// Fails if the organization already has a link, the unique index also covers concurrent requests
     pub async fn insert(&self, conn: &DbConn) -> EmptyResult {
+        let protected_code = self.protected_code()?;
         conn.run(move |conn| {
-            diesel::insert_into(org_invite_links::table).values(self).execute(conn).map_res("Error saving invite link")
+            diesel::insert_into(org_invite_links::table)
+                .values((
+                    org_invite_links::uuid.eq(&self.uuid),
+                    org_invite_links::org_uuid.eq(&self.org_uuid),
+                    org_invite_links::code.eq(&protected_code),
+                    org_invite_links::allowed_domains.eq(&self.allowed_domains),
+                    org_invite_links::invite.eq(&self.invite),
+                    org_invite_links::supports_confirmation.eq(self.supports_confirmation),
+                    org_invite_links::creation_date.eq(self.creation_date),
+                    org_invite_links::revision_date.eq(self.revision_date),
+                ))
+                .execute(conn)
+                .map_res("Error saving invite link")
         })
         .await
     }
 
     /// Stores the allowed domains, returns `false` if the link was refreshed or deleted meanwhile
     pub async fn update_allowed_domains(&self, conn: &DbConn) -> ApiResult<bool> {
+        let protected_code = self.protected_code()?;
         conn.run(move |conn| {
             diesel::update(org_invite_links::table.filter(org_invite_links::uuid.eq(&self.uuid)))
                 .set((
+                    org_invite_links::code.eq(&protected_code),
                     org_invite_links::allowed_domains.eq(&self.allowed_domains),
                     org_invite_links::revision_date.eq(self.revision_date),
                 ))
@@ -165,11 +233,12 @@ impl OrgInviteLink {
     /// A refreshed link gets a new uuid and code here, which invalidates the old code in the same statement.
     /// Returns `false` if the link with `uuid` was refreshed or deleted meanwhile.
     pub async fn replace(&self, uuid: &OrgInviteLinkId, conn: &DbConn) -> ApiResult<bool> {
+        let protected_code = self.protected_code()?;
         conn.run(move |conn| {
             diesel::update(org_invite_links::table.filter(org_invite_links::uuid.eq(uuid)))
                 .set((
                     org_invite_links::uuid.eq(&self.uuid),
-                    org_invite_links::code.eq(&self.code),
+                    org_invite_links::code.eq(&protected_code),
                     org_invite_links::invite.eq(&self.invite),
                     org_invite_links::supports_confirmation.eq(self.supports_confirmation),
                     org_invite_links::creation_date.eq(self.creation_date),
@@ -197,7 +266,17 @@ pub struct OrgInviteLinkId(String);
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Once;
+
     use super::*;
+
+    static INIT_DATABASE_FIELD_KEY: Once = Once::new();
+
+    fn initialize_database_field_key() {
+        INIT_DATABASE_FIELD_KEY.call_once(|| {
+            crypto::initialize_database_field_key(b"org-invite-link-test-installation-key").unwrap();
+        });
+    }
 
     fn link(domains: &[&str]) -> OrgInviteLink {
         let mut link = OrgInviteLink::new(String::from("org").into(), String::new(), false);
@@ -215,6 +294,25 @@ mod tests {
             clean(&["Example.COM", "sub.example.co.uk", "xn--bcher-kva.de", "example.com"]).unwrap(),
             ["example.com", "sub.example.co.uk", "xn--bcher-kva.de"]
         );
+    }
+
+    #[test]
+    fn oversized_domain_lists_are_rejected_before_processing() {
+        let domains = (0..100_000).map(|i| format!("{i}.example.com")).collect();
+        assert!(OrgInviteLink::clean_domains(domains).is_err());
+    }
+
+    #[test]
+    fn maximum_domain_list_fits_mysql_text() {
+        let domains: Vec<String> = (0..OrgInviteLink::MAX_ALLOWED_DOMAINS)
+            .map(|i| format!("{i:03}{}.{}.{}.{}.de", "a".repeat(60), "b".repeat(63), "c".repeat(63), "d".repeat(58),))
+            .collect();
+        assert!(domains.iter().all(|domain| domain.len() == 253));
+
+        let cleaned = OrgInviteLink::clean_domains(domains).unwrap();
+        let serialized = serde_json::to_string(&cleaned).unwrap();
+        assert_eq!(serialized.len(), 65_281);
+        assert!(serialized.len() <= u16::MAX as usize);
     }
 
     #[test]
@@ -251,7 +349,7 @@ mod tests {
     fn only_exact_email_domains_are_allowed() {
         let link = link(&["example.com", "xn--bcher-kva.de"]);
         for email in ["user@example.com", "User@EXAMPLE.com", "\"user@evil.com\"@example.com", "user@bücher.de"] {
-            assert!(link.allows_email(email), "{email:?} must be allowed");
+            assert!(link.allows_email(email).unwrap(), "{email:?} must be allowed");
         }
         for email in [
             "user@evil-example.com",
@@ -265,18 +363,61 @@ mod tests {
             "example.com",
             "",
         ] {
-            assert!(!link.allows_email(email), "{email:?} must not be allowed");
+            assert!(!link.allows_email(email).unwrap(), "{email:?} must not be allowed");
         }
-        assert!(!self::link(&[]).allows_email("user@example.com"));
+        assert!(!self::link(&[]).allows_email("user@example.com").unwrap());
     }
 
     #[test]
     fn codes_are_compared_case_insensitively() {
         let link = link(&[]);
-        assert!(link.code_matches(&link.code));
-        assert!(link.code_matches(&link.code.to_uppercase()));
-        assert!(!link.code_matches(&crate::util::get_uuid()));
-        assert!(!link.code_matches(""));
-        assert!(!link.code_matches(&link.code[..35]));
+        let code = uuid::Uuid::parse_str(&link.code).unwrap();
+        let uppercase_code = uuid::Uuid::parse_str(&link.code.to_uppercase()).unwrap();
+        let wrong_code = uuid::Uuid::new_v4();
+        assert!(link.code_matches(&code));
+        assert!(link.code_matches(&uppercase_code));
+        assert!(!link.code_matches(&wrong_code));
+    }
+
+    #[test]
+    fn invalid_allowed_domains_json_is_not_silently_treated_as_empty() {
+        let mut link = link(&["example.com"]);
+        link.allowed_domains = "[truncated".to_owned();
+        assert!(link.allowed_domains().is_err());
+        assert!(link.allows_email("user@example.com").is_err());
+        assert!(link.to_json().is_err());
+    }
+
+    #[test]
+    fn protected_code_round_trips_and_is_bound_to_the_organization() {
+        initialize_database_field_key();
+        let org_id = crate::util::get_uuid();
+        let mut link = OrgInviteLink::new(org_id.clone().into(), String::new(), false);
+        let plaintext = link.code.clone();
+        let protected = link.protected_code().unwrap();
+        assert_ne!(protected, plaintext);
+        assert!(protected.starts_with("P|1|"));
+
+        link.code = protected.clone();
+        link.unprotect_code().unwrap();
+        assert_eq!(link.code, plaintext);
+
+        let mut moved = OrgInviteLink::new(crate::util::get_uuid().into(), String::new(), false);
+        moved.code = protected;
+        assert!(moved.unprotect_code().is_err());
+    }
+
+    #[test]
+    fn only_valid_plaintext_uuid_is_accepted_for_legacy_rows() {
+        let mut legacy = OrgInviteLink::new(crate::util::get_uuid().into(), String::new(), false);
+        let code = legacy.code.clone();
+        legacy.unprotect_code().unwrap();
+        assert_eq!(legacy.code, code);
+
+        legacy.code = "not-a-legacy-uuid".to_owned();
+        assert!(legacy.unprotect_code().is_err());
+
+        legacy.code = "P|unknown-format".to_owned();
+        assert!(legacy.unprotect_code().is_err());
     }
 }

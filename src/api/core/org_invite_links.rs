@@ -1,22 +1,26 @@
+use std::collections::HashSet;
+
 use chrono::Utc;
-use rocket::{Route, http::Status, response::status, serde::json::Json};
+use rocket::{Route, State, http::Status, response::status, serde::json::Json};
 use serde_json::Value;
 
 use crate::{
-    CONFIG,
+    CONFIG, Error,
     api::{
         ApiResult, EmptyResult, JsonResult, Notify, UpdateType,
         core::{log_event, two_factor::email},
     },
-    auth::{AdminHeaders, Headers},
+    auth::{AdminHeaders, ClientIp, Headers},
+    config::INVITE_LINK_AUTO_CONFIRM_FEATURE,
     db::{
-        DbConn,
+        DbConn, DbPool,
         models::{
             EventType, Membership, MembershipStatus, MembershipType, OrgInviteLink, OrgPolicy, OrgPolicyType,
             Organization, OrganizationId, PolicyViolation, User,
         },
     },
     mail,
+    util::{FeatureFlagFilter, parse_experimental_client_feature_flags},
 };
 
 // Upstream: https://github.com/bitwarden/server/blob/aa786fc9cd3803f48e79f15067e910e99d768b69/src/Api/AdminConsole/Controllers/OrganizationInviteLinksController.cs
@@ -49,6 +53,22 @@ struct InviteLinkRef {
     code: String,
 }
 
+impl InviteLinkRef {
+    fn parsed_code(&self) -> ApiResult<uuid::Uuid> {
+        // System.Text.Json's Guid converter used by Bitwarden accepts the canonical 36-character representation.
+        // Bound the string before parsing so attacker-controlled input never reaches DB or comparison code.
+        if self.code.len() != 36 {
+            return Err(Error::new_msg("The Code field is invalid.").with_code(Status::BadRequest.code).silent());
+        }
+        let code = uuid::Uuid::parse_str(&self.code)
+            .map_err(|_| Error::new_msg("The Code field is invalid.").with_code(Status::BadRequest.code).silent())?;
+        if !code.hyphenated().to_string().eq_ignore_ascii_case(&self.code) {
+            return Err(Error::new_msg("The Code field is invalid.").with_code(Status::BadRequest.code).silent());
+        }
+        Ok(code)
+    }
+}
+
 /// An invite link a user registers through
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -70,12 +90,15 @@ impl OpenOrgInvite {
         if self.sealed_open_org_invite_data.as_ref().is_some_and(|data| data.len() > 4096) {
             err!("The field SealedOpenOrgInviteData must be a string or array type with a maximum length of '4096'.")
         }
-        match find_link(&self.link, conn).await {
-            Ok((link, _)) if link.allows_email(email) => {
-                Ok(CONFIG.invitations_allowed() && CONFIG.is_email_domain_allowed(email))
-            }
-            _ => err!("Invalid or expired organization invite link."),
+        let invalid_link = || Error::new_msg("Invalid or expired organization invite link.").silent();
+        let code = self.link.parsed_code().map_err(|_| invalid_link())?;
+        let Some((link, _)) = lookup_link_with_code(&self.link, &code, conn).await? else {
+            return Err(invalid_link());
+        };
+        if !link.allows_email(email)? {
+            return Err(invalid_link());
         }
+        Ok(CONFIG.invitations_allowed() && CONFIG.is_email_domain_allowed(email))
     }
 }
 
@@ -144,27 +167,46 @@ struct ConfirmInviteLinkData {
 /// The link and organization of a link reference. A wrong organization and a wrong code are reported the same, so
 /// nothing can be learned about an organization without the code of its link.
 async fn find_link(link: &InviteLinkRef, conn: &DbConn) -> ApiResult<(OrgInviteLink, Organization)> {
-    if let Some(invite_link) = OrgInviteLink::find_by_org(&link.organization_id, conn).await
-        && invite_link.code_matches(&link.code)
+    let code = link.parsed_code()?;
+    find_link_with_code(link, &code, conn).await
+}
+
+async fn find_link_with_code(
+    link: &InviteLinkRef,
+    code: &uuid::Uuid,
+    conn: &DbConn,
+) -> ApiResult<(OrgInviteLink, Organization)> {
+    lookup_link_with_code(link, code, conn)
+        .await?
+        .ok_or_else(|| Error::new_msg(NOT_FOUND).with_code(Status::NotFound.code).silent())
+}
+
+async fn lookup_link_with_code(
+    link: &InviteLinkRef,
+    code: &uuid::Uuid,
+    conn: &DbConn,
+) -> ApiResult<Option<(OrgInviteLink, Organization)>> {
+    if let Some(invite_link) = OrgInviteLink::find_by_org(&link.organization_id, conn).await?
+        && invite_link.code_matches(code)
         && let Some(org) = Organization::find_by_uuid(&invite_link.org_uuid, conn).await
     {
-        return Ok((invite_link, org));
+        return Ok(Some((invite_link, org)));
     }
-    err_code!(NOT_FOUND, Status::NotFound.code)
+    Ok(None)
 }
 
 async fn find_org_link(org_id: &OrganizationId, headers: &AdminHeaders, conn: &DbConn) -> ApiResult<OrgInviteLink> {
     if org_id != &headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
-    let Some(link) = OrgInviteLink::find_by_org(org_id, conn).await else {
+    let Some(link) = OrgInviteLink::find_by_org(org_id, conn).await? else {
         err_code!(NOT_FOUND, Status::NotFound.code)
     };
     Ok(link)
 }
 
 async fn conflict_if_link_exists(org_id: &OrganizationId, conn: &DbConn) -> EmptyResult {
-    if OrgInviteLink::find_by_org(org_id, conn).await.is_some() {
+    if OrgInviteLink::find_by_org(org_id, conn).await?.is_some() {
         err_code!("An invite link already exists for this organization.", Status::Conflict.code)
     }
     Ok(())
@@ -172,7 +214,7 @@ async fn conflict_if_link_exists(org_id: &OrganizationId, conn: &DbConn) -> Empt
 
 #[get("/organizations/<org_id>/invite-link")]
 async fn get_invite_link(org_id: OrganizationId, headers: AdminHeaders, conn: DbConn) -> JsonResult {
-    Ok(Json(find_org_link(&org_id, &headers, &conn).await?.to_json()))
+    Ok(Json(find_org_link(&org_id, &headers, &conn).await?.to_json()?))
 }
 
 #[post("/organizations/<org_id>/invite-link", data = "<data>")]
@@ -199,7 +241,7 @@ async fn create_invite_link(
     }
 
     headers.log_event(EventType::OrganizationInviteLinkCreated, &org_id, &org_id, &conn).await;
-    Ok(status::Created::new(format!("organizations/{org_id}/invite-link")).body(Json(link.to_json())))
+    Ok(status::Created::new(format!("organizations/{org_id}/invite-link")).body(Json(link.to_json()?)))
 }
 
 #[put("/organizations/<org_id>/invite-link", data = "<data>")]
@@ -218,7 +260,7 @@ async fn update_invite_link(
     }
 
     headers.log_event(EventType::OrganizationInviteLinkDomainsEdited, &org_id, &org_id, &conn).await;
-    Ok(Json(link.to_json()))
+    Ok(Json(link.to_json()?))
 }
 
 /// The clients change the invite along with this setting, but keep its secret, so the link stays the same
@@ -245,7 +287,7 @@ async fn update_invite_link_confirmation(
         EventType::OrganizationInviteLinkConfirmDisabled
     };
     headers.log_event(event, &org_id, &org_id, &conn).await;
-    Ok(Json(link.to_json()))
+    Ok(Json(link.to_json()?))
 }
 
 #[delete("/organizations/<org_id>/invite-link")]
@@ -282,12 +324,15 @@ async fn refresh_invite_link(
     }
 
     headers.log_event(EventType::OrganizationInviteLinkRefreshed, &org_id, &org_id, &conn).await;
-    Ok(Json(link.to_json()))
+    Ok(Json(link.to_json()?))
 }
 
 #[post("/organizations/invite-link/status", data = "<data>")]
-async fn get_invite_link_status(data: Json<InviteLinkRef>, conn: DbConn) -> JsonResult {
-    let (link, org) = find_link(&data, &conn).await?;
+async fn get_invite_link_status(data: Json<InviteLinkRef>, ip: ClientIp, pool: &State<DbPool>) -> JsonResult {
+    crate::ratelimit::check_limit_unauthenticated(&ip.ip)?;
+    let code = data.parsed_code()?;
+    let conn = pool.get().await?;
+    let (link, org) = find_link_with_code(&data, &code, &conn).await?;
     Ok(Json(json!({
         "organizationName": org.name,
         "linksEnabled": true,
@@ -303,8 +348,11 @@ async fn get_invite_link_status(data: Json<InviteLinkRef>, conn: DbConn) -> Json
 
 /// The policies the clients need before joining: the master password requirements and account recovery enrollment
 #[post("/organizations/invite-link/policies", data = "<data>")]
-async fn get_invite_link_policies(data: Json<InviteLinkRef>, conn: DbConn) -> JsonResult {
-    let (_, org) = find_link(&data, &conn).await?;
+async fn get_invite_link_policies(data: Json<InviteLinkRef>, ip: ClientIp, pool: &State<DbPool>) -> JsonResult {
+    crate::ratelimit::check_limit_unauthenticated(&ip.ip)?;
+    let code = data.parsed_code()?;
+    let conn = pool.get().await?;
+    let (_, org) = find_link_with_code(&data, &code, &conn).await?;
     let policies: Vec<Value> = OrgPolicy::find_by_org(&org.uuid, &conn)
         .await
         .iter()
@@ -322,10 +370,17 @@ async fn get_invite_link_policies(data: Json<InviteLinkRef>, conn: DbConn) -> Js
 }
 
 #[post("/organizations/invite-link/validate-email-domain", data = "<data>")]
-async fn validate_invite_link_email_domain(data: Json<EmailDomainData>, conn: DbConn) -> JsonResult {
-    let (link, _) = find_link(&data.link, &conn).await?;
+async fn validate_invite_link_email_domain(
+    data: Json<EmailDomainData>,
+    ip: ClientIp,
+    pool: &State<DbPool>,
+) -> JsonResult {
+    crate::ratelimit::check_limit_unauthenticated(&ip.ip)?;
+    let code = data.link.parsed_code()?;
+    let conn = pool.get().await?;
+    let (link, _) = find_link_with_code(&data.link, &code, &conn).await?;
     Ok(Json(json!({
-        "isAllowed": link.allows_email(&data.email),
+        "isAllowed": link.allows_email(&data.email)?,
     })))
 }
 
@@ -351,7 +406,7 @@ async fn joining_member(
     if user.verified_at.is_none() {
         err!("You must verify your email address before joining an organization.")
     }
-    if !link.allows_email(&user.email) {
+    if !link.allows_email(&user.email)? {
         err!(format!("You're not allowed to join the {} vault with your email domain.", org.name))
     }
 
@@ -457,15 +512,16 @@ async fn accept_invite_link(data: Json<AcceptInviteLinkData>, headers: Headers, 
     log_member_event(EventType::OrganizationUserInviteLinkAccepted, &member, &headers, &conn).await;
 
     if CONFIG.mail_enabled() {
-        // The member who sent an email invitation, otherwise all admins like upstream
-        let mut addresses = Vec::from_iter(member.invited_by_email.clone());
-        if addresses.is_empty() {
-            for admin in Membership::find_confirmed_by_org(&org.uuid, &conn).await {
-                if admin.atype >= MembershipType::Admin
-                    && let Some(user) = User::find_by_uuid(&admin.user_uuid, &conn).await
-                {
-                    addresses.push(user.email);
-                }
+        // Invite-link acceptance always notifies the current confirmed admins/owners. A pending classic invite may
+        // carry the email of an administrator who has since been removed and must not influence this flow.
+        let mut addresses = Vec::new();
+        let mut seen = HashSet::new();
+        for admin in Membership::find_confirmed_by_org(&org.uuid, &conn).await {
+            if admin.atype >= MembershipType::Admin
+                && let Some(user) = User::find_by_uuid(&admin.user_uuid, &conn).await
+                && seen.insert(user.email.clone())
+            {
+                addresses.push(user.email);
             }
         }
         for address in addresses {
@@ -485,6 +541,16 @@ async fn confirm_invite_link(
     conn: DbConn,
     nt: Notify<'_>,
 ) -> EmptyResult {
+    let auto_confirm_enabled = parse_experimental_client_feature_flags(
+        &CONFIG.experimental_client_feature_flags(),
+        &FeatureFlagFilter::ValidOnly,
+    )
+    .contains_key(INVITE_LINK_AUTO_CONFIRM_FEATURE);
+    if !auto_confirm_enabled {
+        // Bitwarden's RequireFeature(InviteLinkAutoConfirm) maps a disabled feature to Not Found.
+        return Err(Error::new_msg("Not Found").with_code(Status::NotFound.code).silent());
+    }
+
     let data = data.into_inner();
     let (link, org) = find_link(&data.link, &conn).await?;
     if !link.supports_confirmation {
@@ -503,4 +569,27 @@ async fn confirm_invite_link(
 
     nt.send_user_update(UpdateType::SyncOrgKeys, &headers.user, headers.device.push_uuid.as_ref(), &conn).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn link_ref(code: &str) -> InviteLinkRef {
+        InviteLinkRef {
+            organization_id: crate::util::get_uuid().into(),
+            code: code.to_owned(),
+        }
+    }
+
+    #[test]
+    fn invite_link_code_requires_a_canonical_uuid() {
+        let code = crate::util::get_uuid();
+        assert_eq!(link_ref(&code).parsed_code().unwrap().to_string(), code);
+        assert_eq!(link_ref(&code.to_uppercase()).parsed_code().unwrap().to_string(), code);
+
+        for invalid in ["", "not-a-uuid", &"a".repeat(100_000), &code.replace('-', "")] {
+            assert!(link_ref(invalid).parsed_code().is_err(), "{invalid:?} must be rejected");
+        }
+    }
 }

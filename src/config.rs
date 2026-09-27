@@ -1417,7 +1417,11 @@ pub enum PathType {
 // Client (v2026.2.1): https://github.com/bitwarden/clients/blob/f96380c3138291a028bdd2c7a5fee540d5c98ba5/libs/common/src/enums/feature-flag.enum.ts#L12
 // Android (v2026.2.1): https://github.com/bitwarden/android/blob/6902c19c0093fa476bbf74ccaa70c9f14afbb82f/core/src/main/kotlin/com/bitwarden/core/data/manager/model/FlagKey.kt#L31
 // iOS (v2026.2.1): https://github.com/bitwarden/ios/blob/cdd9ba1770ca2ffc098d02d12cc3208e3a830454/BitwardenShared/Core/Platform/Models/Enum/FeatureFlag.swift#L7
+pub const INVITE_LINK_AUTO_CONFIRM_FEATURE: &str = "pm-34429-invite-link-auto-confirm";
+
 pub const SUPPORTED_FEATURE_FLAGS: &[&str] = &[
+    // Admin Console Team
+    INVITE_LINK_AUTO_CONFIRM_FEATURE,
     // Architecture
     "desktop-ui-migration-milestone-1",
     "desktop-ui-migration-milestone-2",

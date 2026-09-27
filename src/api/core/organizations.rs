@@ -2962,7 +2962,7 @@ async fn get_organization_public_key(org_id: OrganizationId, headers: Headers, c
     let is_member = Membership::find_by_user_and_org(&headers.user.uuid, &org_id, &conn)
         .await
         .is_some_and(|m| m.status >= MembershipStatus::Invited as i32);
-    if !is_member && OrgInviteLink::find_by_org(&org_id, &conn).await.is_none() {
+    if !is_member && OrgInviteLink::find_by_org(&org_id, &conn).await?.is_none() {
         err_code!("Organization not found", Status::NotFound.code)
     }
     let Some(org) = Organization::find_by_uuid(&org_id, &conn).await else {

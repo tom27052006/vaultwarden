@@ -23,7 +23,8 @@ use rocket::{Catcher, Route, serde::json::Json, serde::json::Value};
 use crate::{
     CONFIG,
     api::{EmptyResult, JsonResult, Notify, UpdateType},
-    auth::{ClientVersion, Headers},
+    auth::{Headers, OptionalClientVersion},
+    config::INVITE_LINK_AUTO_CONFIRM_FEATURE,
     db::{
         DbConn,
         models::{Membership, MembershipStatus, OrgPolicy, Organization, User},
@@ -211,22 +212,10 @@ fn get_api_webauthn(_headers: Headers) -> Json<Value> {
 }
 
 #[get("/config")]
-fn config(client_version: Option<ClientVersion>) -> Json<Value> {
+fn config(client_version: OptionalClientVersion) -> Json<Value> {
     let domain = CONFIG.domain();
-    // Official available feature flags can be found here:
-    // Server (v2026.2.1): https://github.com/bitwarden/server/blob/0e42725d0837bd1c0dabd864ff621a579959744b/src/Core/Constants.cs#L135
-    // Client (v2026.2.1): https://github.com/bitwarden/clients/blob/f96380c3138291a028bdd2c7a5fee540d5c98ba5/libs/common/src/enums/feature-flag.enum.ts#L12
-    // Android (v2026.2.1): https://github.com/bitwarden/android/blob/6902c19c0093fa476bbf74ccaa70c9f14afbb82f/core/src/main/kotlin/com/bitwarden/core/data/manager/model/FlagKey.kt#L31
-    // iOS (v2026.2.1): https://github.com/bitwarden/ios/blob/cdd9ba1770ca2ffc098d02d12cc3208e3a830454/BitwardenShared/Core/Platform/Models/Enum/FeatureFlag.swift#L7
-    let mut feature_states = parse_experimental_client_feature_flags(
-        &CONFIG.experimental_client_feature_flags(),
-        &FeatureFlagFilter::ValidOnly,
-    );
-    feature_states.insert("pm-19148-innovation-archive".to_owned(), true);
-    // Organization invite links. Older web vaults only have the admin part, without a way to join through the link.
-    let invite_links = client_version.is_some_and(|v| semver::VersionReq::parse(">=2026.8.1").unwrap().matches(&v.0));
-    feature_states.insert("pm-32497-generate-invite-link".to_owned(), invite_links);
-    feature_states.insert("pm-34429-invite-link-auto-confirm".to_owned(), true);
+    let client_version = client_version.0;
+    let feature_states = client_feature_states(client_version.as_ref(), &CONFIG.experimental_client_feature_flags());
 
     Json(json!({
         // Note: The clients use this version to handle backwards compatibility concerns
@@ -270,6 +259,50 @@ fn config(client_version: Option<ClientVersion>) -> Json<Value> {
         "communication": null,
         "object": "config",
     }))
+}
+
+fn client_feature_states(
+    client_version: Option<&semver::Version>,
+    experimental_flags: &str,
+) -> std::collections::HashMap<String, bool> {
+    // Official available feature flags can be found here:
+    // Server (v2026.2.1): https://github.com/bitwarden/server/blob/0e42725d0837bd1c0dabd864ff621a579959744b/src/Core/Constants.cs#L135
+    // Client (v2026.2.1): https://github.com/bitwarden/clients/blob/f96380c3138291a028bdd2c7a5fee540d5c98ba5/libs/common/src/enums/feature-flag.enum.ts#L12
+    // Android (v2026.2.1): https://github.com/bitwarden/android/blob/6902c19c0093fa476bbf74ccaa70c9f14afbb82f/core/src/main/kotlin/com/bitwarden/core/data/manager/model/FlagKey.kt#L31
+    // iOS (v2026.2.1): https://github.com/bitwarden/ios/blob/cdd9ba1770ca2ffc098d02d12cc3208e3a830454/BitwardenShared/Core/Platform/Models/Enum/FeatureFlag.swift#L7
+    let mut feature_states = parse_experimental_client_feature_flags(experimental_flags, &FeatureFlagFilter::ValidOnly);
+    feature_states.insert("pm-19148-innovation-archive".to_owned(), true);
+    // Organization invite links. Older web vaults only have the admin part, without a way to join through the link.
+    let invite_links = client_version.is_some_and(|v| semver::VersionReq::parse(">=2026.8.1").unwrap().matches(v));
+    feature_states.insert("pm-32497-generate-invite-link".to_owned(), invite_links);
+    feature_states.entry(INVITE_LINK_AUTO_CONFIRM_FEATURE.to_owned()).or_insert(false);
+    feature_states
+}
+
+#[cfg(test)]
+mod invite_link_config_tests {
+    use super::*;
+
+    #[test]
+    fn invite_link_flags_default_to_safe_values_without_a_client_version() {
+        let states = client_feature_states(None, "");
+        assert_eq!(states.get("pm-32497-generate-invite-link"), Some(&false));
+        assert_eq!(states.get(INVITE_LINK_AUTO_CONFIRM_FEATURE), Some(&false));
+    }
+
+    #[test]
+    fn invite_link_generation_requires_a_compatible_client() {
+        let old = semver::Version::new(2026, 8, 0);
+        let current = semver::Version::new(2026, 8, 1);
+        assert_eq!(client_feature_states(Some(&old), "").get("pm-32497-generate-invite-link"), Some(&false));
+        assert_eq!(client_feature_states(Some(&current), "").get("pm-32497-generate-invite-link"), Some(&true));
+    }
+
+    #[test]
+    fn auto_confirm_is_only_enabled_explicitly() {
+        let states = client_feature_states(None, INVITE_LINK_AUTO_CONFIRM_FEATURE);
+        assert_eq!(states.get(INVITE_LINK_AUTO_CONFIRM_FEATURE), Some(&true));
+    }
 }
 
 pub fn catchers() -> Vec<Catcher> {
