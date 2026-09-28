@@ -1,4 +1,4 @@
-use std::{collections::HashSet, str::FromStr};
+use std::collections::HashSet;
 
 use chrono::{NaiveDateTime, Utc};
 use diesel::prelude::*;
@@ -40,16 +40,20 @@ impl OrgInviteLink {
     /// `255 * (253 + JSON quotes/comma) + brackets == 65_281` bytes, below the 65_535-byte limit.
     pub const MAX_ALLOWED_DOMAINS: usize = 255;
 
-    /// Whether new invite links can be created. Joining through one needs a verified email address, which a new
-    /// user only gets through the verification email.
+    /// Whether invite links can be used: created, changed and joined through. Joining through one needs a verified
+    /// email address, which a new user only gets through the verification email.
     pub fn is_available() -> bool {
         CONFIG.mail_enabled()
     }
 
     /// Whether the clients show the invite link of the organization. Also without email if the organization has a
-    /// link from before, so its admins can still manage or delete it, even though no new one can be created.
+    /// link from before, so its admins can still see and delete it, even though it can't be used. Not for a link whose
+    /// code can't be decrypted, which the clients can't show: it can't be used either and a new link replaces it.
     pub async fn is_available_for_org(org_uuid: &OrganizationId, conn: &DbConn) -> bool {
-        Self::is_available() || Self::exists_for_org(org_uuid, conn).await.unwrap_or(false)
+        Self::is_available()
+            || Self::find_protected_by_org(org_uuid, conn)
+                .await
+                .is_ok_and(|link| link.is_some_and(|mut link| link.unprotect_code().is_ok()))
     }
 
     pub fn new(org_uuid: OrganizationId, allowed_domains: String, invite: String, supports_confirmation: bool) -> Self {
@@ -168,11 +172,13 @@ fn is_valid_domain_name(domain: &str) -> bool {
         })
 }
 
-/// The lowercase ASCII (`xn--`) form of the domain of an email address, the form allowed domains are entered in
+/// The lowercase domain of an email address, compared literally like upstream's `EmailValidation.GetDomain`. Only a
+/// plain address counts, no display name. Allowed domains are plain DNS names, so a domain with other characters the
+/// parser accepts, like `example.com#x` or `example.com/x`, never matches one.
 fn email_domain(email: &str) -> Option<String> {
-    let email = email_address::EmailAddress::from_str(email).ok()?;
-    let url = url::Url::parse(&format!("https://{}", email.domain())).ok()?;
-    url.domain().map(str::to_ascii_lowercase)
+    let options = email_address::Options::default().without_display_text();
+    let email = email_address::EmailAddress::parse_with_options(email, options).ok()?;
+    Some(email.domain().to_ascii_lowercase())
 }
 
 /// Database methods
@@ -188,15 +194,7 @@ impl OrgInviteLink {
         org_uuid: &OrganizationId,
         conn: &DbConn,
     ) -> ApiResult<Option<Result<Self, OrgInviteLinkId>>> {
-        let link = conn
-            .run(move |conn| {
-                org_invite_links::table
-                    .filter(org_invite_links::org_uuid.eq(org_uuid))
-                    .first::<Self>(conn)
-                    .optional()
-                    .map_res("Error finding organization invite link")
-            })
-            .await?;
+        let link = Self::find_protected_by_org(org_uuid, conn).await?;
         Ok(link.map(|mut link| match link.unprotect_code() {
             Ok(()) => Ok(link),
             Err(e) => {
@@ -208,6 +206,18 @@ impl OrgInviteLink {
                 Err(link.uuid)
             }
         }))
+    }
+
+    /// The link of the organization with its code as stored
+    async fn find_protected_by_org(org_uuid: &OrganizationId, conn: &DbConn) -> ApiResult<Option<Self>> {
+        conn.run(move |conn| {
+            org_invite_links::table
+                .filter(org_invite_links::org_uuid.eq(org_uuid))
+                .first::<Self>(conn)
+                .optional()
+                .map_res("Error finding organization invite link")
+        })
+        .await
     }
 
     /// Whether the organization has a link, also one whose code can't be decrypted

@@ -44,6 +44,16 @@ pub fn routes() -> Vec<Route> {
 
 const NOT_FOUND: &str = "Invite link not found.";
 const CONFLICT: &str = "An invite link already exists for this organization.";
+const NOT_AVAILABLE: &str = "Your organization's plan does not support invite links.";
+
+/// Without mail invite links can only be seen and deleted, everything else is refused like upstream refuses it for a
+/// plan without invite links, with the message the clients recognize.
+fn ensure_available() -> EmptyResult {
+    if !OrgInviteLink::is_available() {
+        return Err(Error::new_msg(NOT_AVAILABLE).silent());
+    }
+    Ok(())
+}
 
 /// Identifies an invite link for the endpoints used to join, the code is the secret part of it
 #[derive(Debug, Deserialize)]
@@ -77,8 +87,9 @@ impl OpenOrgInvite {
         &self.link.organization_id
     }
 
-    /// Errors if the link can't be used with the email address, like upstream. Otherwise returns whether the link
-    /// lets the address register when signups are disabled, which needs the same settings as inviting it by email.
+    /// Errors if the link can't be used with the email address, or at all without mail, like upstream. Otherwise
+    /// returns whether the link lets the address register when signups are disabled, which needs the same settings as
+    /// inviting it by email.
     pub async fn allows_signup(&self, email: &str, conn: &DbConn) -> ApiResult<bool> {
         if self.sealed_open_org_invite_data.as_ref().is_some_and(|data| data.len() > 4096) {
             err!("The field SealedOpenOrgInviteData must be a string or array type with a maximum length of '4096'.")
@@ -86,7 +97,7 @@ impl OpenOrgInvite {
         let invalid_link = || Error::new_msg("Invalid or expired organization invite link.").silent();
         let code = self.link.parsed_code().map_err(|_| invalid_link())?;
         match lookup_link_with_code(&self.link, &code, conn).await? {
-            Some((link, _)) if link.allows_email(email)? => {
+            Some((link, _)) if OrgInviteLink::is_available() && link.allows_email(email)? => {
                 Ok(CONFIG.invitations_allowed() && CONFIG.is_email_domain_allowed(email))
             }
             _ => Err(invalid_link()),
@@ -159,7 +170,19 @@ struct ConfirmInviteLinkData {
 /// The link and organization of a link reference. A wrong organization and a wrong code are reported the same, so
 /// nothing can be learned about an organization without the code of its link.
 async fn find_link(link: &InviteLinkRef, conn: &DbConn) -> ApiResult<(OrgInviteLink, Organization)> {
-    find_link_with_code(link, &link.parsed_code()?, conn).await
+    find_usable_link(link, &link.parsed_code()?, conn).await
+}
+
+/// Like `find_link_with_code`, but also refuses a link which can't be used without mail. Like upstream, only after the
+/// code matched.
+async fn find_usable_link(
+    link: &InviteLinkRef,
+    code: &uuid::Uuid,
+    conn: &DbConn,
+) -> ApiResult<(OrgInviteLink, Organization)> {
+    let found = find_link_with_code(link, code, conn).await?;
+    ensure_available()?;
+    Ok(found)
 }
 
 async fn find_link_with_code(
@@ -220,9 +243,7 @@ async fn create_invite_link(
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
-    if !OrgInviteLink::is_available() {
-        err!("Invite links need email to be configured on this server, to verify the email addresses of new users.")
-    }
+    ensure_available()?;
     let data = data.into_inner();
     let domains = OrgInviteLink::clean_domains(data.allowed_domains)?;
     data.invite.validate()?;
@@ -253,6 +274,7 @@ async fn update_invite_link(
     headers: AdminHeaders,
     conn: DbConn,
 ) -> JsonResult {
+    ensure_available()?;
     let domains = OrgInviteLink::clean_domains(data.into_inner().allowed_domains)?;
     let mut link = find_org_link(&org_id, &headers, &conn).await?;
     link.allowed_domains = domains;
@@ -273,6 +295,7 @@ async fn update_invite_link_confirmation(
     headers: AdminHeaders,
     conn: DbConn,
 ) -> JsonResult {
+    ensure_available()?;
     let data = data.into_inner();
     data.validate()?;
     let mut link = find_org_link(&org_id, &headers, &conn).await?;
@@ -319,6 +342,7 @@ async fn refresh_invite_link(
     headers: AdminHeaders,
     conn: DbConn,
 ) -> JsonResult {
+    ensure_available()?;
     let data = data.into_inner();
     data.validate()?;
     let old_link = find_org_link(&org_id, &headers, &conn).await?;
@@ -337,12 +361,14 @@ async fn get_invite_link_status(data: Json<InviteLinkRef>, ip: ClientIp, pool: &
     let code = data.parsed_code()?;
     let conn = pool.get().await?;
     let (link, org) = find_link_with_code(&data, &code, &conn).await?;
+    // Without mail the link can't be used, reported like upstream reports it for a plan without invite links
+    let enabled = OrgInviteLink::is_available();
     Ok(Json(json!({
         "organizationName": org.name,
-        "linksEnabled": true,
+        "linksEnabled": enabled,
         // Vaultwarden has no seat limit
-        "seatsAvailable": true,
-        "supportsConfirmation": link.supports_confirmation,
+        "seatsAvailable": enabled,
+        "supportsConfirmation": enabled && link.supports_confirmation,
         // SSO isn't configured per organization. Clients also expect SSO sign-ups of such organizations to add the
         // membership and drop the invite afterwards, which Vaultwarden's SSO does not do.
         "sso": null,
@@ -356,7 +382,7 @@ async fn get_invite_link_policies(data: Json<InviteLinkRef>, ip: ClientIp, pool:
     crate::ratelimit::check_limit_unauthenticated(&ip.ip)?;
     let code = data.parsed_code()?;
     let conn = pool.get().await?;
-    let (_, org) = find_link_with_code(&data, &code, &conn).await?;
+    let (_, org) = find_usable_link(&data, &code, &conn).await?;
     let policies: Vec<Value> = OrgPolicy::find_by_org(&org.uuid, &conn)
         .await
         .iter()
@@ -382,7 +408,7 @@ async fn validate_invite_link_email_domain(
     crate::ratelimit::check_limit_unauthenticated(&ip.ip)?;
     let code = data.link.parsed_code()?;
     let conn = pool.get().await?;
-    let (link, _) = find_link_with_code(&data.link, &code, &conn).await?;
+    let (link, _) = find_usable_link(&data.link, &code, &conn).await?;
     Ok(Json(json!({
         "isAllowed": link.allows_email(&data.email)?,
     })))
