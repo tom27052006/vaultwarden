@@ -223,7 +223,7 @@ async fn create_organization(headers: Headers, data: Json<OrgData>, conn: DbConn
     member.save(&conn).await?;
     collection.save(&conn).await?;
 
-    Ok(Json(org.to_json()))
+    Ok(Json(org.to_json(&conn).await))
 }
 
 #[delete("/organizations/<org_id>", data = "<data>")]
@@ -289,7 +289,7 @@ async fn get_organization(org_id: OrganizationId, headers: OwnerHeaders, conn: D
         err!("Organization not found", "Organization id's do not match");
     }
     if let Some(organization) = Organization::find_by_uuid(&org_id, &conn).await {
-        Ok(Json(organization.to_json()))
+        Ok(Json(organization.to_json(&conn).await))
     } else {
         err!("Can't find organization details")
     }
@@ -338,7 +338,7 @@ async fn post_organization(
     )
     .await;
 
-    Ok(Json(org.to_json()))
+    Ok(Json(org.to_json(&conn).await))
 }
 
 // GET /api/collections?writeOnly=false

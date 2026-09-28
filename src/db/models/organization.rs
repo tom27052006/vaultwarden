@@ -193,7 +193,7 @@ impl Organization {
         }
     }
     // https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Api/AdminConsole/Models/Response/Organizations/OrganizationResponseModel.cs
-    pub fn to_json(&self) -> Value {
+    pub async fn to_json(&self, conn: &DbConn) -> Value {
         json!({
             "id": self.uuid,
             "name": self.name,
@@ -215,7 +215,7 @@ impl Organization {
             "selfHost": true,
             "useApi": true,
             "useDisableSMAdsForUsers": true, // Hide Secrets Manager ads
-            "useInviteLinks": OrgInviteLink::is_available(),
+            "useInviteLinks": OrgInviteLink::is_available_for_org(&self.uuid, conn).await,
             "useMyItems": false, // Not (yet) supported
             "useOrganizationDomains": false, // Not supported (Linked to SSO)
             "usePam": false, // Not supported
@@ -492,7 +492,7 @@ impl Membership {
             "useAdminSponsoredFamilies": false,
             "useRiskInsights": false, // Not supported (Not AGPLv3 Licensed)
             "useDisableSMAdsForUsers": true, // Hide Secrets Manager ads
-            "useInviteLinks": OrgInviteLink::is_available(),
+            "useInviteLinks": OrgInviteLink::is_available_for_org(&self.org_uuid, conn).await,
             "useMyItems": false, // Not (yet) supported
             "useOrganizationDomains": false, // Not supported (Linked to SSO)
             "usePam": false, // Not supported

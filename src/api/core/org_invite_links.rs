@@ -43,6 +43,7 @@ pub fn routes() -> Vec<Route> {
 }
 
 const NOT_FOUND: &str = "Invite link not found.";
+const CONFLICT: &str = "An invite link already exists for this organization.";
 
 /// Identifies an invite link for the endpoints used to join, the code is the secret part of it
 #[derive(Debug, Deserialize)]
@@ -189,21 +190,17 @@ async fn find_org_link(org_id: &OrganizationId, headers: &AdminHeaders, conn: &D
     if org_id != &headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
-    match OrgInviteLink::find_by_org(org_id, conn).await? {
-        Some(link) => Ok(link),
-        // The code can't be decrypted, which `find_by_org` logged
-        None if OrgInviteLink::exists_for_org(org_id, conn).await? => {
-            err!(
-                "This invite link can no longer be used because the server's keys changed. Delete it and create a new one."
-            )
-        }
-        None => err_code!(NOT_FOUND, Status::NotFound.code),
-    }
+    // A link whose code can't be decrypted is not found either, which `find_by_org` logged. The clients only take a
+    // Not Found as no link, and then let the admin create a new one, which replaces it.
+    let Some(link) = OrgInviteLink::find_by_org(org_id, conn).await? else {
+        err_code!(NOT_FOUND, Status::NotFound.code)
+    };
+    Ok(link)
 }
 
 async fn conflict_if_link_exists(org_id: &OrganizationId, conn: &DbConn) -> EmptyResult {
     if OrgInviteLink::exists_for_org(org_id, conn).await? {
-        err_code!("An invite link already exists for this organization.", Status::Conflict.code)
+        err_code!(CONFLICT, Status::Conflict.code)
     }
     Ok(())
 }
@@ -229,10 +226,17 @@ async fn create_invite_link(
     let data = data.into_inner();
     let domains = OrgInviteLink::clean_domains(data.allowed_domains)?;
     data.invite.validate()?;
-    conflict_if_link_exists(&org_id, &conn).await?;
 
     let link = OrgInviteLink::new(org_id.clone(), domains, data.invite.invite, data.invite.supports_confirmation);
-    if let Err(e) = link.insert(&conn).await {
+    let replaced = match OrgInviteLink::find_stored_by_org(&org_id, &conn).await? {
+        Some(Ok(_)) => err_code!(CONFLICT, Status::Conflict.code),
+        // A link whose code can't be decrypted can't be used anymore, so the new link takes its place
+        Some(Err(undecryptable)) => link.replace_undecryptable(&undecryptable, &conn).await?,
+        None => false,
+    };
+    if replaced {
+        info!("Replaced the invite link of organization {org_id} whose code couldn't be decrypted");
+    } else if let Err(e) = link.insert(&conn).await {
         // The unique index on the organization rejected a link a concurrent request created first
         conflict_if_link_exists(&org_id, &conn).await?;
         return Err(e);

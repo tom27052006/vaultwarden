@@ -594,7 +594,7 @@ async fn organizations_overview(_token: AdminToken, conn: DbConn) -> ApiResult<H
     let organizations = Organization::get_all(&conn).await;
     let mut organizations_json = Vec::with_capacity(organizations.len());
     for o in organizations {
-        let mut org = o.to_json();
+        let mut org = o.to_json(&conn).await;
         org["user_count"] = json!(Membership::count_by_org(&o.uuid, &conn).await);
         org["cipher_count"] = json!(Cipher::count_by_org(&o.uuid, &conn).await);
         org["collection_count"] = json!(Collection::count_by_org(&o.uuid, &conn).await);
