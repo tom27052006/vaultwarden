@@ -296,17 +296,22 @@ async fn accept_org_invite(
     reset_password_key: Option<String>,
     conn: &DbConn,
 ) -> EmptyResult {
-    if member.status != MembershipStatus::Invited as i32 {
-        err!("User already accepted the invitation");
-    }
-
-    member.status = MembershipStatus::Accepted as i32;
-    member.reset_password_key = reset_password_key;
-
-    // This check is also done at accept_invite, _confirm_invite, _activate_member, edit_member, admin::update_membership_type
-    OrgPolicy::check_user_allowed(&member, "join", conn).await?;
-
-    member.save(conn).await?;
+    conn.run_locked_for_org_and_user(&member.org_uuid.clone(), &user.uuid, async {
+        member = Membership::find_by_uuid_and_org(&member.uuid, &member.org_uuid, conn)
+            .await
+            .ok_or_else(|| Error::new_msg("Organization membership not found"))?;
+        if member.status != MembershipStatus::Invited as i32 {
+            err!("User already accepted the invitation");
+        }
+        member.status = MembershipStatus::Accepted as i32;
+        member.reset_password_key = reset_password_key;
+        OrgPolicy::check_user_allowed(&member, "join", conn).await?;
+        if !member.update_status_if(MembershipStatus::Invited as i32, conn).await? {
+            err!("User already accepted the invitation");
+        }
+        Ok(())
+    })
+    .await?;
 
     if CONFIG.mail_enabled() {
         let Some(org) = Organization::find_by_uuid(&member.org_uuid, conn).await else {

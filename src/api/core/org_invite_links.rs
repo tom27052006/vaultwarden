@@ -46,8 +46,7 @@ const NOT_FOUND: &str = "Invite link not found.";
 const CONFLICT: &str = "An invite link already exists for this organization.";
 const NOT_AVAILABLE: &str = "Your organization's plan does not support invite links.";
 
-/// Without mail invite links can only be seen and deleted, everything else is refused like upstream refuses it for a
-/// plan without invite links, with the message the clients recognize.
+/// Capability is independent of SMTP; verification requirements are enforced in registration and join flows.
 fn ensure_available() -> EmptyResult {
     if !OrgInviteLink::is_available() {
         return Err(Error::new_msg(NOT_AVAILABLE).silent());
@@ -87,9 +86,8 @@ impl OpenOrgInvite {
         &self.link.organization_id
     }
 
-    /// Errors if the link can't be used with the email address, or at all without mail, like upstream. Otherwise
-    /// returns whether the link lets the address register when signups are disabled, which needs the same settings as
-    /// inviting it by email.
+    /// Errors if the link can't be used with the email address. Registration separately requires a usable mail path
+    /// for link-based email verification.
     pub async fn allows_signup(&self, email: &str, conn: &DbConn) -> ApiResult<bool> {
         if self.sealed_open_org_invite_data.as_ref().is_some_and(|data| data.len() > 4096) {
             err!("The field SealedOpenOrgInviteData must be a string or array type with a maximum length of '4096'.")
@@ -173,8 +171,7 @@ async fn find_link(link: &InviteLinkRef, conn: &DbConn) -> ApiResult<(OrgInviteL
     find_usable_link(link, &link.parsed_code()?, conn).await
 }
 
-/// Like `find_link_with_code`, but also refuses a link which can't be used without mail. Like upstream, only after the
-/// code matched.
+/// Like `find_link_with_code`, but also checks server capability after the code matched.
 async fn find_usable_link(
     link: &InviteLinkRef,
     code: &uuid::Uuid,
@@ -221,13 +218,6 @@ async fn find_org_link(org_id: &OrganizationId, headers: &AdminHeaders, conn: &D
     Ok(link)
 }
 
-async fn conflict_if_link_exists(org_id: &OrganizationId, conn: &DbConn) -> EmptyResult {
-    if OrgInviteLink::exists_for_org(org_id, conn).await? {
-        err_code!(CONFLICT, Status::Conflict.code)
-    }
-    Ok(())
-}
-
 #[get("/organizations/<org_id>/invite-link")]
 async fn get_invite_link(org_id: OrganizationId, headers: AdminHeaders, conn: DbConn) -> JsonResult {
     Ok(Json(find_org_link(&org_id, &headers, &conn).await?.to_json()?))
@@ -248,20 +238,24 @@ async fn create_invite_link(
     let domains = OrgInviteLink::clean_domains(data.allowed_domains)?;
     data.invite.validate()?;
 
-    let link = OrgInviteLink::new(org_id.clone(), domains, data.invite.invite, data.invite.supports_confirmation);
-    let replaced = match OrgInviteLink::find_stored_by_org(&org_id, &conn).await? {
-        Some(Ok(_)) => err_code!(CONFLICT, Status::Conflict.code),
-        // A link whose code can't be decrypted can't be used anymore, so the new link takes its place
-        Some(Err(undecryptable)) => link.replace_undecryptable(&undecryptable, &conn).await?,
-        None => false,
-    };
-    if replaced {
-        info!("Replaced the invite link of organization {org_id} whose code couldn't be decrypted");
-    } else if let Err(e) = link.insert(&conn).await {
-        // The unique index on the organization rejected a link a concurrent request created first
-        conflict_if_link_exists(&org_id, &conn).await?;
-        return Err(e);
-    }
+    let link = conn
+        .run_locked_for_org(&org_id, async {
+            let link =
+                OrgInviteLink::new(org_id.clone(), domains, data.invite.invite, data.invite.supports_confirmation);
+            let replaced = match OrgInviteLink::find_stored_by_org(&org_id, &conn).await? {
+                Some(Ok(_)) => err_code!(CONFLICT, Status::Conflict.code),
+                // A link whose code can't be decrypted can't be used anymore, so the new link takes its place
+                Some(Err(undecryptable)) => link.replace_undecryptable(&undecryptable, &conn).await?,
+                None => false,
+            };
+            if replaced {
+                info!("Replaced the invite link of organization {org_id} whose code couldn't be decrypted");
+            } else {
+                link.insert(&conn).await?;
+            }
+            Ok(link)
+        })
+        .await?;
 
     headers.log_event(EventType::OrganizationInviteLinkCreated, &org_id, &org_id, &conn).await;
     Ok(status::Created::new(format!("organizations/{org_id}/invite-link")).body(Json(link.to_json()?)))
@@ -276,12 +270,17 @@ async fn update_invite_link(
 ) -> JsonResult {
     ensure_available()?;
     let domains = OrgInviteLink::clean_domains(data.into_inner().allowed_domains)?;
-    let mut link = find_org_link(&org_id, &headers, &conn).await?;
-    link.allowed_domains = domains;
-    link.revision_date = Utc::now().naive_utc();
-    if !link.update_allowed_domains(&conn).await? {
-        err_code!(NOT_FOUND, Status::NotFound.code)
-    }
+    let link = conn
+        .run_locked_for_org(&org_id, async {
+            let mut link = find_org_link(&org_id, &headers, &conn).await?;
+            link.allowed_domains = domains;
+            link.revision_date = Utc::now().naive_utc();
+            if !link.update_allowed_domains(&conn).await? {
+                err_code!(NOT_FOUND, Status::NotFound.code)
+            }
+            Ok(link)
+        })
+        .await?;
 
     headers.log_event(EventType::OrganizationInviteLinkDomainsEdited, &org_id, &org_id, &conn).await;
     Ok(Json(link.to_json()?))
@@ -298,13 +297,18 @@ async fn update_invite_link_confirmation(
     ensure_available()?;
     let data = data.into_inner();
     data.validate()?;
-    let mut link = find_org_link(&org_id, &headers, &conn).await?;
-    link.invite = data.invite;
-    link.supports_confirmation = data.supports_confirmation;
-    link.revision_date = Utc::now().naive_utc();
-    if !link.replace(&link.uuid, &conn).await? {
-        err_code!(NOT_FOUND, Status::NotFound.code)
-    }
+    let link = conn
+        .run_locked_for_org(&org_id, async {
+            let mut link = find_org_link(&org_id, &headers, &conn).await?;
+            link.invite = data.invite;
+            link.supports_confirmation = data.supports_confirmation;
+            link.revision_date = Utc::now().naive_utc();
+            if !link.replace(&link.uuid, &conn).await? {
+                err_code!(NOT_FOUND, Status::NotFound.code)
+            }
+            Ok(link)
+        })
+        .await?;
 
     let event = if link.supports_confirmation {
         EventType::OrganizationInviteLinkConfirmEnabled
@@ -326,9 +330,13 @@ async fn delete_invite_link(
     }
     // Without decrypting the code, so a link whose code can't be decrypted anymore can be deleted too.
     // Members who joined through the link stay members.
-    if !OrgInviteLink::delete_all_by_organization(&org_id, &conn).await? {
-        err_code!(NOT_FOUND, Status::NotFound.code)
-    }
+    conn.run_locked_for_org(&org_id, async {
+        if !OrgInviteLink::delete_all_by_organization(&org_id, &conn).await? {
+            err_code!(NOT_FOUND, Status::NotFound.code)
+        }
+        Ok(())
+    })
+    .await?;
 
     headers.log_event(EventType::OrganizationInviteLinkDeleted, &org_id, &org_id, &conn).await;
     Ok(status::NoContent)
@@ -345,11 +353,17 @@ async fn refresh_invite_link(
     ensure_available()?;
     let data = data.into_inner();
     data.validate()?;
-    let old_link = find_org_link(&org_id, &headers, &conn).await?;
-    let link = OrgInviteLink::new(org_id.clone(), old_link.allowed_domains, data.invite, data.supports_confirmation);
-    if !link.replace(&old_link.uuid, &conn).await? {
-        err_code!(NOT_FOUND, Status::NotFound.code)
-    }
+    let link = conn
+        .run_locked_for_org(&org_id, async {
+            let old_link = find_org_link(&org_id, &headers, &conn).await?;
+            let link =
+                OrgInviteLink::new(org_id.clone(), old_link.allowed_domains, data.invite, data.supports_confirmation);
+            if !link.replace(&old_link.uuid, &conn).await? {
+                err_code!(NOT_FOUND, Status::NotFound.code)
+            }
+            Ok(link)
+        })
+        .await?;
 
     headers.log_event(EventType::OrganizationInviteLinkRefreshed, &org_id, &org_id, &conn).await;
     Ok(Json(link.to_json()?))
@@ -361,7 +375,7 @@ async fn get_invite_link_status(data: Json<InviteLinkRef>, ip: ClientIp, pool: &
     let code = data.parsed_code()?;
     let conn = pool.get().await?;
     let (link, org) = find_link_with_code(&data, &code, &conn).await?;
-    // Without mail the link can't be used, reported like upstream reports it for a plan without invite links
+    // Capability is independent of SMTP; joining still requires a verified email address.
     let enabled = OrgInviteLink::is_available();
     Ok(Json(json!({
         "organizationName": org.name,
@@ -444,19 +458,36 @@ async fn joining_member(
     Ok((member.unwrap_or_else(|| Membership::new(user.uuid.clone(), org.uuid.clone(), None)), previous_status))
 }
 
-/// Checks the policies of the organization and stores the joined membership. Nothing is stored if a check fails,
-/// and a concurrent request can neither create a second membership nor get a revocation undone. The joins of a user
-/// run one after another, so the SingleOrg checks of each one see the memberships the joins before it stored.
+/// Revalidates the current link and membership under the organization, user and link locks before writing.
 async fn save_joined_member(
     member: &mut Membership,
-    previous_status: Option<i32>,
     reset_password_key: Option<String>,
     headers: &Headers,
     org: &Organization,
+    link_ref: &InviteLinkRef,
+    max_status: MembershipStatus,
     conn: &DbConn,
 ) -> EmptyResult {
+    let code = link_ref.parsed_code()?;
     let auto_enroll = conn
-        .run_locked_for_user(&headers.user.uuid, async {
+        .run_locked_for_org_and_user(&org.uuid, &headers.user.uuid, async {
+            let Some(current_link) = OrgInviteLink::find_by_org_for_update(&link_ref.organization_id, conn).await? else {
+                err_code!(NOT_FOUND, Status::NotFound.code)
+            };
+            if current_link.org_uuid != org.uuid || !current_link.code_matches(&code) {
+                err_code!(NOT_FOUND, Status::NotFound.code)
+            }
+            ensure_available()?;
+            if member.status == MembershipStatus::Confirmed as i32 && !current_link.supports_confirmation {
+                err!("This invite link does not support confirmation.")
+            }
+            let desired_status = member.status;
+            let desired_key = std::mem::take(&mut member.akey);
+            let (mut current_member, previous_status) =
+                joining_member(&headers.user, &current_link, org, max_status, conn).await?;
+            current_member.status = desired_status;
+            current_member.akey = desired_key;
+            *member = current_member;
             // The checks of `OrgPolicy::check_user_allowed`, in the order and with the messages of upstream
             let violations = OrgPolicy::find_violations(member, conn).await;
             if violations.contains(&PolicyViolation::SingleOrgOther) {
@@ -536,10 +567,18 @@ async fn get_invite(data: Json<InviteLinkRef>, headers: Headers, conn: DbConn) -
 async fn accept_invite_link(data: Json<AcceptInviteLinkData>, headers: Headers, conn: DbConn) -> EmptyResult {
     let data = data.into_inner();
     let (link, org) = find_link(&data.link, &conn).await?;
-    let (mut member, previous_status) =
-        joining_member(&headers.user, &link, &org, MembershipStatus::Invited, &conn).await?;
+    let (mut member, _) = joining_member(&headers.user, &link, &org, MembershipStatus::Invited, &conn).await?;
     member.status = MembershipStatus::Accepted as i32;
-    save_joined_member(&mut member, previous_status, data.reset_password_key, &headers, &org, &conn).await?;
+    save_joined_member(
+        &mut member,
+        data.reset_password_key,
+        &headers,
+        &org,
+        &data.link,
+        MembershipStatus::Invited,
+        &conn,
+    )
+    .await?;
 
     log_member_event(EventType::OrganizationUserInviteLinkAccepted, &member, &headers, &conn).await;
 
@@ -582,11 +621,19 @@ async fn confirm_invite_link(
     if data.org_user_key.is_empty() {
         err!("The OrgUserKey field is required.")
     }
-    let (mut member, previous_status) =
-        joining_member(&headers.user, &link, &org, MembershipStatus::Accepted, &conn).await?;
+    let (mut member, _) = joining_member(&headers.user, &link, &org, MembershipStatus::Accepted, &conn).await?;
     member.status = MembershipStatus::Confirmed as i32;
     member.akey = data.org_user_key;
-    save_joined_member(&mut member, previous_status, data.reset_password_key, &headers, &org, &conn).await?;
+    save_joined_member(
+        &mut member,
+        data.reset_password_key,
+        &headers,
+        &org,
+        &data.link,
+        MembershipStatus::Accepted,
+        &conn,
+    )
+    .await?;
 
     log_member_event(EventType::OrganizationUserInviteLinkConfirmed, &member, &headers, &conn).await;
 

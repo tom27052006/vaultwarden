@@ -1104,6 +1104,12 @@ async fn register_verification_email(
 
     let data = data.into_inner();
 
+    if data.open_org_invite.is_some() && !CONFIG.mail_enabled() {
+        err!(
+            "Email verification is required to register through an organization invite link, but email is unavailable."
+        )
+    }
+
     // An invite link can only stand in for an allowed signup if the address gets verified, which joining needs
     let invite_allows_signup = match &data.open_org_invite {
         Some(invite) => invite.allows_signup(&data.email, &conn).await? && CONFIG.mail_enabled(),

@@ -1,11 +1,10 @@
-use std::collections::HashSet;
+use std::future::Future;
 
 use chrono::{NaiveDateTime, Utc};
 use diesel::prelude::*;
 use serde_json::Value;
 
 use crate::{
-    CONFIG,
     api::{ApiResult, EmptyResult},
     crypto,
     db::{DbConn, schema::org_invite_links},
@@ -23,7 +22,7 @@ use super::OrganizationId;
 pub struct OrgInviteLink {
     pub uuid: OrgInviteLinkId,
     pub org_uuid: OrganizationId,
-    /// Bearer secret of the link, always a UUID here and only stored encrypted. Only compare it with `code_matches`
+    /// Bearer secret of the link, a random UUID as in Bitwarden. Only compare it with `code_matches`.
     code: String,
     /// JSON list of the email domains which may use the link
     pub allowed_domains: String,
@@ -40,20 +39,14 @@ impl OrgInviteLink {
     /// `255 * (253 + JSON quotes/comma) + brackets == 65_281` bytes, below the 65_535-byte limit.
     pub const MAX_ALLOWED_DOMAINS: usize = 255;
 
-    /// Whether invite links can be used: created, changed and joined through. Joining through one needs a verified
-    /// email address, which a new user only gets through the verification email.
+    /// Link use by an existing verified account does not require an SMTP server.
     pub fn is_available() -> bool {
-        CONFIG.mail_enabled()
+        true
     }
 
-    /// Whether the clients show the invite link of the organization. Also without email if the organization has a
-    /// link from before, so its admins can still see and delete it, even though it can't be used. Not for a link whose
-    /// code can't be decrypted, which the clients can't show: it can't be used either and a new link replaces it.
-    pub async fn is_available_for_org(org_uuid: &OrganizationId, conn: &DbConn) -> bool {
-        Self::is_available()
-            || Self::find_protected_by_org(org_uuid, conn)
-                .await
-                .is_ok_and(|link| link.is_some_and(|mut link| link.unprotect_code().is_ok()))
+    /// Keep the asynchronous call shape used by organization responses without requiring a database query.
+    pub fn is_available_for_org(_org_uuid: &OrganizationId, _conn: &DbConn) -> impl Future<Output = bool> {
+        std::future::ready(Self::is_available())
     }
 
     pub fn new(org_uuid: OrganizationId, allowed_domains: String, invite: String, supports_confirmation: bool) -> Self {
@@ -79,17 +72,17 @@ impl OrgInviteLink {
 
         let mut invalid = Vec::new();
         let mut cleaned = Vec::with_capacity(domains.len());
-        let mut seen = HashSet::with_capacity(domains.len());
-        for mut domain in domains {
+        for domain in domains {
+            let domain = domain.trim().to_ascii_lowercase();
+            if domain.is_empty() {
+                continue;
+            }
             if !is_valid_domain_name(&domain) {
                 invalid.push(format!("'{}'", domain.escape_debug()));
                 continue;
             }
 
-            domain.make_ascii_lowercase();
-            if seen.insert(domain.clone()) {
-                cleaned.push(domain);
-            }
+            cleaned.push(domain);
         }
         if !invalid.is_empty() {
             err!(format!("The following items are not valid: {}", invalid.join(", ")))
@@ -138,13 +131,9 @@ impl OrgInviteLink {
         format!("OrganizationInviteLink.Code:{}", self.org_uuid)
     }
 
-    fn protected_code(&self) -> ApiResult<String> {
-        crypto::protect_database_field(&self.code, self.code_associated_data().as_bytes())
-    }
-
     fn unprotect_code(&mut self) -> EmptyResult {
-        // Branch builds before at-rest protection stored a plain UUID. Only that exact legacy shape is accepted;
-        // a malformed or unknown envelope is corruption, not plaintext to silently trust.
+        // Earlier feature-branch builds stored an RSA-derived AES-GCM envelope. New links use Bitwarden's UUID
+        // representation, and startup migrates decryptable envelopes before an RSA key can be rotated.
         if crypto::is_protected_database_field(&self.code) {
             self.code = crypto::unprotect_database_field(&self.code, self.code_associated_data().as_bytes())?;
         }
@@ -183,8 +172,7 @@ fn email_domain(email: &str) -> Option<String> {
 
 /// Database methods
 impl OrgInviteLink {
-    /// The link of the organization. A link whose code can't be decrypted counts as no link, as the key protecting
-    /// the codes is derived from `rsa_key.pem`: replacing that file leaves links which can't be used anymore.
+    /// The link of the organization. A legacy envelope whose RSA key is already lost counts as missing.
     pub async fn find_by_org(org_uuid: &OrganizationId, conn: &DbConn) -> ApiResult<Option<Self>> {
         Ok(Self::find_stored_by_org(org_uuid, conn).await?.and_then(Result::ok))
     }
@@ -200,7 +188,7 @@ impl OrgInviteLink {
             Err(e) => {
                 error!(
                     "The code of the invite link of organization {org_uuid} can't be decrypted ({e:?}). It was probably \
-                    protected with a different rsa_key.pem. The link can't be used and counts as missing, creating a \
+                    protected with a different rsa_key.pem. The link can't be used and counts as missing; creating a \
                     new one replaces it."
                 );
                 Err(link.uuid)
@@ -220,28 +208,66 @@ impl OrgInviteLink {
         .await
     }
 
-    /// Whether the organization has a link, also one whose code can't be decrypted
-    pub async fn exists_for_org(org_uuid: &OrganizationId, conn: &DbConn) -> ApiResult<bool> {
-        conn.run(move |conn| {
-            org_invite_links::table
-                .filter(org_invite_links::org_uuid.eq(org_uuid))
-                .count()
-                .first::<i64>(conn)
-                .map(|count| count > 0)
-                .map_res("Error finding organization invite link")
-        })
-        .await
+    /// Current locking read inside the organization and user transaction. DELETE, refresh and support-confirm
+    /// update the same row, so they cannot complete between this read and the membership write.
+    pub async fn find_by_org_for_update(org_uuid: &OrganizationId, conn: &DbConn) -> ApiResult<Option<Self>> {
+        let conn_ref = conn;
+        let link = db_run! { conn_ref:
+            sqlite {
+                org_invite_links::table.filter(org_invite_links::org_uuid.eq(org_uuid)).first::<Self>(conn_ref).optional()
+            }
+            mysql, postgresql {
+                org_invite_links::table.filter(org_invite_links::org_uuid.eq(org_uuid)).for_update().first::<Self>(conn_ref).optional()
+            }
+        }
+        .map_res("Error locking organization invite link")?;
+        Ok(link.and_then(|mut link| link.unprotect_code().ok().map(|()| link)))
+    }
+
+    /// One-time, idempotent conversion while the old RSA key is still present. Rows encrypted under an already
+    /// lost key remain replaceable or deletable through the existing admin endpoints.
+    pub async fn migrate_legacy_codes(conn: &DbConn) -> ApiResult<()> {
+        let conn_ref = conn;
+        let links = db_run! { conn_ref:
+            sqlite, mysql, postgresql {
+                org_invite_links::table.load::<Self>(conn_ref).map_res("Error loading invite links")
+            }
+        }?;
+        for mut link in links {
+            if !crypto::is_protected_database_field(&link.code) {
+                continue;
+            }
+            let old_code = link.code.clone();
+            if let Err(e) = link.unprotect_code() {
+                error!("Could not migrate invite link {}: {e:?}", link.uuid.0);
+                continue;
+            }
+            let conn_ref = conn;
+            db_run! { conn_ref:
+                sqlite, mysql, postgresql {
+                diesel::update(
+                    org_invite_links::table
+                        .filter(org_invite_links::uuid.eq(&link.uuid))
+                        .filter(org_invite_links::code.eq(old_code)),
+                )
+                .set(org_invite_links::code.eq(link.code))
+                .execute(conn_ref)
+                .map(|_| ())
+                .map_res("Error migrating invite link code")
+                }
+            }?;
+        }
+        Ok(())
     }
 
     /// Fails if the organization already has a link, the unique index also covers concurrent requests
     pub async fn insert(&self, conn: &DbConn) -> EmptyResult {
-        let protected_code = self.protected_code()?;
         conn.run(move |conn| {
             diesel::insert_into(org_invite_links::table)
                 .values((
                     org_invite_links::uuid.eq(&self.uuid),
                     org_invite_links::org_uuid.eq(&self.org_uuid),
-                    org_invite_links::code.eq(&protected_code),
+                    org_invite_links::code.eq(&self.code),
                     org_invite_links::allowed_domains.eq(&self.allowed_domains),
                     org_invite_links::invite.eq(&self.invite),
                     org_invite_links::supports_confirmation.eq(self.supports_confirmation),
@@ -256,11 +282,10 @@ impl OrgInviteLink {
 
     /// Stores the allowed domains, returns `false` if the link was refreshed or deleted meanwhile
     pub async fn update_allowed_domains(&self, conn: &DbConn) -> ApiResult<bool> {
-        let protected_code = self.protected_code()?;
         conn.run(move |conn| {
             diesel::update(org_invite_links::table.filter(org_invite_links::uuid.eq(&self.uuid)))
                 .set((
-                    org_invite_links::code.eq(&protected_code),
+                    org_invite_links::code.eq(&self.code),
                     org_invite_links::allowed_domains.eq(&self.allowed_domains),
                     org_invite_links::revision_date.eq(self.revision_date),
                 ))
@@ -275,12 +300,11 @@ impl OrgInviteLink {
     /// A refreshed link gets a new uuid and code here, which invalidates the old code in the same statement.
     /// Returns `false` if the link with `uuid` was refreshed or deleted meanwhile.
     pub async fn replace(&self, uuid: &OrgInviteLinkId, conn: &DbConn) -> ApiResult<bool> {
-        let protected_code = self.protected_code()?;
         conn.run(move |conn| {
             diesel::update(org_invite_links::table.filter(org_invite_links::uuid.eq(uuid)))
                 .set((
                     org_invite_links::uuid.eq(&self.uuid),
-                    org_invite_links::code.eq(&protected_code),
+                    org_invite_links::code.eq(&self.code),
                     org_invite_links::invite.eq(&self.invite),
                     org_invite_links::supports_confirmation.eq(self.supports_confirmation),
                     org_invite_links::creation_date.eq(self.creation_date),
@@ -296,12 +320,11 @@ impl OrgInviteLink {
     /// Stores this new link in place of the link with `uuid` whose code can't be decrypted, in one statement so only
     /// one of concurrent requests replaces it. Returns `false` if that link was replaced or deleted meanwhile.
     pub async fn replace_undecryptable(&self, uuid: &OrgInviteLinkId, conn: &DbConn) -> ApiResult<bool> {
-        let protected_code = self.protected_code()?;
         conn.run(move |conn| {
             diesel::update(org_invite_links::table.filter(org_invite_links::uuid.eq(uuid)))
                 .set((
                     org_invite_links::uuid.eq(&self.uuid),
-                    org_invite_links::code.eq(&protected_code),
+                    org_invite_links::code.eq(&self.code),
                     org_invite_links::allowed_domains.eq(&self.allowed_domains),
                     org_invite_links::invite.eq(&self.invite),
                     org_invite_links::supports_confirmation.eq(self.supports_confirmation),

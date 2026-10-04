@@ -548,8 +548,7 @@ struct MembershipTypeData {
 async fn update_membership_type(data: Json<MembershipTypeData>, token: AdminToken, conn: DbConn) -> EmptyResult {
     let data: MembershipTypeData = data.into_inner();
 
-    let Some(mut member_to_edit) = Membership::find_by_user_and_org(&data.user_uuid, &data.org_uuid, &conn).await
-    else {
+    let Some(member_to_edit) = Membership::find_by_user_and_org(&data.user_uuid, &data.org_uuid, &conn).await else {
         err!("The specified user isn't member of the organization")
     };
 
@@ -566,9 +565,22 @@ async fn update_membership_type(data: Json<MembershipTypeData>, token: AdminToke
         }
     }
 
-    member_to_edit.atype = new_type;
-    // This check is also done at api::organizations::{accept_invite, _confirm_invite, _activate_member, edit_member}, update_membership_type
-    OrgPolicy::check_user_allowed(&member_to_edit, "modify", &conn).await?;
+    conn.run_locked_for_org_and_user(&data.org_uuid, &member_to_edit.user_uuid, async {
+        let Some(mut current) = Membership::find_by_uuid_and_org(&member_to_edit.uuid, &data.org_uuid, &conn).await
+        else {
+            err!("The specified user isn't member of the organization")
+        };
+        if current.atype == MembershipType::Owner
+            && new_type != MembershipType::Owner
+            && Membership::count_confirmed_by_org_and_type(&data.org_uuid, MembershipType::Owner, &conn).await <= 1
+        {
+            err!("Can't change the type of the last owner")
+        }
+        current.atype = new_type;
+        OrgPolicy::check_user_allowed(&current, "modify", &conn).await?;
+        current.save(&conn).await
+    })
+    .await?;
 
     log_event(
         EventType::OrganizationUserUpdated,
@@ -581,7 +593,7 @@ async fn update_membership_type(data: Json<MembershipTypeData>, token: AdminToke
     )
     .await;
 
-    member_to_edit.save(&conn).await
+    Ok(())
 }
 
 #[post("/users/update_revision", format = "application/json")]

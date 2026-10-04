@@ -1442,11 +1442,25 @@ async fn confirm_invite_impl(
         err!("User in invalid state")
     }
 
-    member_to_confirm.status = MembershipStatus::Confirmed as i32;
-    member_to_confirm.akey = key.to_owned();
-
-    // This check is also done at accept_invite, _confirm_invite, _activate_member, edit_member, admin::update_membership_type
-    OrgPolicy::check_user_allowed(&member_to_confirm, "confirm", conn).await?;
+    conn.run_locked_for_org_and_user(org_id, &member_to_confirm.user_uuid.clone(), async {
+        member_to_confirm = Membership::find_by_uuid_and_org(member_id, org_id, conn)
+            .await
+            .ok_or_else(|| crate::Error::new_msg("The specified user isn't a member of the organization"))?;
+        if member_to_confirm.status != MembershipStatus::Accepted as i32 {
+            err!("User in invalid state")
+        }
+        if member_to_confirm.atype != MembershipType::User && headers.membership_type != MembershipType::Owner {
+            err!("Only Owners can confirm Managers, Admins or Owners")
+        }
+        member_to_confirm.status = MembershipStatus::Confirmed as i32;
+        key.clone_into(&mut member_to_confirm.akey);
+        OrgPolicy::check_user_allowed(&member_to_confirm, "confirm", conn).await?;
+        if !member_to_confirm.update_status_if(MembershipStatus::Accepted as i32, conn).await? {
+            err!("User in invalid state")
+        }
+        Ok(())
+    })
+    .await?;
 
     log_event(
         EventType::OrganizationUserConfirmed,
@@ -1473,13 +1487,11 @@ async fn confirm_invite_impl(
         mail::send_invite_confirmed(&address, &org_name).await?;
     }
 
-    let save_result = member_to_confirm.save(conn).await;
-
     if let Some(user) = User::find_by_uuid(&member_to_confirm.user_uuid, conn).await {
         nt.send_user_update(UpdateType::SyncOrgKeys, &user, headers.device.push_uuid.as_ref(), conn).await;
     }
 
-    save_result
+    Ok(())
 }
 
 #[get("/organizations/<org_id>/users/mini-details", rank = 1)]
@@ -1601,8 +1613,7 @@ async fn edit_member(
     member_to_edit.access_all = access_all;
     member_to_edit.atype = new_type as i32;
 
-    // This check is also done at accept_invite, _confirm_invite, _activate_member, edit_member, admin::update_membership_type
-    // We need to perform the check after changing the type since `admin` is exempt.
+    // Reject before touching collection and group assignments; the final check below closes a concurrent policy race.
     OrgPolicy::check_user_allowed(&member_to_edit, "modify", &conn).await?;
 
     // Delete all the odd collections
@@ -1640,6 +1651,33 @@ async fn edit_member(
         group_entry.save(&conn).await?;
     }
 
+    conn.run_locked_for_org_and_user(&org_id, &member_to_edit.user_uuid, async {
+        let Some(mut current) = Membership::find_by_uuid_and_org(&member_id, &org_id, &conn).await else {
+            err!("The specified user isn't member of the organization")
+        };
+        if new_type != current.atype
+            && (current.atype >= MembershipType::Admin || new_type >= MembershipType::Admin)
+            && headers.membership_type != MembershipType::Owner
+        {
+            err!("Only Owners can grant and remove Admin or Owner privileges")
+        }
+        if current.atype == MembershipType::Owner && headers.membership_type != MembershipType::Owner {
+            err!("Only Owners can edit Owner users")
+        }
+        if current.atype == MembershipType::Owner
+            && new_type != MembershipType::Owner
+            && current.status == MembershipStatus::Confirmed as i32
+            && Membership::count_confirmed_by_org_and_type(&org_id, MembershipType::Owner, &conn).await <= 1
+        {
+            err!("Can't delete the last owner")
+        }
+        current.atype = new_type as i32;
+        current.access_all = access_all;
+        OrgPolicy::check_user_allowed(&current, "modify", &conn).await?;
+        current.save(&conn).await
+    })
+    .await?;
+
     log_event(
         EventType::OrganizationUserUpdated,
         &member_to_edit.uuid,
@@ -1651,7 +1689,7 @@ async fn edit_member(
     )
     .await;
 
-    member_to_edit.save(&conn).await
+    Ok(())
 }
 
 #[delete("/organizations/<org_id>/users", data = "<data>")]
@@ -2144,39 +2182,68 @@ async fn put_policy(
         .await?;
     }
 
-    // When enabling the SingleOrg policy, remove this org's members that are members of other orgs
+    // Serialize policy activation with every join/confirm of this organization and with membership changes of
+    // existing members in other organizations. The user row is locked before checking that user's other memberships.
     if pol_type_enum == OrgPolicyType::SingleOrg && data.enabled {
-        for mut member in Membership::find_by_org(&org_id, &conn).await {
-            // Policy only applies to non-Owner/non-Admin members who have accepted joining the org
-            // Exclude invited and revoked users when checking for this policy.
-            // Those users will not be allowed to accept or be activated because of the policy checks done there.
-            if member.atype < MembershipType::Admin
-                && member.status != MembershipStatus::Invited as i32
-                && Membership::count_accepted_and_confirmed_by_user(&member.user_uuid, &member.org_uuid, &conn).await
-                    > 0
-            {
-                if CONFIG.mail_enabled() {
-                    let org = Organization::find_by_uuid(&member.org_uuid, &conn).await.unwrap();
-                    let user = User::find_by_uuid(&member.user_uuid, &conn).await.unwrap();
-
-                    mail::send_single_org_removed_from_org(&user.email, &org.name).await?;
+        let (policy, removed) = conn
+            .run_locked_for_org(&org_id, async {
+                let mut removed = Vec::new();
+                let mut members = Membership::find_by_org(&org_id, &conn).await;
+                members.sort_by(|a, b| a.user_uuid.as_ref().cmp(b.user_uuid.as_ref()));
+                for mut member in members {
+                    if member.atype >= MembershipType::Admin || member.status < MembershipStatus::Accepted as i32 {
+                        continue;
+                    }
+                    conn.lock_user(&member.user_uuid).await?;
+                    // READ COMMITTED on MySQL/MariaDB makes this see a join that completed while the user lock waited.
+                    if Membership::count_accepted_and_confirmed_by_user(&member.user_uuid, &org_id, &conn).await > 0 {
+                        let member_id = member.uuid.clone();
+                        let user_id = member.user_uuid.clone();
+                        member.revoke();
+                        member.save(&conn).await?;
+                        removed.push((member_id, user_id));
+                    }
                 }
+                let mut policy = OrgPolicy::find_by_org_and_type(&org_id, pol_type_enum, &conn)
+                    .await
+                    .unwrap_or_else(|| OrgPolicy::new(org_id.clone(), pol_type_enum, false, "{}".to_owned()));
+                policy.enabled = true;
+                policy.data = serde_json::to_string(&data.data)?;
+                policy.save(&conn).await?;
+                Ok((policy, removed))
+            })
+            .await?;
 
-                log_event(
-                    EventType::OrganizationUserRemoved,
-                    &member.uuid,
-                    &org_id,
-                    &headers.user.uuid,
-                    headers.device.atype,
-                    &headers.ip.ip,
-                    &conn,
-                )
-                .await;
-
-                member.revoke();
-                member.save(&conn).await?;
+        for (member_id, user_id) in removed {
+            log_event(
+                EventType::OrganizationUserRemoved,
+                &member_id,
+                &org_id,
+                &headers.user.uuid,
+                headers.device.atype,
+                &headers.ip.ip,
+                &conn,
+            )
+            .await;
+            if CONFIG.mail_enabled()
+                && let (Some(org), Some(user)) =
+                    (Organization::find_by_uuid(&org_id, &conn).await, User::find_by_uuid(&user_id, &conn).await)
+                && let Err(e) = mail::send_single_org_removed_from_org(&user.email, &org.name).await
+            {
+                error!("Error sending single organization removal email: {e:#?}");
             }
         }
+        log_event(
+            EventType::PolicyUpdated,
+            policy.uuid.as_ref(),
+            &org_id,
+            &headers.user.uuid,
+            headers.device.atype,
+            &headers.ip.ip,
+            &conn,
+        )
+        .await;
+        return Ok(Json(policy.to_json()));
     }
 
     let mut policy = match OrgPolicy::find_by_org_and_type(&org_id, pol_type_enum, &conn).await {
@@ -2441,19 +2508,34 @@ async fn restore_member_impl(
         err!("Organization not found", "Organization id's do not match");
     }
     match Membership::find_by_uuid_and_org(member_id, org_id, conn).await {
-        Some(mut member) if member.status < MembershipStatus::Accepted as i32 => {
+        Some(member) if member.status < MembershipStatus::Accepted as i32 => {
             if member.user_uuid == headers.user.uuid {
                 err!("You cannot restore yourself")
             }
             if member.atype == MembershipType::Owner && headers.membership_type != MembershipType::Owner {
                 err!("Only owners can restore other owners")
             }
-
-            member.restore();
-            // This check is also done at accept_invite, _confirm_invite, _activate_member, edit_member, admin::update_membership_type
-            // This check need to be done after restoring to work with the correct status
-            OrgPolicy::check_user_allowed(&member, "restore", conn).await?;
-            member.save(conn).await?;
+            conn.run_locked_for_org_and_user(org_id, &member.user_uuid, async {
+                let Some(mut current) = Membership::find_by_uuid_and_org(member_id, org_id, conn).await else {
+                    err!("User not found in organization")
+                };
+                if current.user_uuid == headers.user.uuid {
+                    err!("You cannot restore yourself")
+                }
+                if current.atype == MembershipType::Owner && headers.membership_type != MembershipType::Owner {
+                    err!("Only owners can restore other owners")
+                }
+                let previous_status = current.status;
+                if !current.restore() {
+                    err!("User is already active")
+                }
+                OrgPolicy::check_user_allowed(&current, "restore", conn).await?;
+                if !current.update_status_if(previous_status, conn).await? {
+                    err!("User is already active")
+                }
+                Ok(())
+            })
+            .await?;
 
             log_event(
                 EventType::OrganizationUserRestored,

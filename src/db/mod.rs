@@ -451,24 +451,34 @@ pub async fn get_sql_server_version(conn: &DbConn) -> String {
 }
 
 impl DbConn {
-    /// Runs `f` in a transaction which first locks the row of the user, so these transactions run one after another
-    /// for the same user and each one sees what the ones before it stored. PostgreSQL and MySQL lock the row with
-    /// `SELECT ... FOR UPDATE`, SQLite has no row locks and takes the write lock of the database with `BEGIN IMMEDIATE`.
+    /// Runs `f` after locking the organization row. Membership transitions lock the user next, then any invite link.
+    /// A policy change holds this lock while inspecting and updating the organization's memberships. SQLite takes
+    /// its write lock at BEGIN IMMEDIATE instead of individual row locks.
     /// `f` has to run all its queries on this connection. The transaction is committed if `f` succeeds and rolled back
     /// otherwise. If `f` panics or is dropped, diesel reports the connection with the open transaction as broken, so
     /// the pool closes it.
-    pub async fn run_locked_for_user<R>(
+    pub async fn run_locked_for_org<R>(
         &self,
-        user_uuid: &models::UserId,
+        org_uuid: &models::OrganizationId,
         f: impl Future<Output = Result<R, Error>>,
     ) -> Result<R, Error> {
         use diesel::{
             ExpressionMethods, QueryDsl,
             connection::{AnsiTransactionManager, TransactionManager},
         };
-        use schema::users;
+        use schema::organizations;
 
         let conn = self;
+        // A fresh committed view after each row-lock wait is essential for the policy sweep on MySQL/MariaDB.
+        #[cfg(mysql)]
+        db_run! { conn:
+            mysql {
+                diesel::sql_query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED").execute(conn)
+            }
+            sqlite, postgresql { Ok::<usize, diesel::result::Error>(0) }
+        }
+        .map(|_| ())
+        .map_res("Error setting transaction isolation")?;
         db_run! { conn:
             sqlite {
                 AnsiTransactionManager::begin_transaction_sql(conn, "BEGIN IMMEDIATE")
@@ -483,17 +493,17 @@ impl DbConn {
             db_run! { conn:
                 sqlite {
                     // `BEGIN IMMEDIATE` already locked the database
-                    users::table.filter(users::uuid.eq(user_uuid)).select(users::uuid).first::<models::UserId>(conn)
+                    organizations::table.filter(organizations::uuid.eq(org_uuid)).select(organizations::uuid).first::<models::OrganizationId>(conn)
                 }
                 mysql, postgresql {
-                    users::table
-                        .filter(users::uuid.eq(user_uuid))
-                        .select(users::uuid)
+                    organizations::table
+                        .filter(organizations::uuid.eq(org_uuid))
+                        .select(organizations::uuid)
                         .for_update()
-                        .first::<models::UserId>(conn)
+                        .first::<models::OrganizationId>(conn)
                 }
             }
-            .map_res("Error locking user")?;
+            .map_res("Error locking organization")?;
             f.await
         }
         .await;
@@ -510,6 +520,36 @@ impl DbConn {
         };
         // If the rollback failed, diesel reports the connection as broken as well
         result.and_then(|r| ended.map(|()| r).map_res("Error committing transaction"))
+    }
+
+    /// Must be called inside `run_locked_for_org`; all membership writers take these locks in this order.
+    pub async fn lock_user(&self, user_uuid: &models::UserId) -> Result<(), Error> {
+        use diesel::{ExpressionMethods, QueryDsl};
+        use schema::users;
+        let conn = self;
+        db_run! { conn:
+            sqlite {
+                users::table.filter(users::uuid.eq(user_uuid)).select(users::uuid).first::<models::UserId>(conn)
+            }
+            mysql, postgresql {
+                users::table.filter(users::uuid.eq(user_uuid)).select(users::uuid).for_update().first::<models::UserId>(conn)
+            }
+        }
+        .map(|_| ())
+        .map_res("Error locking user")
+    }
+
+    pub async fn run_locked_for_org_and_user<R>(
+        &self,
+        org_uuid: &models::OrganizationId,
+        user_uuid: &models::UserId,
+        f: impl Future<Output = Result<R, Error>>,
+    ) -> Result<R, Error> {
+        self.run_locked_for_org(org_uuid, async {
+            self.lock_user(user_uuid).await?;
+            f.await
+        })
+        .await
     }
 }
 

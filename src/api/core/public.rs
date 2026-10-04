@@ -83,19 +83,24 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
                 }
             }
         // If user is part of the organization, restore it
-        } else if let Some(mut member) = Membership::find_by_email_and_org(&user_data.email, &org_id, &conn).await {
-            let mut restored = member.restore();
-            let ext_modified = member.set_external_id(Some(user_data.external_id.clone()));
-            // Enforce org policies as every other restore path does.
-            // If the user is not allowed, we revoke again and continue so the external_id is still updated.
-            if restored && let Err(e) = OrgPolicy::check_user_allowed(&member, "restore", &conn).await {
-                warn!("Not restoring {}: {e:?}", user_data.email);
-                member.revoke();
-                restored = false;
-            }
-            if restored || ext_modified {
-                member.save(&conn).await?;
-            }
+        } else if let Some(member) = Membership::find_by_email_and_org(&user_data.email, &org_id, &conn).await {
+            conn.run_locked_for_org_and_user(&org_id, &member.user_uuid, async {
+                let Some(mut current) = Membership::find_by_uuid_and_org(&member.uuid, &org_id, &conn).await else {
+                    err!("User not found in organization")
+                };
+                let mut restored = current.restore();
+                let ext_modified = current.set_external_id(Some(user_data.external_id.clone()));
+                if restored && let Err(e) = OrgPolicy::check_user_allowed(&current, "restore", &conn).await {
+                    warn!("Not restoring {}: {e:?}", user_data.email);
+                    current.revoke();
+                    restored = false;
+                }
+                if restored || ext_modified {
+                    current.save(&conn).await?;
+                }
+                Ok(())
+            })
+            .await?;
         } else {
             // If user is not part of the organization
             let user = if let Some(user) = User::find_by_mail(&user_data.email, &conn).await {

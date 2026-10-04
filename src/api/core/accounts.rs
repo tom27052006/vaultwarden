@@ -347,6 +347,11 @@ pub async fn register(data: Json<RegisterData>, email_verification: bool, conn: 
     // An invite link stands in for an allowed signup like an email invitation, but only for a verified address.
     // `allows_signup` fails for a link which can't be used with the address.
     let open_invite = data.open_org_invite.as_ref().filter(|_| email_verification);
+    if data.open_org_invite.is_some() && !CONFIG.mail_enabled() && !email_verified {
+        err!(
+            "Email verification is required to register through an organization invite link, but email is unavailable."
+        )
+    }
     let invite_allows_signup = match open_invite {
         Some(invite) => invite.allows_signup(&email, &conn).await? && email_verified,
         None => false,

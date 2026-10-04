@@ -16,8 +16,7 @@ const DATABASE_FIELD_KDF_SALT: &[u8] = b"vaultwarden/database-field-protection/v
 const DATABASE_FIELD_KDF_INFO: &[u8] = b"OrganizationInviteLink.Code";
 static DATABASE_FIELD_KEY: OnceLock<aead::LessSafeKey> = OnceLock::new();
 
-/// Derives the database field protection key from Vaultwarden's persistent installation RSA key.
-/// HKDF domain separation ensures the derived AEAD key is independent from the key's JWT use.
+/// Derives the legacy invite-code key. This is only used to read and migrate codes written by earlier branch builds.
 pub fn initialize_database_field_key(installation_secret: &[u8]) -> Result<(), Error> {
     let key = hkdf::Salt::new(hkdf::HKDF_SHA256, DATABASE_FIELD_KDF_SALT)
         .extract(installation_secret)
@@ -31,17 +30,6 @@ pub fn initialize_database_field_key(installation_secret: &[u8]) -> Result<(), E
 
 pub fn is_protected_database_field(value: &str) -> bool {
     value.starts_with("P|")
-}
-
-pub fn protect_database_field(plaintext: &str, associated_data: &[u8]) -> Result<String, Error> {
-    let nonce = get_random_bytes::<{ aead::NONCE_LEN }>();
-    let mut sealed = plaintext.as_bytes().to_vec();
-    let aad = aead::Aad::from(associated_data);
-    DATABASE_FIELD_KEY
-        .wait()
-        .seal_in_place_append_tag(aead::Nonce::assume_unique_for_key(nonce), aad, &mut sealed)
-        .map_err(|_| Error::new_msg("Failed to protect database field"))?;
-    Ok(format!("{DATABASE_FIELD_PROTECTED_PREFIX}{}", BASE64URL_NOPAD.encode(&[&nonce[..], &sealed].concat())))
 }
 
 pub fn unprotect_database_field(protected: &str, associated_data: &[u8]) -> Result<String, Error> {
