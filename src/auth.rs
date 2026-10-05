@@ -1101,7 +1101,9 @@ impl<'r> FromRequest<'r> for ManagerHeadersLoose {
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         let headers = try_outcome!(OrgHeaders::from_request(request).await);
-        if headers.membership.has_status(MembershipStatus::Confirmed) {
+        // Collection endpoints using this legacy guard have not been converted yet. Keep
+        // its Admin/Owner boundary until the Collection layer applies granular checks.
+        if headers.is_confirmed_and_manager() {
             Outcome::Success(Self {
                 host: headers.host,
                 device: headers.device,
@@ -1110,7 +1112,7 @@ impl<'r> FromRequest<'r> for ManagerHeadersLoose {
                 ip: headers.ip,
             })
         } else {
-            err_handler!("You need to be a confirmed organization member to call this endpoint")
+            err_handler!("You need to be Admin or Owner to call this endpoint")
         }
     }
 }

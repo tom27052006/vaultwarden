@@ -119,6 +119,7 @@ macro_rules! impl_membership_custom_permissions {
     };
 }
 custom_role_permissions!(impl_membership_custom_permissions);
+pub(crate) use custom_role_permissions;
 
 /// Diesel equivalent of [`Membership::has_edit_any_collection`].
 ///
