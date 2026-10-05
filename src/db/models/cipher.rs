@@ -1403,6 +1403,16 @@ mod tests {
     const CUSTOM: i32 = MembershipType::Custom as i32;
     const UNKNOWN: i32 = Membership::UNKNOWN_ATYPE;
 
+    #[test]
+    fn legacy_access_all_preserves_vault_reach_without_administrative_authority() {
+        let member = Membership::for_test(USER, Status::Confirmed, |m| m.access_all = true);
+        assert!(CipherAccessScope::User.grants_org_wide_cipher_access(&member));
+        assert!(!CipherAccessScope::OrganizationAdmin.grants_org_wide_cipher_access(&member));
+        let unknown = Membership::for_test(UNKNOWN, Status::Confirmed, |m| m.access_all = true);
+        assert!(!CipherAccessScope::User.grants_org_wide_cipher_access(&unknown));
+        assert!(!CipherAccessScope::OrganizationAdmin.grants_org_wide_cipher_access(&unknown));
+    }
+
     /// Who reaches *every* cipher of an organization, in each of the two scopes, and which scope the
     /// v2 attachment upload resolves for the member.
     ///
@@ -1505,6 +1515,10 @@ mod db_scope_tests {
             ('m_custom',   'u_custom',   'org1', '', 2, 4, TRUE),
             ('m_revoked',  'u_revoked',  'org1', '', -1, 4, TRUE),
             ('m_assigned', 'u_assigned', 'org1', '', 2, 2, FALSE);
+        INSERT INTO users_organizations (uuid, user_uuid, org_uuid, akey, status, atype, access_all) VALUES
+            ('m_legacy', 'u_legacy', 'org1', '', 2, 2, TRUE),
+            ('m_legacy_revoked', 'u_legacy_revoked', 'org1', '', -1, 2, TRUE),
+            ('m_unknown', 'u_unknown', 'org1', '', 2, 999, TRUE);
         INSERT INTO users_collections (user_uuid, collection_uuid, read_only, hide_passwords, manage) VALUES
             ('u_assigned', 'col1', FALSE, FALSE, FALSE);
     ";
@@ -1592,6 +1606,15 @@ mod db_scope_tests {
         // `spawn_blocking` to return the connection to the pool.
         block_on(async {
             let conn = db.conn();
+            let legacy: UserId = "u_legacy".to_owned().into();
+            assert!(own_org.is_accessible_to_user(&legacy, CipherAccessScope::User, &conn).await);
+            assert!(!own_org.is_accessible_to_user(&legacy, CipherAccessScope::OrganizationAdmin, &conn).await);
+            assert!(!other_org.is_accessible_to_user(&legacy, CipherAccessScope::User, &conn).await);
+            for denied in ["u_legacy_revoked", "u_unknown"] {
+                assert!(
+                    !own_org.is_accessible_to_user(&denied.to_owned().into(), CipherAccessScope::User, &conn).await
+                );
+            }
             // The fixture is meaningful: the cipher is reachable through a real assignment.
             assert!(
                 own_org.is_accessible_to_user(&assigned, CipherAccessScope::User, &conn).await,

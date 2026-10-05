@@ -146,7 +146,7 @@ impl Collection {
                     let stored_manage = assignment.is_some_and(|(_, _, manage)| manage);
                     let manage = assignment_manage_for_member(m.atype, stored_manage);
                     match assignment {
-                        Some((read_only, hide_passwords, _)) if !m.has_full_access() => {
+                        Some((read_only, hide_passwords, _)) if !m.has_full_access() && !m.has_legacy_access_all() => {
                             (read_only, hide_passwords, manage)
                         }
                         // Reaching every collection means nothing is read-only or hidden here.
@@ -159,7 +159,7 @@ impl Collection {
             match Membership::find_confirmed_by_user_and_org(user_uuid, &self.org_uuid, conn).await {
                 // Same rule as the cached branch above: a member who reaches every collection still
                 // reports a real stored grant, so the serialized value matches the guards.
-                Some(m) if m.has_full_access() => (
+                Some(m) if m.has_full_access() || m.has_legacy_access_all() => (
                     false,
                     false,
                     assignment_manage_for_member(
@@ -188,6 +188,7 @@ impl Collection {
     pub async fn can_access_collection(member: &Membership, col_id: &CollectionId, conn: &DbConn) -> bool {
         member.has_status(MembershipStatus::Confirmed)
             && (member.has_full_access()
+                || member.has_legacy_access_all()
                 || CollectionUser::has_access_to_collection_by_user(col_id, &member.user_uuid, conn).await
                 || (CONFIG.org_groups_enabled()
                     && (GroupUser::has_full_access_by_member(&member.org_uuid, &member.uuid, conn).await

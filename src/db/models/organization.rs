@@ -845,10 +845,11 @@ impl Membership {
     }
 
     pub fn has_full_access(&self) -> bool {
-        (self.has_legacy_access_all() || self.has_edit_any_collection() || self.atype >= MembershipType::Admin)
+        (self.has_edit_any_collection() || self.atype >= MembershipType::Admin)
             && self.has_status(MembershipStatus::Confirmed)
     }
 
+    /// Historical vault reach only; this does not grant organization or collection administration.
     pub fn has_legacy_access_all(&self) -> bool {
         self.access_all && MembershipType::from_i32(self.atype).is_some()
     }
@@ -1450,10 +1451,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_access_all_requires_a_known_confirmed_role() {
+    fn legacy_access_all_is_not_administrative_authority() {
         let mut member = membership(MembershipType::User as i32);
         member.access_all = true;
-        assert!(member.has_full_access());
+        assert!(!member.has_full_access());
         assert!(member.grants_access_to_all_collections());
         assert!(!member.has_edit_any_collection());
         assert!(!member.has_manage_users());
