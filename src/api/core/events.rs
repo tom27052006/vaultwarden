@@ -7,12 +7,14 @@ use serde_json::Value;
 use crate::{
     CONFIG,
     api::{EmptyResult, JsonResult},
-    auth::{AdminHeaders, Headers},
+    auth::{AccessEventLogsHeaders, Headers, may_access_event_logs},
     db::{
         DbConn, DbPool,
-        models::{Cipher, CipherId, Event, EventType, Membership, MembershipId, OrganizationId, UserId},
+        models::{
+            Cipher, CipherAccessScope, CipherId, Event, EventType, Membership, MembershipId, OrganizationId, UserId,
+        },
     },
-    util::parse_date,
+    util::{parse_date, try_parse_date},
 };
 
 /// ###############################################################################################################
@@ -29,9 +31,36 @@ struct EventRange {
     continuation_token: Option<String>,
 }
 
+fn parse_event_date(date: &str, field: &str) -> Result<NaiveDateTime, crate::Error> {
+    try_parse_date(date)
+        .map_err(|error| crate::Error::new("Invalid event date", format!("Invalid RFC 3339 {field}: {error}")))
+}
+
+fn parse_event_range(data: &EventRange) -> Result<(NaiveDateTime, NaiveDateTime), crate::Error> {
+    let start_date = parse_event_date(&data.start, "start date")?;
+
+    let end_date = if let Some(continuation_token) = &data.continuation_token {
+        try_parse_date(continuation_token).map_err(|error| {
+            crate::Error::new(
+                "Invalid continuation token",
+                format!("Continuation token is not a valid RFC 3339 date: {error}"),
+            )
+        })?
+    } else {
+        parse_event_date(&data.end, "end date")?
+    };
+
+    Ok((start_date, end_date))
+}
+
 // Upstream: https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Api/AdminConsole/Controllers/EventsController.cs#L87
 #[get("/organizations/<org_id>/events?<data..>")]
-async fn get_org_events(org_id: OrganizationId, data: EventRange, headers: AdminHeaders, conn: DbConn) -> JsonResult {
+async fn get_org_events(
+    org_id: OrganizationId,
+    data: EventRange,
+    headers: AccessEventLogsHeaders,
+    conn: DbConn,
+) -> JsonResult {
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
@@ -39,12 +68,7 @@ async fn get_org_events(org_id: OrganizationId, data: EventRange, headers: Admin
     // Return an empty vec when we org events are disabled.
     // This prevents client errors
     let events_json: Vec<Value> = if CONFIG.org_events_enabled() {
-        let start_date = parse_date(&data.start);
-        let end_date = if let Some(before_date) = &data.continuation_token {
-            parse_date(before_date)
-        } else {
-            parse_date(&data.end)
-        };
+        let (start_date, end_date) = parse_event_range(&data)?;
 
         Event::find_by_organization_uuid(&org_id, &start_date, &end_date, &conn)
             .await
@@ -62,21 +86,62 @@ async fn get_org_events(org_id: OrganizationId, data: EventRange, headers: Admin
     })))
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum CipherEventScope {
+    Organization(OrganizationId),
+    Personal,
+}
+
+impl CipherEventScope {
+    fn organization_id(&self) -> Option<&OrganizationId> {
+        match self {
+            Self::Organization(org_id) => Some(org_id),
+            Self::Personal => None,
+        }
+    }
+}
+
+fn cipher_event_scope(cipher: &Cipher, user_id: &UserId, membership: Option<&Membership>) -> Option<CipherEventScope> {
+    match &cipher.organization_uuid {
+        Some(org_id)
+            if membership.is_some_and(|membership| {
+                membership.user_uuid == *user_id && membership.org_uuid == *org_id && may_access_event_logs(membership)
+            }) =>
+        {
+            Some(CipherEventScope::Organization(org_id.clone()))
+        }
+        None if cipher.is_owned_by_user(user_id) => Some(CipherEventScope::Personal),
+        _ => None,
+    }
+}
+
 #[get("/ciphers/<cipher_id>/events?<data..>")]
 async fn get_cipher_events(cipher_id: CipherId, data: EventRange, headers: Headers, conn: DbConn) -> JsonResult {
     // Return an empty vec when org events are disabled.
     // This prevents client errors
-    let events_json: Vec<Value> = if CONFIG.org_events_enabled()
-        && Membership::user_has_ge_admin_access_to_cipher(&headers.user.uuid, &cipher_id, &conn).await
-    {
-        let start_date = parse_date(&data.start);
-        let end_date = if let Some(before_date) = &data.continuation_token {
-            parse_date(before_date)
+    let events_json: Vec<Value> = if CONFIG.org_events_enabled() {
+        let (start_date, end_date) = parse_event_range(&data)?;
+
+        let scope = if let Some(cipher) = Cipher::find_by_uuid(&cipher_id, &conn).await {
+            let membership = if let Some(org_id) = &cipher.organization_uuid {
+                Membership::find_by_user_and_org(&headers.user.uuid, org_id, &conn).await
+            } else {
+                None
+            };
+            cipher_event_scope(&cipher, &headers.user.uuid, membership.as_ref())
         } else {
-            parse_date(&data.end)
+            None
         };
 
-        Event::find_by_cipher_uuid(&cipher_id, &start_date, &end_date, &conn).await.iter().map(Event::to_json).collect()
+        if let Some(scope) = scope {
+            Event::find_by_cipher_uuid(&cipher_id, scope.organization_id(), &start_date, &end_date, &conn)
+                .await
+                .iter()
+                .map(Event::to_json)
+                .collect()
+        } else {
+            Vec::new()
+        }
     } else {
         Vec::new()
     };
@@ -93,21 +158,17 @@ async fn get_user_events(
     org_id: OrganizationId,
     member_id: MembershipId,
     data: EventRange,
-    headers: AdminHeaders,
+    headers: AccessEventLogsHeaders,
     conn: DbConn,
 ) -> JsonResult {
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
+
     // Return an empty vec when we org events are disabled.
     // This prevents client errors
     let events_json: Vec<Value> = if CONFIG.org_events_enabled() {
-        let start_date = parse_date(&data.start);
-        let end_date = if let Some(before_date) = &data.continuation_token {
-            parse_date(before_date)
-        } else {
-            parse_date(&data.end)
-        };
+        let (start_date, end_date) = parse_event_range(&data)?;
 
         Event::find_by_org_and_member(&org_id, &member_id, &start_date, &end_date, &conn)
             .await
@@ -224,9 +285,7 @@ async fn post_events_collect(data: Json<Vec<EventCollection>>, headers: Headers,
                 // user can actually access it instead of trusting the provided cipher uuid.
                 if let Some(cipher_uuid) = &event.cipher_id
                     && let Some(cipher) = Cipher::find_by_uuid(cipher_uuid, &conn).await
-                    && cipher
-                        .is_accessible_to_user(&headers.user.uuid, crate::db::models::CipherAccessScope::User, &conn)
-                        .await
+                    && cipher.is_accessible_to_user(&headers.user.uuid, CipherAccessScope::User, &conn).await
                     && let Some(org_id) = cipher.organization_uuid
                 {
                     log_event_impl(
@@ -361,5 +420,59 @@ pub async fn event_cleanup_job(pool: DbPool) {
         Event::clean_events(&conn).await.ok();
     } else {
         error!("Failed to get DB connection while trying to cleanup the events table");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::models::{MembershipStatus, MembershipType};
+
+    #[test]
+    fn cipher_event_scope_binds_the_user_organization_and_confirmed_permission() {
+        let user_id: UserId = "actor".to_owned().into();
+        let org_id: OrganizationId = "org".to_owned().into();
+        let mut cipher = Cipher::new(1, "item".to_owned());
+        cipher.organization_uuid = Some(org_id.clone());
+        let mut member = Membership::for_test(MembershipType::Custom as i32, MembershipStatus::Confirmed, |m| {
+            m.user_uuid = user_id.clone();
+            m.org_uuid = org_id.clone();
+            m.access_event_logs = true;
+        });
+        assert_eq!(
+            cipher_event_scope(&cipher, &user_id, Some(&member)),
+            Some(CipherEventScope::Organization(org_id.clone()))
+        );
+        member.access_event_logs = false;
+        assert_eq!(cipher_event_scope(&cipher, &user_id, Some(&member)), None);
+        member.access_event_logs = true;
+        member.status = MembershipStatus::Revoked as i32;
+        assert_eq!(cipher_event_scope(&cipher, &user_id, Some(&member)), None);
+        member.status = MembershipStatus::Confirmed as i32;
+        member.org_uuid = "foreign".to_owned().into();
+        assert_eq!(cipher_event_scope(&cipher, &user_id, Some(&member)), None);
+        member.org_uuid = org_id;
+        member.user_uuid = "other".to_owned().into();
+        assert_eq!(cipher_event_scope(&cipher, &user_id, Some(&member)), None);
+
+        cipher.organization_uuid = None;
+        cipher.user_uuid = Some(user_id.clone());
+        assert_eq!(cipher_event_scope(&cipher, &user_id, None), Some(CipherEventScope::Personal));
+        assert_eq!(cipher_event_scope(&cipher, &"other".to_owned().into(), None), None);
+    }
+
+    #[test]
+    fn event_ranges_return_errors_for_malformed_dates_and_tokens() {
+        let mut range = EventRange {
+            start: "2026-01-01T00:00:00Z".to_owned(),
+            end: "2026-01-02T00:00:00Z".to_owned(),
+            continuation_token: None,
+        };
+        assert!(parse_event_range(&range).is_ok());
+        range.continuation_token = Some("invalid".to_owned());
+        assert!(parse_event_range(&range).is_err());
+        range.continuation_token = None;
+        range.start = "invalid".to_owned();
+        assert!(parse_event_range(&range).is_err());
     }
 }
