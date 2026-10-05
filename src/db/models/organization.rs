@@ -1275,18 +1275,6 @@ impl Membership {
         .await
     }
 
-    pub async fn user_has_ge_admin_access_to_cipher(user_uuid: &UserId, cipher_uuid: &CipherId, conn: &DbConn) -> bool {
-        let Some(cipher) = Cipher::find_by_uuid(cipher_uuid, conn).await else {
-            return false;
-        };
-        let Some(org_id) = cipher.organization_uuid else {
-            return false;
-        };
-        Membership::find_confirmed_by_user_and_org(user_uuid, &org_id, conn)
-            .await
-            .is_some_and(|member| member.atype >= MembershipType::Admin)
-    }
-
     pub async fn find_by_collection_and_org(
         collection_uuid: &CollectionId,
         org_uuid: &OrganizationId,

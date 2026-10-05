@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::{
     CONFIG,
     api::{ApiResult, EmptyResult, JsonResult},
-    auth::{AdminHeaders, Headers},
+    auth::{AccessEventLogsHeaders, Headers, may_access_event_logs},
     db::{
         DbConn, DbPool,
         models::{Cipher, CipherId, Event, EventType, Membership, MembershipId, OrganizationId, UserId},
@@ -40,7 +40,12 @@ impl EventRange {
 
 // Upstream: https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Api/AdminConsole/Controllers/EventsController.cs#L87
 #[get("/organizations/<org_id>/events?<data..>")]
-async fn get_org_events(org_id: OrganizationId, data: EventRange, headers: AdminHeaders, conn: DbConn) -> JsonResult {
+async fn get_org_events(
+    org_id: OrganizationId,
+    data: EventRange,
+    headers: AccessEventLogsHeaders,
+    conn: DbConn,
+) -> JsonResult {
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
@@ -66,16 +71,62 @@ async fn get_org_events(org_id: OrganizationId, data: EventRange, headers: Admin
     })))
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum CipherEventScope {
+    Organization(OrganizationId),
+    Personal,
+}
+
+impl CipherEventScope {
+    fn organization_id(&self) -> Option<&OrganizationId> {
+        match self {
+            Self::Organization(org_id) => Some(org_id),
+            Self::Personal => None,
+        }
+    }
+}
+
+fn cipher_event_scope(cipher: &Cipher, user_id: &UserId, membership: Option<&Membership>) -> Option<CipherEventScope> {
+    match &cipher.organization_uuid {
+        Some(org_id)
+            if membership.is_some_and(|membership| {
+                membership.user_uuid == *user_id && membership.org_uuid == *org_id && may_access_event_logs(membership)
+            }) =>
+        {
+            Some(CipherEventScope::Organization(org_id.clone()))
+        }
+        None if cipher.is_owned_by_user(user_id) => Some(CipherEventScope::Personal),
+        _ => None,
+    }
+}
+
 #[get("/ciphers/<cipher_id>/events?<data..>")]
 async fn get_cipher_events(cipher_id: CipherId, data: EventRange, headers: Headers, conn: DbConn) -> JsonResult {
     // Return an empty vec when org events are disabled.
     // This prevents client errors
-    let events_json: Vec<Value> = if CONFIG.org_events_enabled()
-        && Membership::user_has_ge_admin_access_to_cipher(&headers.user.uuid, &cipher_id, &conn).await
-    {
+    let events_json: Vec<Value> = if CONFIG.org_events_enabled() {
         let (start_date, end_date) = data.date_range()?;
 
-        Event::find_by_cipher_uuid(&cipher_id, &start_date, &end_date, &conn).await.iter().map(Event::to_json).collect()
+        let scope = if let Some(cipher) = Cipher::find_by_uuid(&cipher_id, &conn).await {
+            let membership = if let Some(org_id) = &cipher.organization_uuid {
+                Membership::find_by_user_and_org(&headers.user.uuid, org_id, &conn).await
+            } else {
+                None
+            };
+            cipher_event_scope(&cipher, &headers.user.uuid, membership.as_ref())
+        } else {
+            None
+        };
+
+        if let Some(scope) = scope {
+            Event::find_by_cipher_uuid(&cipher_id, scope.organization_id(), &start_date, &end_date, &conn)
+                .await
+                .iter()
+                .map(Event::to_json)
+                .collect()
+        } else {
+            Vec::new()
+        }
     } else {
         Vec::new()
     };
@@ -92,12 +143,13 @@ async fn get_user_events(
     org_id: OrganizationId,
     member_id: MembershipId,
     data: EventRange,
-    headers: AdminHeaders,
+    headers: AccessEventLogsHeaders,
     conn: DbConn,
 ) -> JsonResult {
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
+
     // Return an empty vec when we org events are disabled.
     // This prevents client errors
     let events_json: Vec<Value> = if CONFIG.org_events_enabled() {
@@ -358,5 +410,44 @@ pub async fn event_cleanup_job(pool: DbPool) {
         Event::clean_events(&conn).await.ok();
     } else {
         error!("Failed to get DB connection while trying to cleanup the events table");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::models::{MembershipStatus, MembershipType};
+
+    #[test]
+    fn cipher_event_scope_binds_the_user_organization_and_confirmed_permission() {
+        let user_id: UserId = "actor".to_owned().into();
+        let org_id: OrganizationId = "org".to_owned().into();
+        let mut cipher = Cipher::new(1, "item".to_owned());
+        cipher.organization_uuid = Some(org_id.clone());
+        let mut member = Membership::for_test(MembershipType::Custom as i32, MembershipStatus::Confirmed, |m| {
+            m.user_uuid = user_id.clone();
+            m.org_uuid = org_id.clone();
+            m.access_event_logs = true;
+        });
+        assert_eq!(
+            cipher_event_scope(&cipher, &user_id, Some(&member)),
+            Some(CipherEventScope::Organization(org_id.clone()))
+        );
+        member.access_event_logs = false;
+        assert_eq!(cipher_event_scope(&cipher, &user_id, Some(&member)), None);
+        member.access_event_logs = true;
+        member.status = MembershipStatus::Revoked as i32;
+        assert_eq!(cipher_event_scope(&cipher, &user_id, Some(&member)), None);
+        member.status = MembershipStatus::Confirmed as i32;
+        member.org_uuid = "foreign".to_owned().into();
+        assert_eq!(cipher_event_scope(&cipher, &user_id, Some(&member)), None);
+        member.org_uuid = org_id;
+        member.user_uuid = "other".to_owned().into();
+        assert_eq!(cipher_event_scope(&cipher, &user_id, Some(&member)), None);
+
+        cipher.organization_uuid = None;
+        cipher.user_uuid = Some(user_id.clone());
+        assert_eq!(cipher_event_scope(&cipher, &user_id, None), Some(CipherEventScope::Personal));
+        assert_eq!(cipher_event_scope(&cipher, &"other".to_owned().into(), None), None);
     }
 }
