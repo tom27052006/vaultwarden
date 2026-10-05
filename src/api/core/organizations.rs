@@ -3704,7 +3704,7 @@ mod tests {
         use super::{OrganizationReportScope, organization_report_scope};
 
         for (name, _, set) in PERMISSIONS {
-            let mut caller = member(Custom, |m| set(m));
+            let mut caller = member(Custom, set);
             let expected = if matches!(name, "editAnyCollection" | "accessImportExport" | "accessReports") {
                 OrganizationReportScope::Complete
             } else {
@@ -3729,7 +3729,7 @@ mod tests {
         use super::{OrganizationImportTarget, may_import_to_collection};
 
         for (name, _, set) in PERMISSIONS {
-            let mut caller = member(Custom, |m| set(m));
+            let mut caller = member(Custom, set);
             assert_eq!(
                 may_import_to_collection(&caller, OrganizationImportTarget::New),
                 matches!(name, "createNewCollections" | "accessImportExport"),

@@ -400,3 +400,53 @@ impl Event {
 
 #[derive(Clone, Debug, DieselNewType, FromForm, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventId(String);
+
+#[cfg(all(test, sqlite))]
+mod stack_query_tests {
+    use std::fmt::Write;
+
+    use super::Event;
+    use crate::{
+        db::test_db::{TestDb, block_on},
+        util::parse_date,
+    };
+
+    #[test]
+    fn cipher_event_query_applies_organization_scope_before_pagination() {
+        let mut schema = String::from(
+            "
+            CREATE TABLE event (
+                uuid TEXT PRIMARY KEY, event_type INTEGER NOT NULL, user_uuid TEXT, org_uuid TEXT,
+                cipher_uuid TEXT, collection_uuid TEXT, group_uuid TEXT, org_user_uuid TEXT, act_user_uuid TEXT,
+                device_type INTEGER, ip_address TEXT, event_date DATETIME NOT NULL, policy_uuid TEXT,
+                provider_uuid TEXT, provider_user_uuid TEXT, provider_org_uuid TEXT
+            );
+            INSERT INTO event (uuid,event_type,org_uuid,cipher_uuid,event_date) VALUES
+                ('allowed',1100,'org1','cipher','2026-01-01 00:00:00'),
+                ('personal',1100,NULL,'cipher','2026-01-01 00:00:00');
+        ",
+        );
+        for index in 0..=Event::PAGE_SIZE {
+            write!(
+                schema,
+                "INSERT INTO event (uuid,event_type,org_uuid,cipher_uuid,event_date) VALUES \
+                 ('foreign{index}',1100,'org2','cipher','2026-01-02 00:00:00');"
+            )
+            .unwrap();
+        }
+        let db = TestDb::new(&schema);
+        block_on(async {
+            let conn = db.conn();
+            let cipher = "cipher".to_owned().into();
+            let org = "org1".to_owned().into();
+            let start = parse_date("2026-01-01T00:00:00Z");
+            let end = parse_date("2026-01-03T00:00:00Z");
+            let organization = Event::find_by_cipher_uuid(&cipher, Some(&org), &start, &end, &conn).await;
+            assert_eq!(organization.len(), 1);
+            assert_eq!(organization[0].uuid.0, "allowed");
+            let personal = Event::find_by_cipher_uuid(&cipher, None, &start, &end, &conn).await;
+            assert_eq!(personal.len(), 1);
+            assert_eq!(personal[0].uuid.0, "personal");
+        });
+    }
+}
