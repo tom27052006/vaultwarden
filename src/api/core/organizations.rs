@@ -139,6 +139,13 @@ fn validate_collection_access(manage: bool, read_only: bool, hide_passwords: boo
 
 impl FullCollectionData {
     pub async fn validate(&self, org_id: &OrganizationId, conn: &DbConn) -> EmptyResult {
+        for group in &self.groups {
+            validate_collection_access(group.manage, group.read_only, group.hide_passwords)?;
+        }
+        for user in &self.users {
+            validate_collection_access(user.manage, user.read_only, user.hide_passwords)?;
+        }
+
         let org_groups = Group::find_by_organization(org_id, conn).await;
         let org_group_ids: HashSet<&GroupId> = org_groups.iter().map(|c| &c.uuid).collect();
         if let Some(e) = self.groups.iter().find(|g| !org_group_ids.contains(&g.id)) {
