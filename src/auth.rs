@@ -724,6 +724,7 @@ pub struct OrgHeaders {
     pub host: String,
     pub device: Device,
     pub user: User,
+    #[allow(dead_code)]
     pub membership_type: MembershipType,
     pub membership_status: MembershipStatus,
     pub membership: Membership,
@@ -739,6 +740,7 @@ impl OrgHeaders {
     fn is_confirmed_and_admin(&self) -> bool {
         self.membership_status == MembershipStatus::Confirmed && self.membership_type >= MembershipType::Admin
     }
+    // Legacy collection handlers still require Admin or Owner until the Collection layer.
     fn is_confirmed_and_manager(&self) -> bool {
         // The legacy Manager guards still protect collection management endpoints. Until those
         // handlers check granular permissions, a Custom role must not inherit Manager authority.
@@ -751,6 +753,53 @@ impl OrgHeaders {
 
 fn legacy_manager_guard_allows(confirmed: bool, role: MembershipType) -> bool {
     confirmed && role >= MembershipType::Admin
+}
+
+/// Upstream's `BasePermissionRequirement`: a confirmed Owner or Admin, or a Custom member holding the
+/// permission itself. An unparsable stored role satisfies neither comparison and so fails closed.
+///
+/// The single definition of that rule. Everything which asks "may this member do X" goes through one
+/// of the `may_*` predicates below, so the rule cannot drift between call sites.
+pub(crate) fn has_org_permission(membership: &Membership, permission: impl FnOnce(&Membership) -> bool) -> bool {
+    membership.has_status(MembershipStatus::Confirmed)
+        && (membership.atype >= MembershipType::Admin || permission(membership))
+}
+
+/// Upstream's `ManageUsersRequirement`.
+fn may_manage_users(membership: &Membership) -> bool {
+    has_org_permission(membership, Membership::has_manage_users)
+}
+
+/// Upstream's `ManageGroupsRequirement`, which guards `GET /organizations/<org_id>/groups/<id>/details`
+/// as well as creating, updating and deleting groups.
+fn may_manage_groups(membership: &Membership) -> bool {
+    has_org_permission(membership, Membership::has_manage_groups)
+}
+
+/// Upstream's `ManageUsersOrGroupsRequirement`, which guards the group *details list* only.
+fn may_manage_users_or_groups(membership: &Membership) -> bool {
+    has_org_permission(membership, |m| m.has_manage_users() || m.has_manage_groups())
+}
+
+/// Upstream's `ManagePoliciesRequirement`. Note that holding it does not make a member exempt from any
+/// policy; only Owners and Admins are excluded from policy enforcement.
+fn may_manage_policies(membership: &Membership) -> bool {
+    has_org_permission(membership, Membership::has_manage_policies)
+}
+
+/// Upstream's `AccessEventLogsRequirement`. Also used by the cipher event endpoints in `api::core::events`.
+pub(crate) fn may_access_event_logs(membership: &Membership) -> bool {
+    has_org_permission(membership, Membership::has_access_event_logs)
+}
+
+/// Upstream's `AccessImportExportRequirement`. Also used by the organization import endpoint.
+///
+/// NOTE: there is deliberately no `may_access_reports` guard. Vaultwarden has no server-side report
+/// endpoints -- clients compute reports from the organization cipher list -- so `accessReports` is
+/// enforced where that list is served (`get_org_details`). A guard here would invite gating an endpoint
+/// on "may call reports" instead of "may read these ciphers".
+pub(crate) fn may_access_import_export(membership: &Membership) -> bool {
+    has_org_permission(membership, Membership::has_access_import_export)
 }
 
 // org_id is usually the second path param ("/organizations/<org_id>"),
@@ -835,6 +884,9 @@ impl<'r> FromRequest<'r> for OrgHeaders {
 }
 
 pub struct AdminHeaders {
+    // Kept for parity with the other org header guards (and possible future use); the org export
+    // endpoint that used to read this now goes through `AccessImportExportHeaders` instead.
+    #[allow(dead_code)]
     pub host: String,
     pub device: Device,
     pub user: User,
@@ -869,6 +921,96 @@ impl<'r> FromRequest<'r> for AdminHeaders {
         }
     }
 }
+
+// Macro to generate a request guard that permits a confirmed Admin/Owner, or a
+// confirmed Custom member holding the given permission. The generated struct
+// mirrors AdminHeaders so it can be used as a drop-in replacement on endpoints.
+macro_rules! generate_manage_headers {
+    ($name:ident, $check:ident, $err:literal) => {
+        #[allow(dead_code)]
+        pub struct $name {
+            pub host: String,
+            pub device: Device,
+            pub user: User,
+            pub membership_type: MembershipType,
+            // The caller's membership record. Holding the permission that opens an endpoint says
+            // nothing about *which* data the caller may reach, so handlers need the membership to
+            // apply the regular full-access/per-collection checks on top of the guard.
+            pub membership: Membership,
+            pub ip: ClientIp,
+            pub org_id: OrganizationId,
+        }
+
+        #[rocket::async_trait]
+        impl<'r> FromRequest<'r> for $name {
+            type Error = &'static str;
+
+            async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+                let headers = try_outcome!(OrgHeaders::from_request(request).await);
+                if $check(&headers.membership) {
+                    Outcome::Success(Self {
+                        host: headers.host,
+                        device: headers.device,
+                        user: headers.user,
+                        membership_type: headers.membership_type,
+                        ip: headers.ip,
+                        org_id: headers.membership.org_uuid.clone(),
+                        membership: headers.membership,
+                    })
+                } else {
+                    err_handler!($err)
+                }
+            }
+        }
+
+        impl From<$name> for Headers {
+            fn from(h: $name) -> Headers {
+                Headers {
+                    host: h.host,
+                    device: h.device,
+                    user: h.user,
+                    ip: h.ip,
+                }
+            }
+        }
+    };
+}
+
+generate_manage_headers!(
+    ManageUsersHeaders,
+    may_manage_users,
+    "You need the 'Manage Users' permission, or to be an Admin or Owner, to call this endpoint"
+);
+generate_manage_headers!(
+    ManageGroupsHeaders,
+    may_manage_groups,
+    "You need the 'Manage Groups' permission, or to be an Admin or Owner, to call this endpoint"
+);
+generate_manage_headers!(
+    ManagePoliciesHeaders,
+    may_manage_policies,
+    "You need the 'Manage Policies' permission, or to be an Admin or Owner, to call this endpoint"
+);
+// Upstream's `ManageUsersOrGroupsRequirement`, which guards only the group *details list*
+// (`GET /organizations/<org_id>/groups/details`). The single-group view is narrower
+// (`ManageGroupsRequirement`) and therefore keeps `ManageGroupsHeaders`.
+generate_manage_headers!(
+    ManageUsersOrGroupsHeaders,
+    may_manage_users_or_groups,
+    "You need the 'Manage Users' or 'Manage Groups' permission, or to be an Admin or Owner, to call this endpoint"
+);
+generate_manage_headers!(
+    AccessEventLogsHeaders,
+    may_access_event_logs,
+    "You need the 'Access Event Logs' permission, or to be an Admin or Owner, to call this endpoint"
+);
+generate_manage_headers!(
+    AccessImportExportHeaders,
+    may_access_import_export,
+    "You need the 'Access Import/Export' permission, or to be an Admin or Owner, to call this endpoint"
+);
+// NOTE: no `AccessReportsHeaders`. See the note on `may_access_import_export` above:
+// `accessReports` guards data (the organization cipher list), not a dedicated endpoint.
 
 // col_id is usually the fourth path param ("/organizations/<org_id>/collections/<col_id>"),
 // but there could be cases where it is a query value.
@@ -959,7 +1101,7 @@ impl<'r> FromRequest<'r> for ManagerHeadersLoose {
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         let headers = try_outcome!(OrgHeaders::from_request(request).await);
-        if headers.is_confirmed_and_manager() {
+        if headers.membership.has_status(MembershipStatus::Confirmed) {
             Outcome::Success(Self {
                 host: headers.host,
                 device: headers.device,
@@ -968,7 +1110,7 @@ impl<'r> FromRequest<'r> for ManagerHeadersLoose {
                 ip: headers.ip,
             })
         } else {
-            err_handler!("You need to be a Manager, Admin or Owner to call this endpoint")
+            err_handler!("You need to be a confirmed organization member to call this endpoint")
         }
     }
 }
