@@ -534,3 +534,71 @@ mod postgresql_migrations {
         Ok(())
     }
 }
+
+#[cfg(all(test, sqlite))]
+pub(crate) mod test_db {
+    use std::{
+        future::Future,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use super::*;
+
+    pub struct TestDb {
+        path: PathBuf,
+        // An `Option` so `Drop` can close every connection before deleting the file.
+        pool: Option<Pool<DbConnManager>>,
+    }
+
+    impl TestDb {
+        /// `schema` is the DDL (and any seed data) the test needs; only the tables under test have to
+        /// be declared.
+        pub fn new(schema: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "vaultwarden-test-{}-{}.sqlite3",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            // An existing file makes `DbConnType::from_url` take the bare-path SQLite branch.
+            drop(std::fs::remove_file(&path));
+            std::fs::File::create(&path).expect("Error creating test database file");
+
+            let pool = Pool::builder()
+                .max_size(4)
+                .build(DbConnManager::new(path.to_str().expect("Test database path is not UTF-8")))
+                .expect("Error creating test database pool");
+            pool.get().expect("Error opening test database").batch_execute(schema).expect("Error applying test schema");
+
+            Self {
+                path,
+                pool: Some(pool),
+            }
+        }
+
+        pub fn conn(&self) -> DbConn {
+            let pool = self.pool.as_ref().expect("Test pool is closed");
+            DbConn {
+                conn: Arc::new(Mutex::new(Some(pool.get().expect("Error getting test connection")))),
+                permit: None,
+            }
+        }
+    }
+
+    impl Drop for TestDb {
+        fn drop(&mut self) {
+            drop(self.pool.take());
+            drop(std::fs::remove_file(&self.path));
+        }
+    }
+
+    /// `DbConn::run` uses `block_in_place`, which needs a multi-threaded runtime.
+    pub fn block_on<F: Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Error building test runtime")
+            .block_on(future)
+    }
+}

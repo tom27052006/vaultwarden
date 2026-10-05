@@ -638,3 +638,66 @@ impl GroupUser {
     UuidFromParam,
 )]
 pub struct GroupId(String);
+
+#[cfg(all(test, sqlite))]
+mod stack_query_tests {
+    use super::GroupUser;
+    use crate::db::{
+        models::{Membership, MembershipStatus, MembershipType},
+        test_db::{TestDb, block_on},
+    };
+
+    const FIXTURE: &str = "
+        CREATE TABLE users_organizations (uuid TEXT, user_uuid TEXT, org_uuid TEXT, status INTEGER, atype INTEGER);
+        CREATE TABLE collections (uuid TEXT, org_uuid TEXT);
+        CREATE TABLE users_collections (user_uuid TEXT, collection_uuid TEXT, manage BOOLEAN);
+        CREATE TABLE groups (uuid TEXT, organizations_uuid TEXT, access_all BOOLEAN);
+        CREATE TABLE groups_users (groups_uuid TEXT, users_organizations_uuid TEXT);
+        CREATE TABLE collections_groups (groups_uuid TEXT, collections_uuid TEXT, manage BOOLEAN);
+        INSERT INTO users_organizations VALUES ('m', 'u', 'org1', 2, 4), ('revoked', 'r', 'org1', -1, 4);
+        INSERT INTO collections VALUES ('read', 'org1'), ('managed', 'org1'), ('forged', 'org1'), ('foreign', 'org2');
+        INSERT INTO groups VALUES ('full', 'org1', TRUE), ('manager', 'org1', FALSE), ('foreign-group', 'org2', TRUE);
+        INSERT INTO groups_users VALUES ('full', 'm'), ('manager', 'm'), ('foreign-group', 'm'), ('manager', 'revoked');
+        INSERT INTO collections_groups VALUES ('full', 'read', FALSE), ('manager', 'managed', TRUE),
+            ('foreign-group', 'forged', TRUE), ('foreign-group', 'foreign', TRUE);
+    ";
+
+    #[test]
+    fn group_grants_are_dynamic_and_explicit_management_is_bound_to_the_membership() {
+        for disable_group_grant in [false, true] {
+            let schema = if disable_group_grant {
+                format!("{FIXTURE} UPDATE groups SET access_all = FALSE WHERE uuid = 'full';")
+            } else {
+                FIXTURE.to_owned()
+            };
+            let db = TestDb::new(&schema);
+            let mut member = Membership::for_test(MembershipType::Custom as i32, MembershipStatus::Confirmed, |m| {
+                m.uuid = "m".to_owned().into();
+                m.user_uuid = "u".to_owned().into();
+                m.org_uuid = "org1".to_owned().into();
+            });
+            block_on(async {
+                let conn = db.conn();
+                assert_eq!(
+                    GroupUser::has_full_access_by_member(&member.org_uuid, &member.uuid, &conn).await,
+                    !disable_group_grant
+                );
+                assert!(
+                    GroupUser::has_access_to_collection_by_member(&"read".to_owned().into(), &member.uuid, &conn).await
+                );
+                assert!(
+                    !GroupUser::has_access_to_collection_by_member(&"forged".to_owned().into(), &member.uuid, &conn)
+                        .await
+                );
+                assert!(member.has_explicit_collection_manage_access(&"managed".to_owned().into(), &conn).await);
+                for denied in ["read", "forged", "foreign"] {
+                    assert!(!member.has_explicit_collection_manage_access(&denied.to_owned().into(), &conn).await);
+                }
+                member.uuid = "revoked".to_owned().into();
+                member.user_uuid = "r".to_owned().into();
+                member.status = MembershipStatus::Revoked as i32;
+                assert!(!member.has_explicit_collection_manage_access(&"managed".to_owned().into(), &conn).await);
+            });
+        }
+    }
+}

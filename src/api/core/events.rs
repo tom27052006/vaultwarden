@@ -220,7 +220,9 @@ async fn post_events_collect(data: Json<Vec<EventCollection>>, headers: Headers,
                 // user can actually access it instead of trusting the provided cipher uuid.
                 if let Some(cipher_uuid) = &event.cipher_id
                     && let Some(cipher) = Cipher::find_by_uuid(cipher_uuid, &conn).await
-                    && cipher.is_accessible_to_user(&headers.user.uuid, &conn).await
+                    && cipher
+                        .is_accessible_to_user(&headers.user.uuid, crate::db::models::CipherAccessScope::User, &conn)
+                        .await
                     && let Some(org_id) = cipher.organization_uuid
                 {
                     log_event_impl(
