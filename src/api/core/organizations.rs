@@ -202,7 +202,6 @@ async fn create_organization(headers: Headers, data: Json<OrgData>, conn: DbConn
     let collection = Collection::new(org.uuid.clone(), data.collection_name, None);
 
     member.akey = data.key;
-    member.access_all = true;
     member.atype = MembershipType::Owner as i32;
     member.status = MembershipStatus::Confirmed as i32;
 
@@ -1063,7 +1062,13 @@ async fn send_invite(
         };
 
         let mut new_member = Membership::new(user.uuid.clone(), org_id.clone(), Some(headers.user.email.clone()));
-        new_member.access_all = access_all;
+        // New memberships use the granular flags; access_all is read only for historical rows.
+        new_member.create_new_collections = new_type == MembershipType::Custom as i32
+            && data.permissions.get("createNewCollections") == Some(&json!(true));
+        new_member.edit_any_collection = new_type == MembershipType::Custom as i32
+            && data.permissions.get("editAnyCollection") == Some(&json!(true));
+        new_member.delete_any_collection = new_type == MembershipType::Custom as i32
+            && data.permissions.get("deleteAnyCollection") == Some(&json!(true));
         new_member.atype = new_type;
         new_member.status = member_status;
         new_member.save(&conn).await?;
@@ -1533,7 +1538,15 @@ async fn edit_member(
         }
     }
 
-    member_to_edit.access_all = access_all;
+    // Preserve a historical plain-User grant during a User-to-User edit, but never create a new one.
+    member_to_edit.access_all =
+        new_type == MembershipType::User && member_to_edit.atype == MembershipType::User && member_to_edit.access_all;
+    member_to_edit.create_new_collections =
+        new_type == MembershipType::Custom && data.permissions.get("createNewCollections") == Some(&json!(true));
+    member_to_edit.edit_any_collection =
+        new_type == MembershipType::Custom && data.permissions.get("editAnyCollection") == Some(&json!(true));
+    member_to_edit.delete_any_collection =
+        new_type == MembershipType::Custom && data.permissions.get("deleteAnyCollection") == Some(&json!(true));
     member_to_edit.atype = new_type as i32;
 
     // This check is also done at accept_invite, _confirm_invite, _activate_member, edit_member, admin::update_membership_type
