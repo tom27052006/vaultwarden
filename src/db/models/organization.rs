@@ -132,6 +132,14 @@ pub(super) fn custom_membership_with_edit_any_collection() -> diesel::dsl::And<
     users_organizations::atype.eq(MembershipType::Custom as i32).and(users_organizations::edit_any_collection.eq(true))
 }
 
+/// Read historical grants during the additive migration period; unknown roles stay fail-closed.
+pub(super) fn legacy_membership_with_access_all() -> diesel::dsl::And<
+    diesel::dsl::Eq<users_organizations::access_all, bool>,
+    diesel::dsl::EqAny<users_organizations::atype, [i32; 4]>,
+> {
+    users_organizations::access_all.eq(true).and(users_organizations::atype.eq_any([0, 1, 2, 4]))
+}
+
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
 #[diesel(table_name = organization_api_key)]
 #[diesel(primary_key(uuid, org_uuid))]
@@ -837,8 +845,12 @@ impl Membership {
     }
 
     pub fn has_full_access(&self) -> bool {
-        (self.access_all || self.has_edit_any_collection() || self.atype >= MembershipType::Admin)
+        (self.has_legacy_access_all() || self.has_edit_any_collection() || self.atype >= MembershipType::Admin)
             && self.has_status(MembershipStatus::Confirmed)
+    }
+
+    pub fn has_legacy_access_all(&self) -> bool {
+        self.access_all && MembershipType::from_i32(self.atype).is_some()
     }
 
     /// Whether this membership reaches every collection in the org regardless of per-collection
@@ -847,7 +859,7 @@ impl Membership {
     /// still read, and intentionally does not gate on status, matching the old column. Authorization
     /// decisions use the status-aware `has_full_access` instead.
     pub fn grants_access_to_all_collections(&self) -> bool {
-        self.access_all || self.atype >= MembershipType::Admin || self.has_edit_any_collection()
+        self.has_legacy_access_all() || self.atype >= MembershipType::Admin || self.has_edit_any_collection()
     }
 
     /// Whether enabling an organization policy may revoke this membership as part of enforcing it.
@@ -1225,7 +1237,7 @@ impl Membership {
                 .filter(
                     custom_membership_with_edit_any_collection() // Custom "Edit any collection" (successor of access_all)
                         .or(users_organizations::atype.eq_any(ORG_ADMIN_ATYPES)) // or org admin/owner
-                        .or(users_organizations::access_all.eq(true)) // historical membership access
+                        .or(legacy_membership_with_access_all()) // historical membership access
                         .or(ciphers_collections::cipher_uuid.eq(&cipher_uuid)), // ..or access to collection with cipher
                 )
                 .select(users_organizations::all_columns)
@@ -1295,7 +1307,7 @@ impl Membership {
                 .filter(
                     custom_membership_with_edit_any_collection() // Custom "Edit any collection" (successor of access_all)
                         .or(users_organizations::atype.eq_any(ORG_ADMIN_ATYPES)) // or org admin/owner
-                        .or(users_organizations::access_all.eq(true)) // historical membership access
+                        .or(legacy_membership_with_access_all()) // historical membership access
                         .or(users_collections::collection_uuid.eq(&collection_uuid)), // ..or access to collection
                 )
                 .select(users_organizations::all_columns)
@@ -1435,6 +1447,25 @@ mod tests {
 
     fn membership(atype: i32) -> Membership {
         Membership::for_test(atype, MembershipStatus::Confirmed, |_| {})
+    }
+
+    #[test]
+    fn legacy_access_all_requires_a_known_confirmed_role() {
+        let mut member = membership(MembershipType::User as i32);
+        member.access_all = true;
+        assert!(member.has_full_access());
+        assert!(member.grants_access_to_all_collections());
+        assert!(!member.has_edit_any_collection());
+        assert!(!member.has_manage_users());
+
+        member.status = MembershipStatus::Revoked as i32;
+        assert!(!member.has_full_access());
+        member.status = MembershipStatus::Confirmed as i32;
+        for unknown in [-1, 3, UNKNOWN_ATYPE] {
+            member.atype = unknown;
+            assert!(!member.has_full_access());
+            assert!(!member.grants_access_to_all_collections());
+        }
     }
 
     /// How roles rank against each other, and how a stored `atype` is read.
