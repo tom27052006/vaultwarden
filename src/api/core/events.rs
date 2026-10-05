@@ -14,7 +14,7 @@ use crate::{
             Cipher, CipherAccessScope, CipherId, Event, EventType, Membership, MembershipId, OrganizationId, UserId,
         },
     },
-    util::{parse_date, try_parse_date},
+    util::try_parse_date,
 };
 
 /// ###############################################################################################################
@@ -219,6 +219,82 @@ struct EventCollection {
     organization_id: Option<OrganizationId>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientEventKind {
+    User,
+    Cipher,
+    Organization,
+    OrganizationUser,
+}
+
+const MAX_CLIENT_EVENT_BATCH_SIZE: usize = 1_000;
+
+fn validate_client_event_batch_size(event_count: usize) -> Result<(), crate::Error> {
+    if event_count > MAX_CLIENT_EVENT_BATCH_SIZE {
+        return Err(crate::Error::new(
+            "Event batch is too large",
+            format!("At most {MAX_CLIENT_EVENT_BATCH_SIZE} events are accepted per request"),
+        ));
+    }
+    Ok(())
+}
+
+/// The client-generated event types upstream's `/events/collect` accepts. Anything else is ignored,
+/// so that an authenticated client cannot write arbitrary event types into an organization's audit
+/// log. Keep this in sync with upstream's `CollectController`: a type missing here is silently not
+/// logged, which is why the newer item-type events below are listed explicitly rather than matched
+/// by range.
+fn client_event_kind(event_type: i32) -> Option<ClientEventKind> {
+    match event_type {
+        event_type if event_type == EventType::UserClientExportedVault as i32 => Some(ClientEventKind::User),
+        event_type
+            if event_type == EventType::CipherClientViewed as i32
+                || event_type == EventType::CipherClientToggledPasswordVisible as i32
+                || event_type == EventType::CipherClientToggledHiddenFieldVisible as i32
+                || event_type == EventType::CipherClientToggledCardCodeVisible as i32
+                || event_type == EventType::CipherClientCopiedPassword as i32
+                || event_type == EventType::CipherClientCopiedHiddenField as i32
+                || event_type == EventType::CipherClientCopiedCardCode as i32
+                || event_type == EventType::CipherClientAutofilled as i32
+                || event_type == EventType::CipherClientToggledCardNumberVisible as i32
+                || event_type == EventType::CipherClientCopiedBankAccountNumber as i32
+                || event_type == EventType::CipherClientCopiedBankAccountPin as i32
+                || event_type == EventType::CipherClientToggledBankAccountNumberVisible as i32
+                || event_type == EventType::CipherClientToggledBankAccountPinVisible as i32
+                || event_type == EventType::CipherClientCopiedLicenseNumber as i32
+                || event_type == EventType::CipherClientToggledLicenseNumberVisible as i32
+                || event_type == EventType::CipherClientCopiedPassportNumber as i32
+                || event_type == EventType::CipherClientToggledPassportNumberVisible as i32
+                || event_type == EventType::CipherClientCopiedSwiftCode as i32
+                || event_type == EventType::CipherClientToggledSwiftCodeVisible as i32
+                || event_type == EventType::CipherClientCopiedIban as i32
+                || event_type == EventType::CipherClientToggledIbanVisible as i32
+                || event_type == EventType::CipherClientCopiedNationalIdentificationNumber as i32
+                || event_type == EventType::CipherClientToggledNationalIdentificationNumberVisible as i32 =>
+        {
+            Some(ClientEventKind::Cipher)
+        }
+        event_type
+            if event_type == EventType::OrganizationClientExportedVault as i32
+                || event_type == EventType::OrganizationAutoConfirmEnabledAdmin as i32
+                || event_type == EventType::OrganizationAutoConfirmDisabledAdmin as i32
+                || event_type == EventType::OrganizationInviteLinkClientCopied as i32 =>
+        {
+            Some(ClientEventKind::Organization)
+        }
+        // Upstream logs these through `LogOrganizationUserEventAsync`: they describe the acting
+        // user's own membership, not the organization as a whole.
+        event_type
+            if event_type == EventType::OrganizationUserNotificationBannerActionClicked as i32
+                || event_type == EventType::OrganizationItemOrganizationAccepted as i32
+                || event_type == EventType::OrganizationItemOrganizationDeclined as i32 =>
+        {
+            Some(ClientEventKind::OrganizationUser)
+        }
+        _ => None,
+    }
+}
+
 // Upstream:
 // https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Events/Controllers/CollectController.cs
 // https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Core/AdminConsole/Services/Implementations/EventService.cs
@@ -228,10 +304,25 @@ async fn post_events_collect(data: Json<Vec<EventCollection>>, headers: Headers,
         return Ok(());
     }
 
+    // Official clients normally submit small batches (upstream explicitly exercises batches of
+    // 100). Keep ample headroom while preventing one authenticated request from causing an
+    // effectively unbounded sequence of database reads and writes under the shared 20 MiB JSON
+    // limit.
+    validate_client_event_batch_size(data.len())?;
+
+    // Validate all accepted client events before writing any of them. Unsupported event types are
+    // ignored, matching upstream, while malformed dates on accepted events produce a controlled
+    // 400 response instead of panicking after a partially processed batch.
+    let mut accepted_events = Vec::new();
     for event in data.iter() {
-        let event_date = parse_date(&event.date);
-        match event.r#type {
-            1000..=1099 => {
+        if let Some(kind) = client_event_kind(event.r#type) {
+            accepted_events.push((event, kind, parse_event_date(&event.date, "event date")?));
+        }
+    }
+
+    for (event, kind, event_date) in accepted_events {
+        match kind {
+            ClientEventKind::User => {
                 log_user_event_impl(
                     event.r#type,
                     &headers.user.uuid,
@@ -242,7 +333,7 @@ async fn post_events_collect(data: Json<Vec<EventCollection>>, headers: Headers,
                 )
                 .await;
             }
-            1600..=1699 => {
+            ClientEventKind::Organization => {
                 // Only allow logging events for an organization the user is actually a member of.
                 if let Some(org_id) = &event.organization_id
                     && Membership::find_confirmed_by_user_and_org(&headers.user.uuid, org_id, &conn).await.is_some()
@@ -260,27 +351,21 @@ async fn post_events_collect(data: Json<Vec<EventCollection>>, headers: Headers,
                     .await;
                 }
             }
-            // Only the vault notification banner click is accepted from clients. The rest of
-            // the 1500..=1599 range is written server-side and must not be forgeable by a client.
-            t if t == EventType::OrganizationUserNotificationBannerActionClicked as i32 => {
-                if let Some(org_id) = &event.organization_id
-                    && let Some(membership) =
-                        Membership::find_confirmed_by_user_and_org(&headers.user.uuid, org_id, &conn).await
-                {
-                    log_event_impl(
+            ClientEventKind::OrganizationUser => {
+                if let Some(org_id) = &event.organization_id {
+                    log_client_org_user_event(
                         event.r#type,
-                        &membership.uuid,
                         org_id,
                         &headers.user.uuid,
                         headers.device.atype,
-                        Some(event_date),
+                        event_date,
                         &headers.ip.ip,
                         &conn,
                     )
                     .await;
                 }
             }
-            _ => {
+            ClientEventKind::Cipher => {
                 // The cipher determines the organization the event is logged to, so make sure the
                 // user can actually access it instead of trusting the provided cipher uuid.
                 if let Some(cipher_uuid) = &event.cipher_id
@@ -304,6 +389,24 @@ async fn post_events_collect(data: Json<Vec<EventCollection>>, headers: Headers,
         }
     }
     Ok(())
+}
+
+/// Logs a client event against the membership the acting user holds in `org_id`. Without such a
+/// membership there is nothing to log against, so a request naming another organization writes no
+/// event at all instead of one pointing at a foreign or non-existent membership.
+async fn log_client_org_user_event(
+    event_type: i32,
+    org_id: &OrganizationId,
+    act_user_id: &UserId,
+    device_type: i32,
+    event_date: NaiveDateTime,
+    ip: &IpAddr,
+    conn: &DbConn,
+) {
+    if let Some(membership) = Membership::find_confirmed_by_user_and_org(act_user_id, org_id, conn).await {
+        log_event_impl(event_type, &membership.uuid, org_id, act_user_id, device_type, Some(event_date), ip, conn)
+            .await;
+    }
 }
 
 pub async fn log_user_event(event_type: i32, user_id: &UserId, device_type: i32, ip: &IpAddr, conn: &DbConn) {
@@ -393,7 +496,14 @@ async fn log_event_impl(
         1500..=1599 => {
             event.org_user_uuid = Some(source_uuid.to_owned().into());
         }
-        // 1600..=1699 Are organizational events, and they do not need the source_uuid
+        // 1600..=1699 Are organizational events, and they do not need the source_uuid, except for
+        // the two item-organization events, which upstream logs against a membership.
+        event_type
+            if event_type == EventType::OrganizationItemOrganizationAccepted as i32
+                || event_type == EventType::OrganizationItemOrganizationDeclined as i32 =>
+        {
+            event.org_user_uuid = Some(source_uuid.to_owned().into());
+        }
         // Policy Events
         1700..=1799 => {
             event.policy_uuid = Some(source_uuid.to_owned().into());
@@ -427,6 +537,21 @@ pub async fn event_cleanup_job(pool: DbPool) {
 mod tests {
     use super::*;
     use crate::db::models::{MembershipStatus, MembershipType};
+
+    #[test]
+    fn client_events_reject_server_event_types_and_oversized_batches() {
+        assert_eq!(client_event_kind(EventType::UserClientExportedVault as i32), Some(ClientEventKind::User));
+        assert_eq!(client_event_kind(EventType::CipherClientViewed as i32), Some(ClientEventKind::Cipher));
+        assert_eq!(
+            client_event_kind(EventType::OrganizationItemOrganizationAccepted as i32),
+            Some(ClientEventKind::OrganizationUser)
+        );
+        for server_event in [1000, 1100, 1300, 1500, -1, i32::MAX] {
+            assert_eq!(client_event_kind(server_event), None);
+        }
+        assert!(validate_client_event_batch_size(1_000).is_ok());
+        assert!(validate_client_event_batch_size(1_001).is_err());
+    }
 
     #[test]
     fn cipher_event_scope_binds_the_user_organization_and_confirmed_permission() {
