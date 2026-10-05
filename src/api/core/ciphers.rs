@@ -2121,7 +2121,7 @@ async fn delete_cipher_by_uuid(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CipherIdsData {
-    ids: Vec<CipherId>,
+    ids: HashSet<CipherId>,
 }
 
 async fn delete_multiple_ciphers(
