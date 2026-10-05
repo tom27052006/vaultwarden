@@ -1,5 +1,6 @@
 use derive_more::{AsRef, Deref, Display, From};
 use diesel::prelude::*;
+use num_traits::FromPrimitive;
 use serde_json::Value;
 
 use crate::{
@@ -50,6 +51,11 @@ pub struct CollectionUser {
 pub struct CollectionCipher {
     pub cipher_uuid: CipherId,
     pub collection_uuid: CollectionId,
+}
+
+pub(super) fn stored_assignment_manage(membership_type: i32, stored_manage: bool) -> bool {
+    matches!(MembershipType::from_i32(membership_type), Some(MembershipType::Owner | MembershipType::Admin))
+        || stored_manage
 }
 
 /// Local methods
