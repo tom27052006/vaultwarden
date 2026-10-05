@@ -132,6 +132,14 @@ pub(super) fn custom_membership_with_edit_any_collection() -> diesel::dsl::And<
     users_organizations::atype.eq(MembershipType::Custom as i32).and(users_organizations::edit_any_collection.eq(true))
 }
 
+/// Read historical grants during the additive migration period; unknown roles stay fail-closed.
+pub(super) fn legacy_membership_with_access_all() -> diesel::dsl::And<
+    diesel::dsl::Eq<users_organizations::access_all, bool>,
+    diesel::dsl::EqAny<users_organizations::atype, [i32; 4]>,
+> {
+    users_organizations::access_all.eq(true).and(users_organizations::atype.eq_any([0, 1, 2, 4]))
+}
+
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
 #[diesel(table_name = organization_api_key)]
 #[diesel(primary_key(uuid, org_uuid))]
@@ -178,10 +186,6 @@ pub enum MembershipType {
 }
 
 impl MembershipType {
-    // Kept only while the original call sites are moved to Custom in later stack branches.
-    #[allow(non_upper_case_globals)]
-    pub const Manager: Self = Self::Custom;
-
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "0" | "Owner" => Some(MembershipType::Owner),
@@ -851,7 +855,7 @@ impl Membership {
     /// persisted and grants vault reach; Admins/Owners and Custom members with `edit_any_collection`
     /// also reach all collections. Authorization uses the separate status-aware helpers.
     pub fn grants_access_to_all_collections(&self) -> bool {
-        self.access_all || self.atype >= MembershipType::Admin || self.has_edit_any_collection()
+        self.has_legacy_access_all() || self.atype >= MembershipType::Admin || self.has_edit_any_collection()
     }
 
     /// Whether enabling an organization policy may revoke this membership as part of enforcing it.
@@ -1229,7 +1233,7 @@ impl Membership {
                 .filter(
                     custom_membership_with_edit_any_collection() // Custom granular all-collection reach
                         .or(users_organizations::atype.eq_any(ORG_ADMIN_ATYPES)) // or org admin/owner
-                        .or(users_organizations::access_all.eq(true)) // historical membership access
+                        .or(legacy_membership_with_access_all()) // historical membership access
                         .or(ciphers_collections::cipher_uuid.eq(&cipher_uuid)), // ..or access to collection with cipher
                 )
                 .select(users_organizations::all_columns)
@@ -1299,7 +1303,7 @@ impl Membership {
                 .filter(
                     custom_membership_with_edit_any_collection() // Custom granular all-collection reach
                         .or(users_organizations::atype.eq_any(ORG_ADMIN_ATYPES)) // or org admin/owner
-                        .or(users_organizations::access_all.eq(true)) // historical membership access
+                        .or(legacy_membership_with_access_all()) // historical membership access
                         .or(users_collections::collection_uuid.eq(&collection_uuid)), // ..or access to collection
                 )
                 .select(users_organizations::all_columns)
@@ -1455,6 +1459,7 @@ mod tests {
         unknown.access_all = true;
         assert!(!unknown.has_legacy_access_all());
         assert!(!unknown.has_full_access());
+        assert!(!unknown.grants_access_to_all_collections());
     }
 
     /// How roles rank against each other, and how a stored `atype` is read.
