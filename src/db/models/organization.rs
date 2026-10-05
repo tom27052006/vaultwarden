@@ -186,10 +186,6 @@ pub enum MembershipType {
 }
 
 impl MembershipType {
-    // Kept only while the original call sites are moved to Custom in later stack branches.
-    #[allow(non_upper_case_globals)]
-    pub const Manager: Self = Self::Custom;
-
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "0" | "Owner" => Some(MembershipType::Owner),
@@ -358,10 +354,6 @@ impl Organization {
 const ACTIVATE_REVOKE_DIFF: i32 = 128;
 
 impl Membership {
-    pub fn type_manager_as_custom(&self) -> i32 {
-        self.atype
-    }
-
     pub fn new(user_uuid: UserId, org_uuid: OrganizationId, invited_by_email: Option<String>) -> Self {
         Self {
             uuid: MembershipId(crate::util::get_uuid()),
