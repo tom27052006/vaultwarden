@@ -12,9 +12,10 @@ use crate::{
         core::{CipherSyncData, CipherSyncType, accept_org_invite, log_event, two_factor},
     },
     auth::{
-        AdminHeaders, CollectionDeleteHeaders, CollectionReadHeaders, Headers, ManageGroupsHeaders,
-        ManagePoliciesHeaders, ManageUsersHeaders, ManageUsersOrGroupsHeaders, ManagerHeaders, ManagerHeadersLoose,
-        OrgMemberHeaders, OwnerHeaders, can_read_collection_access, can_read_collection_with_access, decode_invite,
+        AccessImportExportHeaders, AdminHeaders, CollectionDeleteHeaders, CollectionReadHeaders, Headers,
+        ManageGroupsHeaders, ManagePoliciesHeaders, ManageUsersHeaders, ManageUsersOrGroupsHeaders, ManagerHeaders,
+        ManagerHeadersLoose, OrgMemberHeaders, OwnerHeaders, can_read_collection_access,
+        can_read_collection_with_access, decode_invite, may_access_import_export,
     },
     db::{
         DbConn,
@@ -49,6 +50,7 @@ pub fn routes() -> Vec<Route> {
         delete_organization_collection,
         bulk_delete_organization_collections,
         post_bulk_collections,
+        get_assigned_org_details,
         get_org_details,
         get_org_domain_sso_verified,
         get_members,
@@ -482,10 +484,6 @@ async fn get_org_collections_details(org_id: OrganizationId, headers: ManagerHea
     })))
 }
 
-async fn get_org_collections_impl(org_id: &OrganizationId, conn: &DbConn) -> Value {
-    Collection::find_by_organization(org_id, conn).await.iter().map(Collection::to_json).collect::<Value>()
-}
-
 fn may_read_all_collections(member: &Membership) -> bool {
     member.has_full_access()
         || member.has_edit_any_collection()
@@ -790,6 +788,12 @@ struct BulkCollectionIds {
     ids: Vec<CollectionId>,
 }
 
+/// Upstream resolves a bulk delete through `GetManyByManyIdsAsync(model.Ids)` and then compares the
+/// number of loaded collections against the number of requested ids, so a repeated id resolves to one
+/// entity and fails that count check. Duplicates are therefore rejected instead of deduplicated.
+/// An empty request is rejected as well: upstream's bulk authorization handler fails closed on an
+/// empty resource set. Both checks run before the first deletion, so nothing is authorized, deleted
+/// or logged for a rejected request.
 fn bulk_delete_collection_targets(ids: Vec<CollectionId>) -> ApiResult<Vec<CollectionId>> {
     if ids.is_empty() {
         err!("No collections were provided")
@@ -824,6 +828,10 @@ async fn bulk_delete_organization_collections(
     Ok(())
 }
 
+// Upstream guards this route with `BulkCollectionOperations.ReadWithAccess`, which — unlike the
+// `ReadAccess` used by `/collections/<col_id>/users` below — also admits `Manage users`. Hence the
+// route-specific `can_read_collection_with_access` instead of the general `CollectionReadHeaders`
+// guard: extending that guard would have changed the `/users` endpoint along with it.
 #[get("/organizations/<org_id>/collections/<col_id>/details")]
 async fn get_org_collection_detail(
     org_id: OrganizationId,
@@ -924,18 +932,115 @@ struct OrgIdData {
     organization_id: OrganizationId,
 }
 
+fn filter_ciphers_for_organization(ciphers: Vec<Cipher>, org_id: &OrganizationId) -> Vec<Cipher> {
+    ciphers.into_iter().filter(|cipher| cipher.organization_uuid.as_ref() == Some(org_id)).collect()
+}
+
+// The Admin Console calls this when the acting member may not read every cipher: DeleteAnyCollection
+// alone needs an empty successful response so the collection list can finish loading.
+//
+// Security: start from the regular user-visible cipher query and constrain it to the requested
+// organization. DeleteAnyCollection must never make cipher contents visible.
+#[get("/ciphers/organization-details/assigned?<data..>")]
+async fn get_assigned_org_details(data: OrgIdData, headers: Headers, conn: DbConn) -> JsonResult {
+    let Some(membership) =
+        Membership::find_confirmed_by_user_and_org(&headers.user.uuid, &data.organization_id, &conn).await
+    else {
+        err_code!("Resource not found.", "User is not a confirmed member of the organization", Status::NotFound.code);
+    };
+
+    Ok(Json(json!({
+        "data": assigned_org_ciphers_json(&membership, &headers.host, &conn).await?,
+        "object": "list",
+        "continuationToken": null,
+    })))
+}
+
+// Serialize exactly the organization ciphers the user is actually assigned to, directly or via a group.
+// `CipherSyncType::User` keeps the per-cipher access restrictions in place, so nothing outside the
+// caller's own collections is returned and every cipher carries its real `edit`/`viewPassword` flags.
+// NOTE: as everywhere else in Vaultwarden (and Bitwarden), `hidePasswords` is reported as
+// `viewPassword: false` rather than redacted server-side, so this assigned portion matches what the
+// same member receives from `/api/sync`.
+//
+// On top of that, upstream's `GetAssignedOrganizationCiphers` adds the organization's *unassigned*
+// ciphers for the roles allowed to reach them (`CanAccessUnassignedCiphersAsync`: Owner/Admin, or a
+// Custom member holding `Edit any collection`) -- which is `may_administer_org_ciphers`. This
+// is deliberately the only place that widens the scope: the regular `/api/sync` view stays as it is.
+async fn assigned_org_ciphers_json(membership: &Membership, host: &str, conn: &DbConn) -> Result<Value, crate::Error> {
+    let user_id = &membership.user_uuid;
+    let org_id = &membership.org_uuid;
+
+    let ciphers = filter_ciphers_for_organization(Cipher::find_by_user_visible(user_id, conn).await, org_id);
+    let assigned: HashSet<CipherId> = ciphers.iter().map(|cipher| cipher.uuid.clone()).collect();
+
+    let cipher_sync_data = CipherSyncData::new(user_id, CipherSyncType::User, conn).await;
+    let mut ciphers_json = Vec::new();
+
+    // Assigned ciphers keep the user's actual collection restrictions.
+    for cipher in ciphers {
+        ciphers_json.push(cipher.to_json(host, user_id, Some(&cipher_sync_data), CipherSyncType::User, conn).await?);
+    }
+
+    // Bitwarden exposes unassigned ciphers with full edit/password access to
+    // Owner/Admin and Custom members with EditAnyCollection.
+    if may_administer_org_ciphers(membership) {
+        for cipher in Cipher::find_unassigned_by_org(org_id, conn)
+            .await
+            .into_iter()
+            .filter(|cipher| !assigned.contains(&cipher.uuid))
+        {
+            // Use Organization serialization here so the normal user-access
+            // assertion is deliberately skipped for this already-authorized
+            // special case. Add the user-specific fields below explicitly.
+            let mut unassigned_cipher_json =
+                cipher.to_json(host, user_id, Some(&cipher_sync_data), CipherSyncType::Organization, conn).await?;
+
+            unassigned_cipher_json["folderId"] = json!(cipher_sync_data.cipher_folders.get(&cipher.uuid).cloned());
+            unassigned_cipher_json["favorite"] = json!(cipher_sync_data.cipher_favorites.contains(&cipher.uuid));
+            unassigned_cipher_json["archivedDate"] = json!(
+                cipher_sync_data
+                    .cipher_archives
+                    .get(&cipher.uuid)
+                    .map_or(Value::Null, |date| Value::String(crate::util::format_date(date)))
+            );
+
+            unassigned_cipher_json["edit"] = json!(true);
+            unassigned_cipher_json["viewPassword"] = json!(true);
+            unassigned_cipher_json["permissions"] = json!({
+                "delete": true,
+                "restore": true,
+            });
+
+            ciphers_json.push(unassigned_cipher_json);
+        }
+    }
+
+    Ok(Value::Array(ciphers_json))
+}
+
+// The organization cipher list the clients use for the admin vault view and for computing reports
+// locally. Bitwarden grants the complete organization scope to AccessReports and AccessImportExport.
 #[get("/ciphers/organization-details?<data..>")]
 async fn get_org_details(data: OrgIdData, headers: ManagerHeadersLoose, conn: DbConn) -> JsonResult {
     if data.organization_id != headers.membership.org_uuid {
         err_code!("Resource not found.", "Organization id's do not match", Status::NotFound.code);
     }
 
-    if !may_administer_org_ciphers(&headers.membership) {
-        err_code!("Resource not found.", "User does not have full access", Status::NotFound.code);
-    }
-
+    let ciphers_json = match organization_report_scope(&headers.membership) {
+        OrganizationReportScope::Complete => {
+            get_org_details_impl(&data.organization_id, &headers.host, &headers.user.uuid, &conn).await?
+        }
+        OrganizationReportScope::Denied => {
+            err_code!(
+                "Resource not found.",
+                "User does not have permission to read the organization ciphers",
+                Status::NotFound.code
+            );
+        }
+    };
     Ok(Json(json!({
-        "data": get_org_details_impl(&data.organization_id, &headers.host, &headers.user.uuid, &conn).await?,
+        "data": ciphers_json,
         "object": "list",
         "continuationToken": null,
     })))
@@ -947,14 +1052,35 @@ async fn get_org_details_impl(
     user_id: &UserId,
     conn: &DbConn,
 ) -> Result<Value, crate::Error> {
-    let ciphers = Cipher::find_by_org(org_id, conn).await;
-    let cipher_sync_data = CipherSyncData::new(user_id, CipherSyncType::Organization, conn).await;
+    ciphers_to_org_json(Cipher::find_by_org(org_id, conn).await, org_id, host, user_id, conn).await
+}
+
+// Serialize an already-authorized set of organization ciphers. The caller decides which ciphers go
+// in: `CipherSyncType::Organization` skips the per-cipher access restrictions, so this must never be
+// handed a cipher the user is not allowed to see.
+async fn ciphers_to_org_json(
+    ciphers: Vec<Cipher>,
+    org_id: &OrganizationId,
+    host: &str,
+    user_id: &UserId,
+    conn: &DbConn,
+) -> Result<Value, crate::Error> {
+    let mut cipher_sync_data = CipherSyncData::new(user_id, CipherSyncType::Organization, conn).await;
+    cipher_sync_data.cipher_collections =
+        index_cipher_collections(Cipher::get_collections_with_cipher_by_organization(org_id, conn).await);
 
     let mut ciphers_json = Vec::with_capacity(ciphers.len());
     for c in ciphers {
         ciphers_json.push(c.to_json(host, user_id, Some(&cipher_sync_data), CipherSyncType::Organization, conn).await?);
     }
     Ok(json!(ciphers_json))
+}
+
+fn index_cipher_collections(relations: Vec<(CipherId, CollectionId)>) -> HashMap<CipherId, Vec<CollectionId>> {
+    relations.into_iter().fold(HashMap::new(), |mut indexed, (cipher_id, collection_id)| {
+        indexed.entry(cipher_id).or_default().push(collection_id);
+        indexed
+    })
 }
 
 // Returning a Domain/Organization here allow to prefill it and prevent prompting the user
@@ -1095,7 +1221,7 @@ impl CustomRolePermissions {
     /// Read one known permission key.
     ///
     /// An absent key is `false`: the object is the complete set the caller wants. A key that *is* present
-    /// must be a JSON boolean â€” treating `"true"`, `1` or `null` as "not `Value::Bool(true)`" turned a
+    /// must be a JSON boolean — treating `"true"`, `1` or `null` as "not `Value::Bool(true)`" turned a
     /// malformed request into a silent permission *removal* that still answered 200.
     fn read_known(permissions: &HashMap<String, Value>, key: &str) -> Result<bool, crate::Error> {
         match permissions.get(key) {
@@ -1379,6 +1505,10 @@ async fn reinvite_member(
     reinvite_member_impl(&org_id, &member_id, &headers, &conn).await
 }
 
+/// Reinvite and confirm are guarded by `ManageUsersRequirement` alone upstream — neither
+/// `ResendOrganizationInviteCommand` nor `ConfirmOrganizationUserCommand` consults the acting member's
+/// role against the target's. Neither action can change a role, so the actor/target matrix that
+/// update, remove, revoke and restore still enforce does not apply here.
 async fn reinvite_member_impl(
     org_id: &OrganizationId,
     member_id: &MembershipId,
@@ -1619,6 +1749,10 @@ async fn confirm_invite_impl(
     save_result
 }
 
+// Organization user mini-details are available to every confirmed organization member, matching
+// upstream's `MemberOrProvider` authorization for this route. That broadens metadata visibility (id,
+// user id, name, email, membership type, status) compared with Vaultwarden's previous Manager-only
+// behaviour, and is intentional: a broad range of client flows depends on basic member lookups.
 #[get("/organizations/<org_id>/users/mini-details", rank = 1)]
 async fn get_org_user_mini_details(org_id: OrganizationId, headers: OrgMemberHeaders, conn: DbConn) -> JsonResult {
     if org_id != headers.membership.org_uuid {
@@ -1724,7 +1858,7 @@ async fn edit_member(
     }
 
     custom_permissions.apply_to(&mut member_to_edit);
-    // A historical plain-User grant survives an unchanged User edit; role changes never carry it forward.
+    // Preserve an existing User grant when editing that same role; never carry it into a new role.
     if !(member_to_edit.atype == MembershipType::User && new_type == MembershipType::User) {
         member_to_edit.access_all = false;
     }
@@ -1931,8 +2065,7 @@ async fn bulk_public_keys(
     })))
 }
 
-use super::ciphers::CipherData;
-use super::ciphers::{CipherUpdateAuthorization, update_cipher_from_data};
+use super::ciphers::{CipherData, CipherUpdateAuthorization, update_cipher_from_data};
 
 // The import endpoint only ever uses the name/id/external_id of a collection.
 // Bitwarden's own server ignores `groups`/`users` here too, so do not make them
@@ -1962,7 +2095,7 @@ struct RelationsData {
     value: usize,
 }
 
-// https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Api/Tools/Controllers/ImportCiphersController.cs#L62
+// https://github.com/bitwarden/server/blob/e8afc9eb63901402fd160198e70eb865e011144a/src/Api/Tools/Controllers/ImportCiphersController.cs
 #[post("/ciphers/import-organization?<query..>", data = "<data>")]
 async fn post_org_import(
     query: OrgIdData,
@@ -1975,16 +2108,16 @@ async fn post_org_import(
     if org_id != headers.membership.org_uuid {
         err!("Organization not found", "Organization id's do not match");
     }
-    // OrgMemberHeaders also allows invited and accepted members, which are not allowed to import
-    if headers.membership.status != MembershipStatus::Confirmed as i32 {
-        err!("You need to be a Member of the Organization to call this endpoint")
+    // AccessImportExport authorizes the complete organization import. Other confirmed members keep
+    // the regular per-target Create/Update authorization.
+    if !headers.membership.has_status(MembershipStatus::Confirmed) {
+        err!("You need to be a confirmed member of this organization to import into it")
     }
-    // The legacy import endpoint predates granular Custom permissions. Open it to Custom only
-    // when the scoped import authorization is added in the final stack layer.
-    if headers.membership.atype == MembershipType::Custom {
-        err!("You don't have permission to import into this organization")
-    }
+    let organization_write_authorized = may_access_import_export(&headers.membership);
     let data: ImportData = data.into_inner();
+    if data.collections.is_empty() && !organization_write_authorized {
+        err!("Not enough privileges to import into this organization")
+    }
 
     // Validate the import before continuing
     // Bitwarden does not process the import if there is one item invalid.
@@ -1992,26 +2125,65 @@ async fn post_org_import(
     // TODO: See if we can optimize the whole cipher adding/importing and prevent duplicate code and checks.
     Cipher::validate_cipher_data(&data.ciphers)?;
 
+    // Robustness: validate every collection<->cipher relationship index against the payload *before*
+    // creating anything. `key` indexes into `ciphers` and `value` into `collections`, and an out-of-range
+    // index would otherwise panic when the relations are applied — after rows have already been written.
+    let import_cipher_count = data.ciphers.len();
+    let import_collection_count = data.collections.len();
+    for relation in &data.collection_relationships {
+        if relation.key >= import_cipher_count || relation.value >= import_collection_count {
+            err!(
+                "Invalid collection relationship",
+                "A collection relationship references a non-existent cipher or collection"
+            )
+        }
+    }
+
+    // Security: index the existing collections by id so the per-collection authorization below can run
+    // the collection-*update* predicate `auth::can_edit_collection` on them. Upstream resolves
+    // `BulkCollectionOperations.ImportCiphers` through the very same `CanUpdateCollectionAsync` as a
+    // collection update, so importing into an existing collection needs Owner/Admin, `Edit any
+    // collection` or a real per-collection Manage grant. A plain write assignment
+    // (`readOnly = false`, `manage = false`) is deliberately *not* enough — the previous
+    // `is_writable_by_user` check accepted it and was more permissive than upstream.
     let existing_collections: HashMap<CollectionId, Collection> =
         Collection::find_by_organization(&org_id, &conn).await.into_iter().map(|c| (c.uuid.clone(), c)).collect();
+
+    // Finish every request-controlled collection authorization check before the first new collection
+    // is written. This matters for the PR's create-only Custom role: a payload may name a new
+    // collection first and an existing, unauthorized collection later. Rejecting the latter only in
+    // the write loop left the former behind even though the request failed.
+    for col in &data.collections {
+        if let Some(collection) = col.id.as_ref().and_then(|col_id| existing_collections.get(col_id)) {
+            let can_update = crate::auth::can_edit_collection(&headers.membership, &collection.uuid, &conn).await;
+            if !may_import_to_collection(
+                &headers.membership,
+                OrganizationImportTarget::Existing {
+                    can_update,
+                },
+            ) {
+                err!(Compact, "The current user isn't allowed to manage this collection")
+            }
+        } else if !may_import_to_collection(&headers.membership, OrganizationImportTarget::New) {
+            err!(Compact, "The current user isn't allowed to create new collections")
+        }
+    }
+
     let mut collections: Vec<CollectionId> = Vec::with_capacity(data.collections.len());
     for col in data.collections {
         let existing = col.id.as_ref().and_then(|col_id| existing_collections.get(col_id));
         let collection_uuid = if let Some(collection) = existing {
-            // When not an Owner or Admin, check if the member is allowed to write to the collection.
-            if headers.membership.atype < MembershipType::Admin
-                && !collection.is_writable_by_user(&headers.membership.user_uuid, &conn).await
-            {
-                err!(Compact, "The current user isn't allowed to manage this collection")
-            }
             collection.uuid.clone()
         } else {
-            // Importing into a new collection requires the independent create permission.
-            if !headers.membership.can_create_new_collections() {
-                err!(Compact, "The current user isn't allowed to create new collections")
-            }
             let new_collection = Collection::new(org_id.clone(), col.name, col.external_id);
             new_collection.save(&conn).await?;
+            // Import-created collections do not carry the regular create endpoint's user access
+            // selections. Give a create-only importer Manage access to the collection they just
+            // created, matching Bitwarden's organization-import behavior.
+            if !headers.membership.has_full_access() {
+                CollectionUser::save(&headers.membership.user_uuid, &new_collection.uuid, false, false, true, &conn)
+                    .await?;
+            }
             new_collection.uuid
         };
 
@@ -2038,17 +2210,17 @@ async fn post_org_import(
             &mut cipher,
             cipher_data,
             &headers,
-            CipherUpdateAuthorization::organization_import(collections.clone(), true),
+            CipherUpdateAuthorization::organization_import(collections.clone(), organization_write_authorized),
             &conn,
             &nt,
             UpdateType::None,
         )
-        .await
-        .ok();
+        .await?;
         ciphers.push(cipher.uuid);
     }
 
-    // Assign the collections
+    // Assign the collections. Indices were bounds-validated above, but use `.get()` here as well so
+    // any future drift fails closed with an error instead of panicking.
     for (cipher_index, col_index) in relations {
         let (Some(cipher_id), Some(col_id)) = (ciphers.get(cipher_index), collections.get(col_index)) else {
             err!(Compact, "Invalid collection relationship")
@@ -2130,6 +2302,9 @@ async fn post_bulk_collections(data: Json<BulkCollectionsData>, headers: Headers
     Ok(())
 }
 
+// `ManagePoliciesRequirement` upstream, exactly as the single-policy route below: a member without the
+// permission is refused rather than served an empty list. Policy *enforcement* is unaffected — holding
+// `managePolicies` does not make a Custom member exempt from any policy.
 #[get("/organizations/<org_id>/policies")]
 async fn list_policies(org_id: OrganizationId, headers: ManagePoliciesHeaders, conn: DbConn) -> JsonResult {
     if org_id != headers.org_id {
@@ -2637,6 +2812,9 @@ async fn get_groups_data(details: bool, org_id: OrganizationId, conn: DbConn) ->
     })))
 }
 
+// The plain group list (id, name, externalId) exposes no access mappings. Upstream guards it with
+// `OrganizationCollectionManagementAccessRequirement`, so it stays readable for members who have a
+// reason to see it — the web vault needs it to render group names.
 #[get("/organizations/<org_id>/groups")]
 async fn get_groups(org_id: OrganizationId, headers: OrgMemberHeaders, conn: DbConn) -> JsonResult {
     if org_id != headers.membership.org_uuid {
@@ -2650,6 +2828,10 @@ async fn get_groups(org_id: OrganizationId, headers: OrgMemberHeaders, conn: DbC
     get_groups_data(false, org_id, conn).await
 }
 
+// Group *details* expose accessAll, external IDs and collection mappings. Upstream guards the details
+// *list* with `ManageUsersOrGroupsRequirement` and the *single* group below with the narrower
+// `ManageGroupsRequirement`, so the two are authorized separately. Neither accepts organization-wide
+// collection reach or a legacy `groups.access_all` membership as a substitute.
 #[get("/organizations/<org_id>/groups/details", rank = 1)]
 async fn get_groups_details(org_id: OrganizationId, headers: ManageUsersOrGroupsHeaders, conn: DbConn) -> JsonResult {
     if org_id != headers.org_id {
@@ -2876,6 +3058,34 @@ fn may_revoke_stored_member_type(caller_type: MembershipType, target_atype: i32)
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OrganizationImportTarget {
+    Existing {
+        /// The outcome of `auth::can_edit_collection` for this collection — upstream resolves
+        /// `BulkCollectionOperations.ImportCiphers` through exactly the same `CanUpdateCollectionAsync`
+        /// it uses for a collection update, so this is the collection-update authorization, not a
+        /// write/edit assignment. A `readOnly = false, manage = false` assignment does not qualify.
+        can_update: bool,
+    },
+    New,
+}
+
+fn may_import_to_collection(caller: &Membership, target: OrganizationImportTarget) -> bool {
+    if !caller.has_status(MembershipStatus::Confirmed) {
+        return false;
+    }
+    if may_access_import_export(caller) {
+        return true;
+    }
+
+    match target {
+        OrganizationImportTarget::Existing {
+            can_update,
+        } => can_update,
+        OrganizationImportTarget::New => caller.can_create_new_collections(),
+    }
+}
+
 fn may_grant_custom_permissions(
     caller: &Membership,
     target_type: MembershipType,
@@ -2884,6 +3094,22 @@ fn may_grant_custom_permissions(
     !caller.has_type(MembershipType::Custom)
         || target_type != MembershipType::Custom
         || requested.is_none_or(|permissions| permissions.is_subset_of(caller))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OrganizationReportScope {
+    Complete,
+    Denied,
+}
+
+fn organization_report_scope(caller: &Membership) -> OrganizationReportScope {
+    if caller.has_status(MembershipStatus::Confirmed)
+        && (may_administer_org_ciphers(caller) || caller.has_access_import_export() || caller.has_access_reports())
+    {
+        OrganizationReportScope::Complete
+    } else {
+        OrganizationReportScope::Denied
+    }
 }
 
 async fn add_update_group(
@@ -2927,6 +3153,8 @@ async fn add_update_group(
     })))
 }
 
+// Upstream guards this with `ManageGroupsRequirement` — deliberately narrower than the details *list*
+// above, which also admits `Manage users`.
 #[get("/organizations/<org_id>/groups/<group_id>/details")]
 async fn get_group_details(
     org_id: OrganizationId,
@@ -3362,18 +3590,21 @@ async fn put_reset_password_enrollment(
 // NOTE: It seems clients can't handle uppercase-first keys!!
 //       We need to convert all keys so they have the first character to be a lowercase.
 //       Else the export will be just an empty JSON file.
-// We currently only support exports by members of the Admin or Owner status.
-// Vaultwarden does not yet support exporting only managed collections!
-// https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Api/Tools/Controllers/OrganizationExportController.cs#L52
+// https://github.com/bitwarden/server/blob/e8afc9eb63901402fd160198e70eb865e011144a/src/Api/Tools/Controllers/OrganizationExportController.cs
 #[get("/organizations/<org_id>/export")]
-async fn get_org_export(org_id: OrganizationId, headers: AdminHeaders, conn: DbConn) -> JsonResult {
+async fn get_org_export(org_id: OrganizationId, headers: AccessImportExportHeaders, conn: DbConn) -> JsonResult {
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
 
+    let collections = Collection::find_by_organization(&org_id, &conn).await;
+    let ciphers = Cipher::find_by_org(&org_id, &conn).await;
+
+    let collections_json: Value = collections.iter().map(Collection::to_json).collect();
+
     Ok(Json(json!({
-        "collections": convert_json_key_lcase_first(get_org_collections_impl(&org_id, &conn).await),
-        "ciphers": convert_json_key_lcase_first(get_org_details_impl(&org_id, &headers.host, &headers.user.uuid, &conn).await?),
+        "collections": convert_json_key_lcase_first(collections_json),
+        "ciphers": convert_json_key_lcase_first(ciphers_to_org_json(ciphers, &org_id, &headers.host, &headers.user.uuid, &conn).await?),
     })))
 }
 
@@ -3468,6 +3699,65 @@ mod tests {
 
     fn member(atype: MembershipType, set: impl FnOnce(&mut Membership)) -> Membership {
         Membership::for_test(atype as i32, MembershipStatus::Confirmed, set)
+    }
+
+    #[test]
+    fn report_scope_requires_the_matching_permission_and_confirmed_membership() {
+        use super::{OrganizationReportScope, organization_report_scope};
+
+        for (name, _, set) in PERMISSIONS {
+            let mut caller = member(Custom, set);
+            let expected = if matches!(name, "editAnyCollection" | "accessImportExport" | "accessReports") {
+                OrganizationReportScope::Complete
+            } else {
+                OrganizationReportScope::Denied
+            };
+            assert_eq!(organization_report_scope(&caller), expected, "{name}");
+            caller.status = MembershipStatus::Revoked as i32;
+            assert_eq!(organization_report_scope(&caller), OrganizationReportScope::Denied);
+            caller.status = MembershipStatus::Confirmed as i32;
+            for atype in [User as i32, UNKNOWN_ATYPE] {
+                caller.atype = atype;
+                assert_eq!(organization_report_scope(&caller), OrganizationReportScope::Denied);
+            }
+        }
+        for role in [Owner, Admin] {
+            assert_eq!(organization_report_scope(&member(role, |_| {})), OrganizationReportScope::Complete);
+        }
+    }
+
+    #[test]
+    fn import_distinguishes_new_collections_from_authorized_existing_targets() {
+        use super::{OrganizationImportTarget, may_import_to_collection};
+
+        for (name, _, set) in PERMISSIONS {
+            let mut caller = member(Custom, set);
+            assert_eq!(
+                may_import_to_collection(&caller, OrganizationImportTarget::New),
+                matches!(name, "createNewCollections" | "accessImportExport"),
+                "{name}: new collection"
+            );
+            for can_update in [false, true] {
+                assert_eq!(
+                    may_import_to_collection(
+                        &caller,
+                        OrganizationImportTarget::Existing {
+                            can_update
+                        }
+                    ),
+                    can_update || name == "accessImportExport",
+                    "{name}: existing collection"
+                );
+            }
+            caller.status = MembershipStatus::Revoked as i32;
+            assert!(!may_import_to_collection(&caller, OrganizationImportTarget::New));
+            assert!(!may_import_to_collection(
+                &caller,
+                OrganizationImportTarget::Existing {
+                    can_update: true
+                }
+            ));
+        }
     }
 
     fn requested(set: SetRequested) -> Perms {

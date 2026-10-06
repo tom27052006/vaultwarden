@@ -1135,7 +1135,6 @@ async fn can_manage_collection(
 /// the path-based `ManagerHeaders` guard: Edit-any (or Admin/Owner) reaches every collection, otherwise
 /// only those carrying a real per-collection Manage grant. Group `access_all` deliberately does not
 /// qualify. Body-param endpoints cannot use `ManagerHeaders`, so they run this per collection instead.
-#[allow(dead_code)] // Used by the organization import endpoint in the next stack layer.
 pub(crate) async fn can_edit_collection(
     membership: &Membership,
     collection_uuid: &CollectionId,
