@@ -740,11 +740,17 @@ impl OrgHeaders {
         self.membership_status == MembershipStatus::Confirmed && self.membership_type >= MembershipType::Admin
     }
     fn is_confirmed_and_manager(&self) -> bool {
-        self.membership_status == MembershipStatus::Confirmed && self.membership_type >= MembershipType::Manager
+        // The legacy Manager guards still protect collection management endpoints. Until those
+        // handlers check granular permissions, a Custom role must not inherit Manager authority.
+        legacy_manager_guard_allows(self.membership_status == MembershipStatus::Confirmed, self.membership_type)
     }
     fn is_confirmed_and_owner(&self) -> bool {
         self.membership_status == MembershipStatus::Confirmed && self.membership_type == MembershipType::Owner
     }
+}
+
+fn legacy_manager_guard_allows(confirmed: bool, role: MembershipType) -> bool {
+    confirmed && role >= MembershipType::Admin
 }
 
 // org_id is usually the second path param ("/organizations/<org_id>"),
@@ -1381,6 +1387,17 @@ pub async fn refresh_tokens(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_manager_guards_do_not_grant_custom_authority() {
+        for role in [MembershipType::User, MembershipType::Custom] {
+            assert!(!legacy_manager_guard_allows(true, role));
+        }
+        for role in [MembershipType::Admin, MembershipType::Owner] {
+            assert!(legacy_manager_guard_allows(true, role));
+            assert!(!legacy_manager_guard_allows(false, role));
+        }
+    }
 
     fn client_ip(values: &[&str]) -> Option<IpAddr> {
         let is_trusted = |ip: IpAddr| match ip {

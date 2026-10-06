@@ -489,6 +489,7 @@ pub async fn update_cipher_from_data(
                 // Write access to the cipher itself only counts when it already belongs to this organization.
                 if shared_to_collections.as_ref().is_some_and(|cols| !cols.is_empty())
                     || member.has_full_access()
+                    || member.has_legacy_access_all()
                     || (!transfer_cipher && cipher.is_write_accessible_to_user(&headers.user.uuid, conn).await)
                 {
                     cipher.organization_uuid = Some(org_id);

@@ -553,10 +553,10 @@ impl Cipher {
         if let Some(ref org_uuid) = self.organization_uuid {
             if let Some(cipher_sync_data) = cipher_sync_data {
                 if let Some(cached_member) = cipher_sync_data.members.get(org_uuid) {
-                    return cached_member.has_full_access();
+                    return cached_member.has_full_access() || cached_member.has_legacy_access_all();
                 }
             } else if let Some(member) = Membership::find_confirmed_by_user_and_org(user_uuid, org_uuid, conn).await {
-                return member.has_full_access();
+                return member.has_full_access() || member.has_legacy_access_all();
             }
         }
         false

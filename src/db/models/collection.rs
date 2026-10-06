@@ -1,5 +1,6 @@
 use derive_more::{AsRef, Deref, Display, From};
 use diesel::prelude::*;
+use num_traits::FromPrimitive;
 use serde_json::Value;
 
 use crate::{
@@ -50,6 +51,11 @@ pub struct CollectionUser {
 pub struct CollectionCipher {
     pub cipher_uuid: CipherId,
     pub collection_uuid: CollectionId,
+}
+
+pub(super) fn stored_assignment_manage(membership_type: i32, stored_manage: bool) -> bool {
+    matches!(MembershipType::from_i32(membership_type), Some(MembershipType::Owner | MembershipType::Admin))
+        || stored_manage
 }
 
 /// Local methods
@@ -106,10 +112,12 @@ impl Collection {
             match cipher_sync_data.members.get(&self.org_uuid) {
                 // Only for Manager types Bitwarden returns true for the manage option
                 // Owners and Admins always have true. Users are not able to have full access
-                Some(m) if m.has_full_access() => (false, false, m.atype >= MembershipType::Manager),
+                Some(m) if m.has_full_access() || m.has_legacy_access_all() => {
+                    (false, false, m.atype >= MembershipType::Admin)
+                }
                 Some(m) => {
                     // Only let a manager manage collections when the have full read/write access
-                    let is_manager = m.atype == MembershipType::Manager;
+                    let is_manager = m.atype >= MembershipType::Admin;
                     if let Some(cu) = cipher_sync_data.user_collections.get(&self.uuid) {
                         (
                             cu.read_only,
@@ -130,12 +138,14 @@ impl Collection {
             }
         } else {
             match Membership::find_confirmed_by_user_and_org(user_uuid, &self.org_uuid, conn).await {
-                Some(m) if m.has_full_access() => (false, false, m.atype >= MembershipType::Manager),
-                Some(m) if m.atype == MembershipType::Manager && self.is_manageable_by_user(user_uuid, conn).await => {
+                Some(m) if m.has_full_access() || m.has_legacy_access_all() => {
+                    (false, false, m.atype >= MembershipType::Admin)
+                }
+                Some(m) if m.atype >= MembershipType::Admin && self.is_manageable_by_user(user_uuid, conn).await => {
                     (false, false, true)
                 }
                 Some(m) => {
-                    let is_manager = m.atype == MembershipType::Manager;
+                    let is_manager = m.atype >= MembershipType::Admin;
                     let read_only = !self.is_writable_by_user(user_uuid, conn).await;
                     let hide_passwords = self.hide_passwords_for_user(user_uuid, conn).await;
                     (read_only, hide_passwords, is_manager && !read_only && !hide_passwords)
@@ -155,6 +165,7 @@ impl Collection {
     pub async fn can_access_collection(member: &Membership, col_id: &CollectionId, conn: &DbConn) -> bool {
         member.has_status(MembershipStatus::Confirmed)
             && (member.has_full_access()
+                || member.has_legacy_access_all()
                 || CollectionUser::has_access_to_collection_by_user(col_id, &member.user_uuid, conn).await
                 || (CONFIG.org_groups_enabled()
                     && (GroupUser::has_full_access_by_member(&member.org_uuid, &member.uuid, conn).await
@@ -973,11 +984,7 @@ impl CollectionMembership {
             "id": self.membership_uuid,
             "readOnly": self.read_only,
             "hidePasswords": self.hide_passwords,
-            "manage": membership_type >= MembershipType::Admin
-                || self.manage
-                || (membership_type == MembershipType::Manager
-                    && !self.read_only
-                    && !self.hide_passwords),
+            "manage": membership_type >= MembershipType::Admin || self.manage,
         })
     }
 }
