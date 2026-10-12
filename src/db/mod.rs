@@ -534,3 +534,132 @@ mod postgresql_migrations {
         Ok(())
     }
 }
+
+/// A throwaway SQLite database with the real schema, for tests that need to run queries.
+#[cfg(all(test, sqlite))]
+pub mod test_db {
+    use std::{
+        future::Future,
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+    };
+
+    use diesel::{Connection, connection::SimpleConnection, r2d2::Pool, sqlite::SqliteConnection};
+    use diesel_migrations::MigrationHarness;
+    use tokio::sync::Mutex;
+
+    use super::{DbConn, DbConnManager, sqlite_migrations::MIGRATIONS};
+
+    pub struct TestDb {
+        path: PathBuf,
+        // An `Option` so `Drop` can close every connection before removing the file.
+        pool: Option<Pool<DbConnManager>>,
+    }
+
+    impl TestDb {
+        /// A database with every migration applied.
+        pub fn new() -> Self {
+            Self::upgraded_from(None, "")
+        }
+
+        /// A database that was filled with `data` while it was at the schema before the migration `version`, and then
+        /// upgraded with the remaining migrations.
+        pub fn upgraded_from(version: Option<&str>, data: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "vaultwarden-test-{}-{}.sqlite3",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            let url = path.to_str().expect("Test database path is not UTF-8").to_owned();
+
+            let mut conn = SqliteConnection::establish(&url).expect("Error creating the test database");
+            conn.batch_execute("PRAGMA foreign_keys = OFF").expect("Error disabling foreign keys");
+            for migration in conn.pending_migrations(MIGRATIONS).expect("Error reading the migrations") {
+                if version.is_some_and(|version| migration.name().version().to_string() == version) {
+                    break;
+                }
+                conn.run_migration(&migration).expect("Error running a migration");
+            }
+            conn.batch_execute(data).expect("Error inserting the test data");
+            conn.run_pending_migrations(MIGRATIONS).expect("Error running the remaining migrations");
+            drop(conn);
+
+            let pool =
+                Pool::builder().max_size(2).build(DbConnManager::new(&url)).expect("Error creating the test pool");
+            Self {
+                path,
+                pool: Some(pool),
+            }
+        }
+
+        /// A connection to the database. It has to be used and dropped within the runtime of [`block_on`].
+        pub fn conn(&self) -> DbConn {
+            let pool = self.pool.as_ref().expect("The test pool is closed");
+            DbConn {
+                conn: Arc::new(Mutex::new(Some(pool.get().expect("Error getting a test connection")))),
+                permit: None,
+            }
+        }
+    }
+
+    impl Drop for TestDb {
+        fn drop(&mut self) {
+            drop(self.pool.take());
+            drop(std::fs::remove_file(&self.path));
+        }
+    }
+
+    /// `DbConn::run` uses `block_in_place`, which needs a multi-threaded runtime.
+    pub fn block_on<F: Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Error building the test runtime")
+            .block_on(future)
+    }
+
+    /// Reverting the migration of the Custom role permissions refuses to drop them while there are Custom members,
+    /// and changes nothing then. Without any, it removes the permissions, and the upgrade adds them back.
+    #[test]
+    fn custom_role_migration_reverts_only_without_custom_members() {
+        use diesel::migration::MigrationSource;
+        use diesel::{RunQueryDsl, sql_query};
+
+        let db = TestDb::new();
+        let mut conn = SqliteConnection::establish(db.path.to_str().unwrap()).unwrap();
+        let migration = MigrationSource::<diesel::sqlite::Sqlite>::migrations(&MIGRATIONS)
+            .unwrap()
+            .into_iter()
+            .find(|migration| migration.name().version().to_string() == "20261010120000")
+            .expect("The Custom role permissions migration");
+        // Like Vaultwarden runs its migrations
+        conn.batch_execute(
+            "PRAGMA foreign_keys = OFF;
+             INSERT INTO organizations (uuid, name, billing_email) VALUES ('org', 'Org', 'org@example.com');
+             INSERT INTO users_organizations (uuid, user_uuid, org_uuid, access_all, akey, status, atype, manage_users)
+                 VALUES ('m-custom', 'custom', 'org', FALSE, '', 2, 4, TRUE);",
+        )
+        .unwrap();
+        let has_permissions = |conn: &mut SqliteConnection| {
+            sql_query("SELECT manage_users FROM users_organizations").execute(conn).is_ok()
+        };
+
+        assert!(conn.revert_migration(&*migration).is_err());
+        assert!(has_permissions(&mut conn));
+        let custom_members = diesel::select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+            "(SELECT COUNT(*) FROM users_organizations WHERE atype = 4 AND manage_users)",
+        ))
+        .get_result::<i64>(&mut conn);
+        assert_eq!(custom_members, Ok(1));
+
+        conn.batch_execute("UPDATE users_organizations SET atype = 2, manage_users = FALSE").unwrap();
+        assert!(conn.revert_migration(&*migration).is_ok());
+        assert!(!has_permissions(&mut conn));
+        conn.run_pending_migrations(MIGRATIONS).unwrap();
+        assert!(has_permissions(&mut conn));
+    }
+}
