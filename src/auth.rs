@@ -873,6 +873,49 @@ impl<'r> FromRequest<'r> for AdminHeaders {
     }
 }
 
+/// Generates the request guard of the routes a Custom member may use with a permission. Like AdminHeaders it lets a
+/// confirmed Owner or Admin through, and a confirmed Custom member holding the permission.
+macro_rules! permission_headers {
+    ($(#[$doc:meta])* $name:ident, $permission:expr) => {
+        $(#[$doc])*
+        pub struct $name {
+            pub device: Device,
+            pub user: User,
+            pub membership_type: MembershipType,
+            pub membership: Membership,
+            pub ip: ClientIp,
+            pub org_id: OrganizationId,
+        }
+
+        #[rocket::async_trait]
+        impl<'r> FromRequest<'r> for $name {
+            type Error = &'static str;
+
+            async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+                let headers = try_outcome!(OrgHeaders::from_request(request).await);
+                if headers.is_confirmed_and_admin() || headers.membership.has_custom_permission($permission) {
+                    Outcome::Success(Self {
+                        device: headers.device,
+                        user: headers.user,
+                        membership_type: headers.membership_type,
+                        org_id: headers.membership.org_uuid.clone(),
+                        membership: headers.membership,
+                        ip: headers.ip,
+                    })
+                } else {
+                    err_handler!("You need to be Admin or Owner to call this endpoint")
+                }
+            }
+        }
+    };
+}
+
+permission_headers!(
+    /// For the routes that manage the members of an organization.
+    ManageUsersHeaders,
+    CustomPermission::ManageUsers
+);
+
 // col_id is usually the fourth path param ("/organizations/<org_id>/collections/<col_id>"),
 // but there could be cases where it is a query value.
 // First check the path, if this is not a valid uuid, try the query values.

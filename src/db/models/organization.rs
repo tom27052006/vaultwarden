@@ -244,6 +244,7 @@ pub enum CustomPermission {
 /// The permissions this version enforces on every endpoint they open. Only these can be granted, a stored
 /// grant of any other one grants nothing. They are implemented one at a time, so this grows with them.
 const SUPPORTED_CUSTOM_PERMISSIONS: &[CustomPermission] = &[
+    CustomPermission::ManageUsers,
     CustomPermission::CreateNewCollections,
     CustomPermission::EditAnyCollection,
     CustomPermission::DeleteAnyCollection,
@@ -338,7 +339,7 @@ pub(super) fn custom_edit_any_collection() -> CustomEditAnyCollection {
 }
 
 #[cfg(test)]
-pub(crate) mod test_flag {
+pub mod test_flag {
     thread_local! {
         /// Overrides EXPERIMENTAL_CUSTOM_ROLES for the tests running on this thread.
         pub static CUSTOM_ROLES_ENABLED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
@@ -1649,6 +1650,7 @@ mod tests {
         assert_eq!(
             SUPPORTED_CUSTOM_PERMISSIONS,
             [
+                CustomPermission::ManageUsers,
                 CustomPermission::CreateNewCollections,
                 CustomPermission::EditAnyCollection,
                 CustomPermission::DeleteAnyCollection
