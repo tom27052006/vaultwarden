@@ -12,8 +12,9 @@ use crate::{
         core::{CipherSyncData, CipherSyncType, accept_org_invite, log_event, two_factor},
     },
     auth::{
-        AdminHeaders, CollectionAction, CollectionDeleteHeaders, CollectionReadHeaders, Headers, ManageUsersHeaders,
-        ManagerHeaders, ManagerHeadersLoose, OrgMemberHeaders, OwnerHeaders, custom_member_may, decode_invite,
+        AdminHeaders, CollectionAction, CollectionDeleteHeaders, CollectionReadHeaders, Headers, ManageGroupsHeaders,
+        ManagePoliciesHeaders, ManageUsersHeaders, ManagerHeaders, ManagerHeadersLoose, OrgMemberHeaders, OwnerHeaders,
+        custom_member_may, decode_invite,
     },
     db::{
         DbConn,
@@ -1088,6 +1089,52 @@ async fn custom_member_may_grant_group(caller: &Membership, group: &Group, conn:
         }
     }
     true
+}
+
+/// Checks how a Custom member with Manage groups creates a group, or changes the `current` one: they only give access
+/// to the collections they may edit, only give access to all collections when they may edit any collection, and only
+/// change the members of a group giving access to nothing else. Returns the collections of the group they may not
+/// edit, the access to which stays as it is.
+async fn check_custom_group_change(
+    caller: &Membership,
+    request: &GroupRequest,
+    current: Option<&Group>,
+    conn: &DbConn,
+) -> Result<HashSet<CollectionId>, crate::Error> {
+    let mut kept_collections = HashSet::new();
+    let current_members: HashSet<MembershipId> = match current {
+        Some(group) => {
+            for collection_group in CollectionGroup::find_by_group(&group.uuid, &caller.org_uuid, conn).await {
+                if !custom_member_may(CollectionAction::Edit, caller, &collection_group.collections_uuid, conn).await {
+                    kept_collections.insert(collection_group.collections_uuid);
+                }
+            }
+            GroupUser::find_by_group(&group.uuid, &caller.org_uuid, conn)
+                .await
+                .into_iter()
+                .map(|group_user| group_user.users_organizations_uuid)
+                .collect()
+        }
+        None => HashSet::new(),
+    };
+
+    for collection in &request.collections {
+        if !kept_collections.contains(&collection.id)
+            && !custom_member_may(CollectionAction::Edit, caller, &collection.id, conn).await
+        {
+            err!("You can only give access to the collections you may edit")
+        }
+    }
+    if request.access_all != current.is_some_and(|group| group.access_all) && !caller.can_edit_any_collection() {
+        err!("You can only give access to all collections when you may edit any collection")
+    }
+    let members: HashSet<MembershipId> = request.users.iter().cloned().collect();
+    if members != current_members
+        && (!kept_collections.is_empty() || (request.access_all && !caller.can_edit_any_collection()))
+    {
+        err!("You can only change the members of the groups giving access to the collections you may edit")
+    }
+    Ok(kept_collections)
 }
 
 /// Checks what a Custom member with Manage users gives a member: only permissions they have themselves, access to the
@@ -2177,7 +2224,7 @@ async fn post_bulk_collections(data: Json<BulkCollectionsData>, headers: Headers
 }
 
 #[get("/organizations/<org_id>/policies")]
-async fn list_policies(org_id: OrganizationId, headers: AdminHeaders, conn: DbConn) -> JsonResult {
+async fn list_policies(org_id: OrganizationId, headers: ManagePoliciesHeaders, conn: DbConn) -> JsonResult {
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
@@ -2243,7 +2290,7 @@ async fn get_master_password_policy(org_id: OrganizationId, _headers: OrgMemberH
 }
 
 #[get("/organizations/<org_id>/policies/<pol_type>", rank = 3)]
-async fn get_policy(org_id: OrganizationId, pol_type: i32, headers: AdminHeaders, conn: DbConn) -> JsonResult {
+async fn get_policy(org_id: OrganizationId, pol_type: i32, headers: ManagePoliciesHeaders, conn: DbConn) -> JsonResult {
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
@@ -2280,7 +2327,7 @@ async fn put_policy(
     org_id: OrganizationId,
     pol_type: i32,
     data: Json<PutPolicy>,
-    headers: AdminHeaders,
+    headers: ManagePoliciesHeaders,
     conn: DbConn,
 ) -> JsonResult {
     if org_id != headers.org_id {
@@ -2645,11 +2692,12 @@ async fn restore_member_impl(
 }
 
 /// Whether a member may give others access to collections, and so needs to see the members and groups: by seeing
-/// or creating any collection, by managing the members, or by the manage option on a collection.
+/// or creating any collection, by managing the members or groups, or by the manage option on a collection.
 async fn may_assign_collection_access(member: &Membership, conn: &DbConn) -> bool {
     member.can_view_all_collections()
         || member.has_custom_permission(CustomPermission::CreateNewCollections)
         || member.has_custom_permission(CustomPermission::ManageUsers)
+        || member.has_custom_permission(CustomPermission::ManageGroups)
         || Collection::has_manageable_collection_by_user(&member.org_uuid, &member.user_uuid, conn).await
 }
 
@@ -2672,7 +2720,9 @@ async fn get_groups_data(
             && !headers.membership.has_type(MembershipType::Custom)
             && GroupUser::has_full_access_by_member(&org_id, &headers.membership.uuid, &conn).await);
     let allowed = if details {
-        has_full_access || headers.membership.has_custom_permission(CustomPermission::ManageUsers)
+        has_full_access
+            || headers.membership.has_custom_permission(CustomPermission::ManageUsers)
+            || headers.membership.has_custom_permission(CustomPermission::ManageGroups)
     } else {
         has_full_access || may_assign_collection_access(&headers.membership, &conn).await
     };
@@ -2778,7 +2828,7 @@ impl CollectionData {
 #[post("/organizations/<org_id>/groups", data = "<data>")]
 async fn post_groups(
     org_id: OrganizationId,
-    headers: AdminHeaders,
+    headers: ManageGroupsHeaders,
     data: Json<GroupRequest>,
     conn: DbConn,
 ) -> JsonResult {
@@ -2791,6 +2841,9 @@ async fn post_groups(
 
     let group_request = data.into_inner();
     group_request.validate(&org_id, &conn).await?;
+    if headers.membership_type == MembershipType::Custom {
+        check_custom_group_change(&headers.membership, &group_request, None, &conn).await?;
+    }
 
     let group = group_request.to_group(&org_id);
 
@@ -2813,7 +2866,7 @@ async fn put_group(
     org_id: OrganizationId,
     group_id: GroupId,
     data: Json<GroupRequest>,
-    headers: AdminHeaders,
+    headers: ManageGroupsHeaders,
     conn: DbConn,
 ) -> JsonResult {
     if org_id != headers.org_id {
@@ -2829,10 +2882,23 @@ async fn put_group(
 
     let group_request = data.into_inner();
     group_request.validate(&org_id, &conn).await?;
+    let kept_collections = if headers.membership_type == MembershipType::Custom {
+        check_custom_group_change(&headers.membership, &group_request, Some(&group), &conn).await?
+    } else {
+        HashSet::new()
+    };
 
     let updated_group = group_request.update_group(group);
 
-    CollectionGroup::delete_all_by_group(&group_id, &org_id, &conn).await?;
+    if kept_collections.is_empty() {
+        CollectionGroup::delete_all_by_group(&group_id, &org_id, &conn).await?;
+    } else {
+        for collection_group in CollectionGroup::find_by_group(&group_id, &org_id, &conn).await {
+            if !kept_collections.contains(&collection_group.collections_uuid) {
+                collection_group.delete(&org_id, &conn).await?;
+            }
+        }
+    }
     GroupUser::delete_all_by_group(&group_id, &org_id, &conn).await?;
 
     log_event(
@@ -2846,7 +2912,9 @@ async fn put_group(
     )
     .await;
 
-    add_update_group(updated_group, group_request.collections, group_request.users, org_id, &headers, &conn).await
+    // The access to the collections they may not edit stays as it is
+    let collections = group_request.collections.into_iter().filter(|c| !kept_collections.contains(&c.id)).collect();
+    add_update_group(updated_group, collections, group_request.users, org_id, &headers, &conn).await
 }
 
 async fn add_update_group(
@@ -2854,7 +2922,7 @@ async fn add_update_group(
     collections: Vec<CollectionData>,
     members: Vec<MembershipId>,
     org_id: OrganizationId,
-    headers: &AdminHeaders,
+    headers: &ManageGroupsHeaders,
     conn: &DbConn,
 ) -> JsonResult {
     group.save(conn).await?;
@@ -2893,7 +2961,7 @@ async fn add_update_group(
 async fn get_group_details(
     org_id: OrganizationId,
     group_id: GroupId,
-    headers: AdminHeaders,
+    headers: ManageGroupsHeaders,
     conn: DbConn,
 ) -> JsonResult {
     if org_id != headers.org_id {
@@ -2911,14 +2979,19 @@ async fn get_group_details(
 }
 
 #[delete("/organizations/<org_id>/groups/<group_id>")]
-async fn delete_group(org_id: OrganizationId, group_id: GroupId, headers: AdminHeaders, conn: DbConn) -> EmptyResult {
+async fn delete_group(
+    org_id: OrganizationId,
+    group_id: GroupId,
+    headers: ManageGroupsHeaders,
+    conn: DbConn,
+) -> EmptyResult {
     delete_group_impl(&org_id, &group_id, &headers, &conn).await
 }
 
 async fn delete_group_impl(
     org_id: &OrganizationId,
     group_id: &GroupId,
-    headers: &AdminHeaders,
+    headers: &ManageGroupsHeaders,
     conn: &DbConn,
 ) -> EmptyResult {
     if org_id != &headers.org_id {
@@ -2950,7 +3023,7 @@ async fn delete_group_impl(
 async fn bulk_delete_groups(
     org_id: OrganizationId,
     data: Json<BulkGroupIds>,
-    headers: AdminHeaders,
+    headers: ManageGroupsHeaders,
     conn: DbConn,
 ) -> EmptyResult {
     if org_id != headers.org_id {
@@ -2969,7 +3042,12 @@ async fn bulk_delete_groups(
 }
 
 #[get("/organizations/<org_id>/groups/<group_id>", rank = 2)]
-async fn get_group(org_id: OrganizationId, group_id: GroupId, headers: AdminHeaders, conn: DbConn) -> JsonResult {
+async fn get_group(
+    org_id: OrganizationId,
+    group_id: GroupId,
+    headers: ManageGroupsHeaders,
+    conn: DbConn,
+) -> JsonResult {
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
@@ -2988,7 +3066,7 @@ async fn get_group(org_id: OrganizationId, group_id: GroupId, headers: AdminHead
 async fn get_group_members(
     org_id: OrganizationId,
     group_id: GroupId,
-    headers: AdminHeaders,
+    headers: ManageGroupsHeaders,
     conn: DbConn,
 ) -> JsonResult {
     if org_id != headers.org_id {
