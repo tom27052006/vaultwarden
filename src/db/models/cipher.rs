@@ -25,7 +25,8 @@ use macros::UuidFromParam;
 
 use super::{
     Archive, Attachment, CollectionCipher, CollectionId, Favorite, FolderCipher, FolderId, Group, Membership,
-    MembershipStatus, OrganizationId, User, UserId, organization::ORG_ADMIN_ATYPES,
+    MembershipStatus, OrganizationId, User, UserId,
+    organization::{ORG_ADMIN_ATYPES, custom_edit_any_collection},
 };
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
@@ -1168,7 +1169,8 @@ impl Cipher {
                             .or(collections_groups::collections_uuid
                                 .is_not_null() // Access via groups
                                 .and(collections_groups::read_only.eq(false)))
-                            .or(users_organizations::atype.eq_any(ORG_ADMIN_ATYPES)), // User is admin or owner
+                            .or(users_organizations::atype.eq_any(ORG_ADMIN_ATYPES)) // User is admin or owner
+                            .or(custom_edit_any_collection()), // Custom member with Edit any collection
                     )
                     .select(ciphers_collections::collection_uuid)
                     .load::<CollectionId>(conn)
@@ -1197,7 +1199,8 @@ impl Cipher {
                             .or(users_collections::user_uuid
                                 .eq(user_uuid) // User has access to collection
                                 .and(users_collections::read_only.eq(false)))
-                            .or(users_organizations::atype.eq_any(ORG_ADMIN_ATYPES)), // User is admin or owner
+                            .or(users_organizations::atype.eq_any(ORG_ADMIN_ATYPES)) // User is admin or owner
+                            .or(custom_edit_any_collection()), // Custom member with Edit any collection
                     )
                     .select(ciphers_collections::collection_uuid)
                     .load::<CollectionId>(conn)
