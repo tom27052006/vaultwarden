@@ -1,7 +1,11 @@
 mod query_logger;
 
 use std::{
-    sync::{Arc, OnceLock},
+    future::Future,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -123,6 +127,7 @@ pub static ACTIVE_DB_TYPE: OnceLock<DbConnType> = OnceLock::new();
 pub struct DbConn {
     conn: Arc<Mutex<Option<PooledConnection<DbConnManager>>>>,
     permit: Option<OwnedSemaphorePermit>,
+    transaction_open: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -150,6 +155,7 @@ impl Drop for DbConn {
     fn drop(&mut self) {
         let conn = Arc::clone(&self.conn);
         let permit = self.permit.take();
+        let transaction_open = self.transaction_open.load(Ordering::Acquire);
 
         // Since connection can't be on the stack in an async fn during an
         // await, we have to spawn a new blocking-safe thread...
@@ -157,7 +163,13 @@ impl Drop for DbConn {
             // And then re-enter the runtime to wait on the async mutex, but in a blocking fashion.
             let mut conn = tokio::runtime::Handle::current().block_on(conn.lock_owned());
 
-            if let Some(conn) = conn.take() {
+            if let Some(mut conn) = conn.take() {
+                if transaction_open {
+                    // A cancelled request must not return an open transaction to the pool.
+                    if let Err(error) = conn.batch_execute("ROLLBACK") {
+                        error!("Failed to roll back a cancelled database transaction: {error}");
+                    }
+                }
                 drop(conn);
             }
 
@@ -248,6 +260,7 @@ impl DbPool {
         Ok(DbConn {
             conn: Arc::new(Mutex::new(Some(c))),
             permit: Some(permit),
+            transaction_open: AtomicBool::new(false),
         })
     }
 }
@@ -320,6 +333,29 @@ impl DbConnType {
 }
 
 impl DbConn {
+    /// Run asynchronous model calls on this request's pooled connection in one transaction.
+    /// Send external notifications only after this returns successfully.
+    pub async fn transaction<F, Fut, T>(&self, operation: F) -> Result<T, Error>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, Error>>,
+    {
+        self.run(|conn| conn.batch_execute("BEGIN")).await.map_res("Error starting database transaction")?;
+        self.transaction_open.store(true, Ordering::Release);
+        let result = operation().await;
+        if result.is_ok() {
+            let committed = self.run(|conn| conn.batch_execute("COMMIT")).await;
+            let closed = committed.is_ok() || self.run(|conn| conn.batch_execute("ROLLBACK")).await.is_ok();
+            if closed {
+                self.transaction_open.store(false, Ordering::Release);
+            }
+            committed.map_res("Error committing database transaction")?;
+        } else if self.run(|conn| conn.batch_execute("ROLLBACK")).await.is_ok() {
+            self.transaction_open.store(false, Ordering::Release);
+        }
+        result
+    }
+
     pub async fn run<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut DbConnInner) -> R + Send,
@@ -543,7 +579,7 @@ pub mod test_db {
         path::PathBuf,
         sync::{
             Arc,
-            atomic::{AtomicU64, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
         },
     };
 
@@ -602,6 +638,7 @@ pub mod test_db {
             DbConn {
                 conn: Arc::new(Mutex::new(Some(pool.get().expect("Error getting a test connection")))),
                 permit: None,
+                transaction_open: AtomicBool::new(false),
             }
         }
     }
@@ -661,5 +698,41 @@ pub mod test_db {
         assert!(!has_permissions(&mut conn));
         conn.run_pending_migrations(MIGRATIONS).unwrap();
         assert!(has_permissions(&mut conn));
+    }
+
+    #[test]
+    fn async_transaction_rolls_back_earlier_writes_on_database_error() {
+        use crate::error::MapResult;
+        use diesel::{RunQueryDsl, sql_query};
+
+        let db = TestDb::new();
+        block_on(async {
+            let conn = db.conn();
+            conn.run(|c| c.batch_execute("CREATE TABLE transaction_probe (id INTEGER PRIMARY KEY)")).await.unwrap();
+            let result: Result<(), super::Error> = conn
+                .transaction(async || {
+                    let _: () = conn
+                        .run(|c| sql_query("INSERT INTO transaction_probe VALUES (1)").execute(c))
+                        .await
+                        .map_res("First insert failed")?;
+                    let _: () = conn
+                        .run(|c| sql_query("INSERT INTO transaction_probe VALUES (1)").execute(c))
+                        .await
+                        .map_res("Second insert failed")?;
+                    Ok(())
+                })
+                .await;
+            assert!(result.is_err());
+            let count = conn
+                .run(|c| {
+                    diesel::select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+                        "(SELECT COUNT(*) FROM transaction_probe)",
+                    ))
+                    .get_result::<i64>(c)
+                })
+                .await
+                .unwrap();
+            assert_eq!(count, 0);
+        });
     }
 }
