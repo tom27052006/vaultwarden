@@ -12,9 +12,9 @@ use crate::{
         core::{CipherSyncData, CipherSyncType, accept_org_invite, log_event, two_factor},
     },
     auth::{
-        AdminHeaders, CollectionAction, CollectionDeleteHeaders, CollectionReadHeaders, Headers, ManageGroupsHeaders,
-        ManagePoliciesHeaders, ManageUsersHeaders, ManagerHeaders, ManagerHeadersLoose, OrgMemberHeaders, OwnerHeaders,
-        custom_member_may, decode_invite,
+        AccessImportExportHeaders, AdminHeaders, CollectionAction, CollectionDeleteHeaders, CollectionReadHeaders,
+        Headers, ManageGroupsHeaders, ManagePoliciesHeaders, ManageUsersHeaders, ManagerHeaders, ManagerHeadersLoose,
+        OrgMemberHeaders, OwnerHeaders, custom_member_may, decode_invite,
     },
     db::{
         DbConn,
@@ -879,7 +879,7 @@ async fn get_org_details(data: OrgIdData, headers: ManagerHeadersLoose, conn: Db
         err_code!("Resource not found.", "Organization id's do not match", Status::NotFound.code);
     }
 
-    if !headers.membership.can_edit_any_collection() {
+    if !headers.membership.can_list_all_ciphers() {
         err_code!("Resource not found.", "User does not have full access", Status::NotFound.code);
     }
 
@@ -1661,7 +1661,9 @@ async fn get_org_user_mini_details(org_id: OrganizationId, headers: ManagerHeade
     if org_id != headers.membership.org_uuid {
         err!("Organization not found", "Organization id's do not match");
     }
+    // A Custom member lists the members to give them access, or to read the event logs, which show who acted
     if headers.membership.has_type(MembershipType::Custom)
+        && !headers.membership.has_custom_permission(CustomPermission::AccessEventLogs)
         && !may_assign_collection_access(&headers.membership, &conn).await
     {
         err_code!("Resource not found.", "User does not have access", Status::NotFound.code);
@@ -2071,83 +2073,102 @@ async fn post_org_import(
     // TODO: See if we can optimize the whole cipher adding/importing and prevent duplicate code and checks.
     Cipher::validate_cipher_data(&data.ciphers)?;
 
+    // Access Import/Export permits unassigned items, as on Bitwarden's server. The cipher update helper grants
+    // that authority only for this organization-import call and only to a confirmed Custom member.
+    let import_export = headers.membership.has_custom_permission(CustomPermission::AccessImportExport);
+    let ImportData {
+        ciphers: imported_ciphers,
+        collections: imported_collections,
+        collection_relationships,
+    } = data;
+    let mut relations = Vec::with_capacity(collection_relationships.len());
+    let mut seen_relations = HashSet::new();
+    for relation in collection_relationships {
+        if relation.key >= imported_ciphers.len() || relation.value >= imported_collections.len() {
+            err!(Compact, "Invalid collection relationship")
+        }
+        if seen_relations.insert((relation.key, relation.value)) {
+            relations.push((relation.key, relation.value));
+        }
+    }
     let existing_collections: HashMap<CollectionId, Collection> =
         Collection::find_by_organization(&org_id, &conn).await.into_iter().map(|c| (c.uuid.clone(), c)).collect();
-    let mut collections: Vec<CollectionId> = Vec::with_capacity(data.collections.len());
-    for col in data.collections {
+    // Resolve and authorize all supplied collections before creating anything. An ID absent from this
+    // organization is an export-file ID: create a new collection with a fresh ID, even if the supplied ID
+    // happens to exist in another organization. Never link a cipher to that other organization's collection.
+    for col in &imported_collections {
         let existing = col.id.as_ref().and_then(|col_id| existing_collections.get(col_id));
-        let collection_uuid = if let Some(collection) = existing {
+        if let Some(collection) = existing {
             // When not an Owner or Admin, check if the member is allowed to write to the collection.
             if headers.membership.atype < MembershipType::Admin
                 && !headers.membership.can_edit_any_collection()
+                && !import_export
                 && !collection.is_writable_by_user(&headers.membership.user_uuid, &conn).await
             {
                 err!(Compact, "The current user isn't allowed to manage this collection")
             }
-            collection.uuid.clone()
         } else {
             // We do not allow users or managers which can not manage all collections to create new collections
             // If there is any collection other than an existing import collection, abort the import.
             if headers.membership.atype <= MembershipType::Manager
                 && !headers.membership.has_full_access()
                 && !headers.membership.has_custom_permission(CustomPermission::CreateNewCollections)
+                && !import_export
             {
                 err!(Compact, "The current user isn't allowed to create new collections")
             }
-            let new_collection = Collection::new(org_id.clone(), col.name, col.external_id);
-            new_collection.save(&conn).await?;
-            // A Custom member who may only create collections gets to manage the ones they import into
-            if headers.membership.has_type(MembershipType::Custom) && !headers.membership.can_edit_any_collection() {
-                CollectionUser::save(&headers.membership.user_uuid, &new_collection.uuid, false, false, true, &conn)
-                    .await?;
-            }
-            new_collection.uuid
-        };
-
-        collections.push(collection_uuid);
+        }
     }
-
-    // Read the relations between collections and ciphers
-    // Ciphers can be in multiple collections at the same time
-    let mut relations = Vec::with_capacity(data.collection_relationships.len());
-    for relation in data.collection_relationships {
-        relations.push((relation.key, relation.value));
-    }
-
+    let grant_new_collection_manage =
+        headers.membership.has_type(MembershipType::Custom) && !headers.membership.can_edit_any_collection();
+    let importer_uuid = headers.membership.user_uuid.clone();
     let headers: Headers = headers.into();
-
-    let mut ciphers: Vec<CipherId> = Vec::with_capacity(data.ciphers.len());
-    for mut cipher_data in data.ciphers {
-        // Always clear folder_id's via an organization import
-        cipher_data.folder_id = None;
-        // Replace the client-provided, unvalidated organizationId with the real target org
-        cipher_data.organization_id = Some(org_id.clone());
-        let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
-        update_cipher_from_data(
-            &mut cipher,
-            cipher_data,
-            &headers,
-            Some(collections.clone()),
-            &conn,
-            &nt,
-            UpdateType::None,
-            true,
-        )
-        .await
-        .ok();
-        ciphers.push(cipher.uuid);
-    }
-
-    // Assign the collections
-    for (cipher_index, col_index) in relations {
-        let (Some(cipher_id), Some(col_id)) = (ciphers.get(cipher_index), collections.get(col_index)) else {
-            err!(Compact, "Invalid collection relationship")
-        };
-        CollectionCipher::save(cipher_id, col_id, &conn).await?;
-    }
-
-    let mut user = headers.user;
-    user.update_revision(&conn).await
+    conn.transaction(async || {
+        let mut collections: Vec<CollectionId> = Vec::with_capacity(imported_collections.len());
+        for col in imported_collections {
+            let collection_uuid = if let Some(collection) = col.id.as_ref().and_then(|id| existing_collections.get(id))
+            {
+                collection.uuid.clone()
+            } else {
+                let new_collection = Collection::new(org_id.clone(), col.name, col.external_id);
+                new_collection.save(&conn).await?;
+                // Bitwarden gives the importer Manage on a newly created collection.
+                if grant_new_collection_manage {
+                    CollectionUser::save(&importer_uuid, &new_collection.uuid, false, false, true, &conn).await?;
+                }
+                new_collection.uuid
+            };
+            collections.push(collection_uuid);
+        }
+        let mut assigned = vec![Vec::<CollectionId>::new(); imported_ciphers.len()];
+        for (cipher_index, collection_index) in relations {
+            assigned[cipher_index].push(collections[collection_index].clone());
+        }
+        for (mut cipher_data, collection_ids) in imported_ciphers.into_iter().zip(assigned) {
+            cipher_data.folder_id = None;
+            // The query and confirmed membership, never the file, select the target organization.
+            cipher_data.organization_id = Some(org_id.clone());
+            let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
+            update_cipher_from_data(
+                &mut cipher,
+                cipher_data,
+                &headers,
+                Some(collection_ids.clone()),
+                &conn,
+                &nt,
+                UpdateType::None,
+                false,
+                import_export,
+            )
+            .await?;
+            for collection_id in collection_ids {
+                CollectionCipher::save(&cipher.uuid, &collection_id, &conn).await?;
+            }
+        }
+        let mut user = headers.user;
+        user.update_revision(&conn).await
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -3387,11 +3408,11 @@ async fn put_reset_password_enrollment(
 // NOTE: It seems clients can't handle uppercase-first keys!!
 //       We need to convert all keys so they have the first character to be a lowercase.
 //       Else the export will be just an empty JSON file.
-// We currently only support exports by members of the Admin or Owner status.
+// Exports the whole vault of the organization, for an Owner, an Admin or a Custom member with Access import/export.
 // Vaultwarden does not yet support exporting only managed collections!
 // https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Api/Tools/Controllers/OrganizationExportController.cs#L52
 #[get("/organizations/<org_id>/export")]
-async fn get_org_export(org_id: OrganizationId, headers: AdminHeaders, conn: DbConn) -> JsonResult {
+async fn get_org_export(org_id: OrganizationId, headers: AccessImportExportHeaders, conn: DbConn) -> JsonResult {
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }

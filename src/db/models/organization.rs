@@ -15,7 +15,7 @@ use crate::{
     db::{
         DbConn,
         schema::{
-            ciphers, ciphers_collections, collections_groups, groups, groups_users, org_policies, organization_api_key,
+            ciphers_collections, collections_groups, groups, groups_users, org_policies, organization_api_key,
             organizations, users, users_collections, users_organizations,
         },
     },
@@ -242,7 +242,8 @@ pub enum CustomPermission {
 }
 
 /// The permissions this version enforces on every endpoint they open. Only these can be granted, a stored
-/// grant of any other one grants nothing. They are implemented one at a time, so this grows with them.
+/// grant of any other one grants nothing. Every stored permission is enforced now, a permission added later only
+/// belongs here once every endpoint it opens enforces it.
 const SUPPORTED_CUSTOM_PERMISSIONS: &[CustomPermission] = &[
     CustomPermission::ManageUsers,
     CustomPermission::ManageGroups,
@@ -250,6 +251,9 @@ const SUPPORTED_CUSTOM_PERMISSIONS: &[CustomPermission] = &[
     CustomPermission::CreateNewCollections,
     CustomPermission::EditAnyCollection,
     CustomPermission::DeleteAnyCollection,
+    CustomPermission::AccessEventLogs,
+    CustomPermission::AccessImportExport,
+    CustomPermission::AccessReports,
 ];
 
 impl CustomPermission {
@@ -1081,6 +1085,16 @@ impl Membership {
         self.can_edit_any_collection() || self.has_custom_permission(CustomPermission::DeleteAnyCollection)
     }
 
+    /// Whether this member may list every cipher of the organization in the Admin Console, like Bitwarden's
+    /// CanAccessAllCiphers: every member who may edit any collection, and a Custom member with Access import/export
+    /// (the export holds every cipher anyway) or Access reports (the reports run on every cipher). The list adds
+    /// nothing to the member's own vault.
+    pub fn can_list_all_ciphers(&self) -> bool {
+        self.can_edit_any_collection()
+            || self.has_custom_permission(CustomPermission::AccessImportExport)
+            || self.has_custom_permission(CustomPermission::AccessReports)
+    }
+
     pub async fn find_by_uuid(uuid: &MembershipId, conn: &DbConn) -> Option<Self> {
         conn.run(move |conn| {
             users_organizations::table.filter(users_organizations::uuid.eq(uuid)).first::<Self>(conn).ok()
@@ -1376,28 +1390,6 @@ impl Membership {
         .await
     }
 
-    pub async fn user_has_ge_admin_access_to_cipher(user_uuid: &UserId, cipher_uuid: &CipherId, conn: &DbConn) -> bool {
-        conn.run(move |conn| {
-            users_organizations::table
-                .inner_join(
-                    ciphers::table.on(ciphers::uuid
-                        .eq(cipher_uuid)
-                        .and(ciphers::organization_uuid.eq(users_organizations::org_uuid.nullable()))),
-                )
-                .filter(users_organizations::user_uuid.eq(user_uuid))
-                .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
-                .filter(
-                    users_organizations::atype.eq_any(vec![MembershipType::Owner as i32, MembershipType::Admin as i32]),
-                )
-                .count()
-                .first::<i64>(conn)
-                .ok()
-                .unwrap_or(0)
-                != 0
-        })
-        .await
-    }
-
     pub async fn find_by_collection_and_org(
         collection_uuid: &CollectionId,
         org_uuid: &OrganizationId,
@@ -1657,7 +1649,10 @@ mod tests {
                 CustomPermission::ManagePolicies,
                 CustomPermission::CreateNewCollections,
                 CustomPermission::EditAnyCollection,
-                CustomPermission::DeleteAnyCollection
+                CustomPermission::DeleteAnyCollection,
+                CustomPermission::AccessEventLogs,
+                CustomPermission::AccessImportExport,
+                CustomPermission::AccessReports
             ]
         );
     }
@@ -1749,6 +1744,60 @@ mod tests {
                 assert_eq!(member.can_edit_any_collection(), edit_any, "{case}, enabled {enabled}: edit any");
                 assert_eq!(member.can_view_all_collections(), view_all, "{case}, enabled {enabled}: view all");
                 assert_eq!(member.shown_custom_permissions(), HashSet::from_iter(shown), "{case}, enabled {enabled}");
+            }
+        }
+        test_flag::CUSTOM_ROLES_ENABLED.set(None);
+    }
+
+    /// Who may list every cipher of the organization in the Admin Console.
+    #[test]
+    fn listing_all_ciphers() {
+        let confirmed = |atype: i32, permission: Option<CustomPermission>, access_all: bool| {
+            let mut member = member(atype);
+            member.status = MembershipStatus::Confirmed as i32;
+            member.access_all = access_all;
+            if let Some(permission) = permission {
+                *member.custom_permission_mut(permission) = true;
+            }
+            member
+        };
+
+        // (case, member, may list them while enabled, while disabled)
+        let mut cases = vec![
+            ("Owner", confirmed(Owner as i32, None, false), true, true),
+            ("Admin", confirmed(Admin as i32, None, false), true, true),
+            ("Manager", confirmed(Manager as i32, None, false), false, false),
+            ("Manager with access_all", confirmed(Manager as i32, None, true), true, true),
+            ("User", confirmed(User as i32, None, false), false, false),
+            (
+                "User with stale Access reports",
+                confirmed(User as i32, Some(CustomPermission::AccessReports), false),
+                false,
+                false,
+            ),
+            ("Custom", confirmed(Custom as i32, None, false), false, false),
+            ("unknown role", confirmed(99, Some(CustomPermission::AccessReports), false), false, false),
+        ];
+        for permission in CustomPermission::ALL {
+            let listed = matches!(
+                permission,
+                CustomPermission::EditAnyCollection
+                    | CustomPermission::AccessImportExport
+                    | CustomPermission::AccessReports
+            );
+            cases.push((permission.json_key(), confirmed(Custom as i32, Some(permission), false), listed, false));
+        }
+        let mut accepted = confirmed(Custom as i32, Some(CustomPermission::AccessReports), false);
+        accepted.status = MembershipStatus::Accepted as i32;
+        cases.push(("accepted Custom + Access reports", accepted, false, false));
+        let mut revoked = confirmed(Custom as i32, Some(CustomPermission::AccessReports), false);
+        revoked.revoke();
+        cases.push(("revoked Custom + Access reports", revoked, false, false));
+
+        for (case, member, on, off) in cases {
+            for (enabled, expected) in [(true, on), (false, off)] {
+                test_flag::CUSTOM_ROLES_ENABLED.set(Some(enabled));
+                assert_eq!(member.can_list_all_ciphers(), expected, "{case}, enabled {enabled}");
             }
         }
         test_flag::CUSTOM_ROLES_ENABLED.set(None);
