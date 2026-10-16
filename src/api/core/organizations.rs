@@ -13,8 +13,8 @@ use crate::{
     },
     auth::{
         AdminHeaders, CollectionAction, CollectionDeleteHeaders, CollectionReadHeaders, CollectionUsersReadHeaders,
-        Headers, ManageUsersHeaders, ManagerHeaders, ManagerHeadersLoose, OrgMemberHeaders, OwnerHeaders,
-        custom_member_may, decode_invite,
+        Headers, ManageGroupsHeaders, ManagePoliciesHeaders, ManageUsersHeaders, ManagerHeaders, ManagerHeadersLoose,
+        OrgMemberHeaders, OwnerHeaders, custom_member_may, decode_invite,
     },
     db::{
         DbConn,
@@ -365,7 +365,10 @@ async fn get_org_collections(org_id: OrganizationId, headers: ManagerHeadersLoos
         err!("Organization not found", "Organization id's do not match");
     }
 
-    let collections = if headers.membership.can_view_all_collections() {
+    // Manage groups may list organization collections for group access administration without editing them.
+    let collections = if headers.membership.can_view_all_collections()
+        || headers.membership.has_custom_permission(CustomPermission::ManageGroups)
+    {
         get_org_collections_impl(&org_id, &conn).await
     } else if headers.membership.has_type(MembershipType::Custom) {
         // A Custom member gets the collections they may manage
@@ -409,13 +412,15 @@ async fn get_org_collections_details(org_id: OrganizationId, headers: ManagerHea
     // check if current user has full access to the organization (either directly or via any group)
     let has_full_access_to_org = member.has_full_access()
         || (CONFIG.org_groups_enabled() && GroupUser::has_full_access_by_member(&org_id, &member.uuid, &conn).await);
-    // Manage users may read collection access details without editing the collection itself.
-    let custom_collections =
-        if member.has_type(MembershipType::Custom) && !member.can_view_all_collection_access_details() {
-            Some(Collection::find_explicitly_manageable_by_user(&org_id, &member.user_uuid, &conn).await)
-        } else {
-            None
-        };
+    // Manage users and Manage groups may read collection access details without editing collection metadata.
+    let custom_collections = if member.has_type(MembershipType::Custom)
+        && !member.can_view_all_collection_access_details()
+        && !member.has_custom_permission(CustomPermission::ManageGroups)
+    {
+        Some(Collection::find_explicitly_manageable_by_user(&org_id, &member.user_uuid, &conn).await)
+    } else {
+        None
+    };
 
     // Get all admins, owners and managers who can manage/access all
     // Those are currently not listed in the col_users but need to be listed too.
@@ -1088,6 +1093,38 @@ fn custom_member_may_grant_group(caller: &Membership, group: &Group) -> bool {
     caller.org_uuid == group.organizations_uuid
         && caller.has_custom_permission(CustomPermission::ManageUsers)
         && (!group.access_all || caller.can_edit_any_collection())
+}
+
+/// Manage groups permits changing a group's access to any collection in its organization. The request is validated
+/// against that organization before this check. Legacy `access_all` remains stronger: changing it, or changing the
+/// members of a group already holding it, requires Edit any collection.
+async fn check_custom_group_change(
+    caller: &Membership,
+    request: &GroupRequest,
+    current: Option<&Group>,
+    conn: &DbConn,
+) -> EmptyResult {
+    let current_access_all = current.is_some_and(|group| group.access_all);
+    let requested_access_all = request.access_all.unwrap_or(current_access_all);
+    if requested_access_all != current_access_all && !caller.can_edit_any_collection() {
+        err!("You can only give access to all collections when you may edit any collection")
+    }
+    if requested_access_all && !caller.can_edit_any_collection() {
+        let current_members: HashSet<MembershipId> = match current {
+            Some(group) => GroupUser::find_by_group(&group.uuid, &caller.org_uuid, conn)
+                .await
+                .into_iter()
+                .map(|group_user| group_user.users_organizations_uuid)
+                .collect(),
+            None => HashSet::new(),
+        };
+        if request.users.iter().cloned().collect::<HashSet<_>>() != current_members {
+            err!(
+                "You can only change the members of a group with access to all collections when you may edit any collection"
+            )
+        }
+    }
+    Ok(())
 }
 
 /// Checks what a Custom member with Manage users gives a member: only permissions they have themselves, and access to
@@ -2282,7 +2319,7 @@ async fn post_bulk_collections(data: Json<BulkCollectionsData>, headers: Headers
 }
 
 #[get("/organizations/<org_id>/policies")]
-async fn list_policies(org_id: OrganizationId, headers: AdminHeaders, conn: DbConn) -> JsonResult {
+async fn list_policies(org_id: OrganizationId, headers: ManagePoliciesHeaders, conn: DbConn) -> JsonResult {
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
@@ -2348,7 +2385,7 @@ async fn get_master_password_policy(org_id: OrganizationId, _headers: OrgMemberH
 }
 
 #[get("/organizations/<org_id>/policies/<pol_type>", rank = 3)]
-async fn get_policy(org_id: OrganizationId, pol_type: i32, headers: AdminHeaders, conn: DbConn) -> JsonResult {
+async fn get_policy(org_id: OrganizationId, pol_type: i32, headers: ManagePoliciesHeaders, conn: DbConn) -> JsonResult {
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
@@ -2385,7 +2422,7 @@ async fn put_policy(
     org_id: OrganizationId,
     pol_type: i32,
     data: Json<PutPolicy>,
-    headers: AdminHeaders,
+    headers: ManagePoliciesHeaders,
     conn: DbConn,
 ) -> JsonResult {
     if org_id != headers.org_id {
@@ -2429,8 +2466,15 @@ async fn put_policy(
         }
     }
 
+    let mut policy = match OrgPolicy::find_by_org_and_type(&org_id, pol_type_enum, &conn).await {
+        Some(p) => p,
+        None => OrgPolicy::new(org_id.clone(), pol_type_enum, false, "{}".to_owned()),
+    };
+    // Bitwarden enforces these policies when they first become enabled, not on every update to an enabled policy.
+    let newly_enabled = data.enabled && !policy.enabled;
+
     // When enabling the TwoFactorAuthentication policy, revoke all members that do not have 2FA
-    if pol_type_enum == OrgPolicyType::TwoFactorAuthentication && data.enabled {
+    if pol_type_enum == OrgPolicyType::TwoFactorAuthentication && newly_enabled {
         two_factor::enforce_2fa_policy_for_org(
             &org_id,
             &headers.user.uuid,
@@ -2442,44 +2486,10 @@ async fn put_policy(
     }
 
     // When enabling the SingleOrg policy, remove this org's members that are members of other orgs
-    if pol_type_enum == OrgPolicyType::SingleOrg && data.enabled {
-        for mut member in Membership::find_by_org(&org_id, &conn).await {
-            // Policy only applies to non-Owner/non-Admin members who have accepted joining the org
-            // Exclude invited and revoked users when checking for this policy.
-            // Those users will not be allowed to accept or be activated because of the policy checks done there.
-            if member.atype < MembershipType::Admin
-                && member.status != MembershipStatus::Invited as i32
-                && Membership::count_accepted_and_confirmed_by_user(&member.user_uuid, &member.org_uuid, &conn).await
-                    > 0
-            {
-                if CONFIG.mail_enabled() {
-                    let org = Organization::find_by_uuid(&member.org_uuid, &conn).await.unwrap();
-                    let user = User::find_by_uuid(&member.user_uuid, &conn).await.unwrap();
-
-                    mail::send_single_org_removed_from_org(&user.email, &org.name).await?;
-                }
-
-                log_event(
-                    EventType::OrganizationUserRemoved,
-                    &member.uuid,
-                    &org_id,
-                    &headers.user.uuid,
-                    headers.device.atype,
-                    &headers.ip.ip,
-                    &conn,
-                )
-                .await;
-
-                member.revoke();
-                member.save(&conn).await?;
-            }
-        }
+    if pol_type_enum == OrgPolicyType::SingleOrg && newly_enabled {
+        enforce_single_org_policy_for_org(&org_id, &headers.user.uuid, headers.device.atype, &headers.ip.ip, &conn)
+            .await?;
     }
-
-    let mut policy = match OrgPolicy::find_by_org_and_type(&org_id, pol_type_enum, &conn).await {
-        Some(p) => p,
-        None => OrgPolicy::new(org_id.clone(), pol_type_enum, false, "{}".to_owned()),
-    };
 
     policy.enabled = data.enabled;
     policy.data = serde_json::to_string(&data.data)?;
@@ -2497,6 +2507,37 @@ async fn put_policy(
     .await;
 
     Ok(Json(policy.to_json()))
+}
+
+async fn enforce_single_org_policy_for_org(
+    org_id: &OrganizationId,
+    acting_user_id: &UserId,
+    device_type: i32,
+    ip: &std::net::IpAddr,
+    conn: &DbConn,
+) -> EmptyResult {
+    for mut member in Membership::find_by_org(org_id, conn).await {
+        // Enforcement at activation excludes the actor, Owners, Admins, invited and revoked members.
+        // Later membership activation still checks the enabled policy independently.
+        if member.atype < MembershipType::Admin
+            && member.user_uuid != *acting_user_id
+            && member.status != MembershipStatus::Invited as i32
+            && Membership::count_accepted_and_confirmed_by_user(&member.user_uuid, &member.org_uuid, conn).await > 0
+        {
+            if CONFIG.mail_enabled() {
+                let org = Organization::find_by_uuid(&member.org_uuid, conn).await.unwrap();
+                let user = User::find_by_uuid(&member.user_uuid, conn).await.unwrap();
+                mail::send_single_org_removed_from_org(&user.email, &org.name).await?;
+            }
+
+            log_event(EventType::OrganizationUserRemoved, &member.uuid, org_id, acting_user_id, device_type, ip, conn)
+                .await;
+
+            member.revoke();
+            member.save(conn).await?;
+        }
+    }
+    Ok(())
 }
 
 #[get("/plans")]
@@ -2750,11 +2791,12 @@ async fn restore_member_impl(
 }
 
 /// Whether a member may give others access to collections, and so needs to see the members and groups: by seeing
-/// or creating any collection, by managing the members, or by the manage option on a collection.
+/// or creating any collection, by managing the members or groups, or by the manage option on a collection.
 async fn may_assign_collection_access(member: &Membership, conn: &DbConn) -> bool {
     member.can_view_all_collections()
         || member.has_custom_permission(CustomPermission::CreateNewCollections)
         || member.has_custom_permission(CustomPermission::ManageUsers)
+        || member.has_custom_permission(CustomPermission::ManageGroups)
         || Collection::has_manageable_collection_by_user(&member.org_uuid, &member.user_uuid, conn).await
 }
 
@@ -2777,7 +2819,9 @@ async fn get_groups_data(
             && !headers.membership.has_type(MembershipType::Custom)
             && GroupUser::has_full_access_by_member(&org_id, &headers.membership.uuid, &conn).await);
     let allowed = if details {
-        has_full_access || headers.membership.has_custom_permission(CustomPermission::ManageUsers)
+        has_full_access
+            || headers.membership.has_custom_permission(CustomPermission::ManageUsers)
+            || headers.membership.has_custom_permission(CustomPermission::ManageGroups)
     } else {
         has_full_access || may_assign_collection_access(&headers.membership, &conn).await
     };
@@ -2826,8 +2870,7 @@ async fn get_groups_details(org_id: OrganizationId, headers: ManagerHeadersLoose
 #[serde(rename_all = "camelCase")]
 struct GroupRequest {
     name: String,
-    #[serde(default)]
-    access_all: bool,
+    access_all: Option<bool>,
     external_id: Option<String>,
     collections: Vec<CollectionData>,
     users: Vec<MembershipId>,
@@ -2835,12 +2878,14 @@ struct GroupRequest {
 
 impl GroupRequest {
     pub fn to_group(&self, org_uuid: &OrganizationId) -> Group {
-        Group::new(org_uuid.clone(), self.name.clone(), self.access_all, self.external_id.clone())
+        Group::new(org_uuid.clone(), self.name.clone(), self.access_all.unwrap_or(false), self.external_id.clone())
     }
 
     pub fn update_group(&self, mut group: Group) -> Group {
         group.name.clone_from(&self.name);
-        group.access_all = self.access_all;
+        if let Some(access_all) = self.access_all {
+            group.access_all = access_all;
+        }
         // Group Updates do not support changing the external_id
         // These input fields are in a disabled state, and can only be updated/added via ldap_import
 
@@ -2883,7 +2928,7 @@ impl CollectionData {
 #[post("/organizations/<org_id>/groups", data = "<data>")]
 async fn post_groups(
     org_id: OrganizationId,
-    headers: AdminHeaders,
+    headers: ManageGroupsHeaders,
     data: Json<GroupRequest>,
     conn: DbConn,
 ) -> JsonResult {
@@ -2896,6 +2941,9 @@ async fn post_groups(
 
     let group_request = data.into_inner();
     group_request.validate(&org_id, &conn).await?;
+    if headers.membership_type == MembershipType::Custom {
+        check_custom_group_change(&headers.membership, &group_request, None, &conn).await?;
+    }
 
     let group = group_request.to_group(&org_id);
 
@@ -2918,7 +2966,7 @@ async fn put_group(
     org_id: OrganizationId,
     group_id: GroupId,
     data: Json<GroupRequest>,
-    headers: AdminHeaders,
+    headers: ManageGroupsHeaders,
     conn: DbConn,
 ) -> JsonResult {
     if org_id != headers.org_id {
@@ -2934,6 +2982,9 @@ async fn put_group(
 
     let group_request = data.into_inner();
     group_request.validate(&org_id, &conn).await?;
+    if headers.membership_type == MembershipType::Custom {
+        check_custom_group_change(&headers.membership, &group_request, Some(&group), &conn).await?;
+    }
 
     let updated_group = group_request.update_group(group);
 
@@ -2959,7 +3010,7 @@ async fn add_update_group(
     collections: Vec<CollectionData>,
     members: Vec<MembershipId>,
     org_id: OrganizationId,
-    headers: &AdminHeaders,
+    headers: &ManageGroupsHeaders,
     conn: &DbConn,
 ) -> JsonResult {
     group.save(conn).await?;
@@ -2998,7 +3049,7 @@ async fn add_update_group(
 async fn get_group_details(
     org_id: OrganizationId,
     group_id: GroupId,
-    headers: AdminHeaders,
+    headers: ManageGroupsHeaders,
     conn: DbConn,
 ) -> JsonResult {
     if org_id != headers.org_id {
@@ -3016,14 +3067,19 @@ async fn get_group_details(
 }
 
 #[delete("/organizations/<org_id>/groups/<group_id>")]
-async fn delete_group(org_id: OrganizationId, group_id: GroupId, headers: AdminHeaders, conn: DbConn) -> EmptyResult {
+async fn delete_group(
+    org_id: OrganizationId,
+    group_id: GroupId,
+    headers: ManageGroupsHeaders,
+    conn: DbConn,
+) -> EmptyResult {
     delete_group_impl(&org_id, &group_id, &headers, &conn).await
 }
 
 async fn delete_group_impl(
     org_id: &OrganizationId,
     group_id: &GroupId,
-    headers: &AdminHeaders,
+    headers: &ManageGroupsHeaders,
     conn: &DbConn,
 ) -> EmptyResult {
     if org_id != &headers.org_id {
@@ -3055,7 +3111,7 @@ async fn delete_group_impl(
 async fn bulk_delete_groups(
     org_id: OrganizationId,
     data: Json<BulkGroupIds>,
-    headers: AdminHeaders,
+    headers: ManageGroupsHeaders,
     conn: DbConn,
 ) -> EmptyResult {
     if org_id != headers.org_id {
@@ -3074,7 +3130,12 @@ async fn bulk_delete_groups(
 }
 
 #[get("/organizations/<org_id>/groups/<group_id>", rank = 2)]
-async fn get_group(org_id: OrganizationId, group_id: GroupId, headers: AdminHeaders, conn: DbConn) -> JsonResult {
+async fn get_group(
+    org_id: OrganizationId,
+    group_id: GroupId,
+    headers: ManageGroupsHeaders,
+    conn: DbConn,
+) -> JsonResult {
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
@@ -3093,7 +3154,7 @@ async fn get_group(org_id: OrganizationId, group_id: GroupId, headers: AdminHead
 async fn get_group_members(
     org_id: OrganizationId,
     group_id: GroupId,
-    headers: AdminHeaders,
+    headers: ManageGroupsHeaders,
     conn: DbConn,
 ) -> JsonResult {
     if org_id != headers.org_id {
@@ -3586,6 +3647,115 @@ mod tests {
                 (after.status, after.atype, after.akey.as_str()),
                 (2, MembershipType::Owner as i32, "encrypted-key")
             );
+        });
+    }
+    #[cfg(sqlite)]
+    #[test]
+    fn group_assignments_preserve_scope_and_access_all_boundaries() {
+        test_db::run(async |db| {
+            let conn = db.conn();
+            let (org, _, mut member) = test_db::custom_member(&conn, CustomPermission::ManageGroups).await;
+            let foreign = test_db::organization(&conn).await;
+            for org_id in [&org.uuid, &foreign.uuid] {
+                let collection = test_db::collection(&conn, org_id).await;
+                let request: GroupRequest = serde_json::from_value(json!({"name":"Group","collections":[
+                    {"id":collection.uuid,"readOnly":false,"hidePasswords":false,"manage":true}],"users":[]}))
+                .unwrap();
+                assert_eq!(request.validate(&org.uuid, &conn).await.is_ok(), org_id == &org.uuid);
+                check_custom_group_change(&member, &request, None, &conn).await.unwrap();
+                assert!(!Collection::can_access_collection(&member, &collection.uuid, &conn).await);
+                assert!(!custom_member_may(CollectionAction::Edit, &member, &collection.uuid, &conn).await);
+            }
+            let mut group = Group::new(org.uuid.clone(), "Group".into(), true, None);
+            group.save(&conn).await.unwrap();
+            GroupUser::new(group.uuid.clone(), member.uuid.clone()).save(&conn).await.unwrap();
+            let omitted: GroupRequest =
+                serde_json::from_value(json!({"name":"Group","collections":[],"users":[member.uuid]})).unwrap();
+            check_custom_group_change(&member, &omitted, Some(&group), &conn).await.unwrap();
+            let group = omitted.update_group(group);
+            assert!(group.access_all);
+            for edit in [false, true] {
+                let permissions = if edit {
+                    vec![CustomPermission::ManageGroups, CustomPermission::EditAnyCollection]
+                } else {
+                    vec![CustomPermission::ManageGroups]
+                };
+                member.set_custom_permissions(&permissions.into_iter().collect());
+                for (access_all, users, current) in [
+                    (Some(false), vec![member.uuid.clone()], Some(&group)),
+                    (Some(true), vec![], None),
+                    (None, vec![], Some(&group)),
+                ] {
+                    let request: GroupRequest = serde_json::from_value(
+                        json!({"name":"Group","accessAll":access_all,"collections":[],"users":users}),
+                    )
+                    .unwrap();
+                    assert_eq!(check_custom_group_change(&member, &request, current, &conn).await.is_ok(), edit);
+                    if edit && access_all == Some(false) {
+                        let stored = Group::find_by_uuid_and_org(&group.uuid, &org.uuid, &conn).await.unwrap();
+                        let mut updated = request.update_group(stored);
+                        updated.save(&conn).await.unwrap();
+                        assert!(!Group::find_by_uuid_and_org(&group.uuid, &org.uuid, &conn).await.unwrap().access_all);
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(sqlite)]
+    #[test]
+    fn enabling_policy_exempts_actor_and_admin_and_revokes_only_on_transition() {
+        test_db::run(async |db| {
+            let conn = db.conn();
+            for policy in [OrgPolicyType::TwoFactorAuthentication, OrgPolicyType::SingleOrg] {
+                let (org, _, actor) = test_db::custom_member(&conn, CustomPermission::ManagePolicies).await;
+                let (_, other) = test_db::member(&conn, &org.uuid, MembershipType::User, &[]).await;
+                let (_, admin) = test_db::member(&conn, &org.uuid, MembershipType::Admin, &[]).await;
+                if policy == OrgPolicyType::SingleOrg {
+                    let foreign = test_db::organization(&conn).await;
+                    for member in [&actor, &other, &admin] {
+                        let mut m = Membership::new(member.user_uuid.clone(), foreign.uuid.clone(), None);
+                        m.status = 2;
+                        m.save(&conn).await.unwrap();
+                    }
+                }
+                for first_enable in [true, false] {
+                    let headers = users_headers(&actor, &conn).await;
+                    let headers = ManagePoliciesHeaders {
+                        device: headers.device,
+                        user: headers.user,
+                        membership: headers.membership,
+                        membership_type: headers.membership_type,
+                        ip: headers.ip,
+                        org_id: headers.org_id,
+                    };
+                    put_policy(
+                        org.uuid.clone(),
+                        policy as i32,
+                        Json(PutPolicy {
+                            policy: PolicyData {
+                                enabled: true,
+                                data: None,
+                            },
+                        }),
+                        headers,
+                        db.conn(),
+                    )
+                    .await
+                    .unwrap();
+                    for member in [&actor, &other, &admin] {
+                        let mut after = Membership::find_by_uuid(&member.uuid, &conn).await.unwrap();
+                        assert_eq!(
+                            after.has_status(MembershipStatus::Confirmed),
+                            !first_enable || member.uuid != other.uuid
+                        );
+                        if first_enable && member.uuid == other.uuid {
+                            assert!(after.restore());
+                            after.save(&conn).await.unwrap();
+                        }
+                    }
+                }
+            }
         });
     }
 }
