@@ -6,16 +6,18 @@ use serde_json::Value;
 
 use crate::{
     CONFIG,
-    api::{EmptyResult, core::two_factor},
+    api::{ApiResult, EmptyResult, core::two_factor},
     db::{
         DbConn,
-        schema::{org_policies, users_organizations},
+        schema::{org_policies, organizations, users_organizations},
     },
     error::MapResult,
     util::format_date,
 };
 
-use super::{Membership, MembershipId, MembershipStatus, MembershipType, OrganizationId, TwoFactor, UserId};
+use super::{
+    EmergencyAccess, Membership, MembershipId, MembershipStatus, MembershipType, OrganizationId, TwoFactor, UserId,
+};
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
 #[diesel(table_name = org_policies)]
@@ -73,6 +75,57 @@ pub struct ResetPasswordDataModel {
 
 /// Local methods
 impl OrgPolicy {
+    /// Serialize policy 3/18 changes on the organization row. Cleanup and policy state commit together.
+    /// Other membership/emergency-access writers do not all share this lock.
+    pub async fn save_auto_confirm_dependency(&mut self, conn: &DbConn) -> ApiResult<Vec<EmergencyAccess>> {
+        self.revision_date = Utc::now().naive_utc();
+        conn.run(move |conn| {
+            conn.transaction::<_, crate::error::Error, _>(|conn| {
+                // A no-op write also obtains SQLite's write lock before any validation reads.
+                diesel::update(organizations::table.filter(organizations::uuid.eq(&self.org_uuid)))
+                    .set(organizations::name.eq(organizations::name))
+                    .execute(conn)?;
+                let policies = org_policies::table.filter(org_policies::org_uuid.eq(&self.org_uuid))
+                    .load::<Self>(conn).map_res("Error loading organization policies")?;
+                let enabled = |kind: OrgPolicyType| policies.iter().any(|p| p.has_type(kind) && p.enabled);
+                let auto_enabled = enabled(OrgPolicyType::AutomaticUserConfirmation);
+                if self.has_type(OrgPolicyType::SingleOrg) && !self.enabled && auto_enabled {
+                    err!("Automatic user confirmation is enabled. It is not allowed to disable this policy.")
+                }
+                let mut removed = Vec::new();
+                if self.has_type(OrgPolicyType::AutomaticUserConfirmation) && self.enabled {
+                    if !enabled(OrgPolicyType::SingleOrg) {
+                        err!("Single Organization policy is not enabled. It is mandatory for this policy to be enabled.")
+                    }
+                    if !auto_enabled {
+                        let user_ids = users_organizations::table
+                            .filter(users_organizations::org_uuid.eq(&self.org_uuid))
+                            .filter(users_organizations::status.eq_any(Membership::JOINED_STATUSES))
+                            .select(users_organizations::user_uuid).load::<UserId>(conn)?;
+                        let conflicts = users_organizations::table
+                            .filter(users_organizations::user_uuid.eq_any(&user_ids))
+                            .filter(users_organizations::org_uuid.ne(&self.org_uuid))
+                            .filter(users_organizations::status.eq_any(Membership::JOINED_STATUSES))
+                            .count().first::<i64>(conn)?;
+                        if conflicts > 0 {
+                            err!("This policy forbids members to be part of other organizations, but at least one member still is.")
+                        }
+                        removed = EmergencyAccess::delete_for_users(&user_ids, conn)?;
+                    }
+                }
+                if let Some(current) = policies.iter().find(|p| p.atype == self.atype) {
+                    self.uuid = current.uuid.clone();
+                    diesel::update(org_policies::table.filter(org_policies::uuid.eq(&self.uuid)))
+                        .set(&*self).execute(conn)?;
+                } else {
+                    diesel::insert_into(org_policies::table).values(&*self)
+                        .execute(conn)?;
+                }
+                Ok(removed)
+            })
+        }).await
+    }
+
     pub fn new(org_uuid: OrganizationId, atype: OrgPolicyType, enabled: bool, data: String) -> Self {
         Self {
             uuid: OrgPolicyId(crate::util::get_uuid()),
@@ -309,14 +362,24 @@ impl OrgPolicy {
     }
 
     /// Whether the policy is stored as enabled for this organization, regardless of any config option.
-    pub async fn is_enabled(org_uuid: &OrganizationId, policy_type: OrgPolicyType, conn: &DbConn) -> bool {
-        Self::find_by_org_and_type(org_uuid, policy_type, conn).await.is_some_and(|p| p.enabled)
+    pub async fn is_enabled(org_uuid: &OrganizationId, policy_type: OrgPolicyType, conn: &DbConn) -> ApiResult<bool> {
+        conn.run(move |conn| {
+            org_policies::table
+                .filter(org_policies::org_uuid.eq(org_uuid))
+                .filter(org_policies::atype.eq(policy_type as i32))
+                .select(org_policies::enabled)
+                .first::<bool>(conn)
+                .optional()
+                .map(|enabled| enabled.unwrap_or(false))
+                .map_res("Error checking organization policy")
+        })
+        .await
     }
 
     /// Requires both the server-wide option and this organization's policy.
-    pub async fn is_auto_confirm_enabled(org_uuid: &OrganizationId, conn: &DbConn) -> bool {
-        CONFIG.org_auto_confirm_enabled()
-            && Self::is_enabled(org_uuid, OrgPolicyType::AutomaticUserConfirmation, conn).await
+    pub async fn is_auto_confirm_enabled(org_uuid: &OrganizationId, conn: &DbConn) -> ApiResult<bool> {
+        Ok(CONFIG.org_auto_confirm_enabled()
+            && Self::is_enabled(org_uuid, OrgPolicyType::AutomaticUserConfirmation, conn).await?)
     }
 
     pub async fn check_user_allowed(m: &Membership, action: &str, conn: &DbConn) -> EmptyResult {
@@ -354,15 +417,15 @@ impl OrgPolicy {
 
         // Stricter than the SingleOrg block above: this policy exempts no role and no status.
         // https://github.com/bitwarden/server/blob/b3d1eb9a7854322f106efa55c191c1a4da9f8645/src/Core/AdminConsole/OrganizationFeatures/Policies/Enforcement/AutoConfirm/AutomaticUserConfirmationPolicyEnforcementHandler.cs
-        if AutoConfirmRequirement::for_user(&m.user_uuid, conn).await.forbids_membership_outside(&m.org_uuid) {
+        if AutoConfirmRequirement::for_user(&m.user_uuid, conn).await?.forbids_membership_outside(&m.org_uuid) {
             err!(format!(
                 "Cannot {} because another organization confirms its members automatically and forbids other memberships (membership {})",
                 action, m.uuid
             ));
         }
 
-        if Self::is_auto_confirm_enabled(&m.org_uuid, conn).await
-            && Membership::count_accepted_confirmed_and_revoked_by_user(&m.user_uuid, &m.org_uuid, conn).await > 0
+        if Self::is_enabled(&m.org_uuid, OrgPolicyType::AutomaticUserConfirmation, conn).await?
+            && Membership::count_accepted_confirmed_and_revoked_by_user(&m.user_uuid, &m.org_uuid, conn).await? > 0
         {
             err!(format!(
                 "Cannot {} because the organization confirms its members automatically and forbids being part of other organizations (membership {})",
@@ -435,15 +498,11 @@ pub struct OrgPolicyId(String);
 pub struct AutoConfirmRequirement(Vec<Membership>);
 
 impl AutoConfirmRequirement {
-    /// Loads every role and status in organizations with this policy; empty when the server option is off.
+    /// Stored policies remain enforced when the server-wide capability is disabled.
     /// https://github.com/bitwarden/server/blob/b3d1eb9a7854322f106efa55c191c1a4da9f8645/src/Core/AdminConsole/OrganizationFeatures/Policies/PolicyRequirements/BasePolicyRequirementFactory.cs
-    pub async fn for_user(user_uuid: &UserId, conn: &DbConn) -> Self {
-        if !CONFIG.org_auto_confirm_enabled() {
-            return Self(Vec::new());
-        }
-
-        Self(
-            conn.run(move |conn| {
+    pub async fn for_user(user_uuid: &UserId, conn: &DbConn) -> ApiResult<Self> {
+        let members = conn
+            .run(move |conn| {
                 org_policies::table
                     .inner_join(
                         users_organizations::table.on(users_organizations::org_uuid
@@ -454,10 +513,15 @@ impl AutoConfirmRequirement {
                     .filter(org_policies::enabled.eq(true))
                     .select(users_organizations::all_columns)
                     .load::<Membership>(conn)
-                    .expect("Error loading memberships by org_policy")
+                    .map_res("Error loading memberships by org_policy")
             })
-            .await,
-        )
+            .await?;
+        Ok(Self(
+            members
+                .into_iter()
+                .filter(|m| m.status == MembershipStatus::Invited as i32 || m.counts_for_auto_confirm())
+                .collect(),
+        ))
     }
 
     /// Any membership, including Invited and elevated roles, forbids creating another organization.

@@ -28,11 +28,13 @@ use crate::{
 /// Deletes emergency access granted by or to `user_id` and sends each grantor one mail listing lost contacts.
 /// https://github.com/bitwarden/server/blob/b3d1eb9a7854322f106efa55c191c1a4da9f8645/src/Core/Auth/UserFeatures/EmergencyAccess/Commands/DeleteEmergencyAccessCommand.cs
 pub async fn delete_all_emergency_access_of_user(user_id: &UserId, conn: &DbConn) -> EmptyResult {
-    // Keep the rows that `delete_all_by_user` would discard so notifications can name the contacts.
-    let mut removed = EmergencyAccess::find_all_by_grantor_uuid(user_id, conn).await;
-    removed.extend(EmergencyAccess::find_all_by_grantee_uuid(user_id, conn).await);
+    let removed = EmergencyAccess::take_all_by_user(user_id, conn).await?;
+    notify_removed_emergency_access(removed, conn).await;
+    Ok(())
+}
 
-    // Collect before deletion and group into one mail per grantor.
+pub async fn notify_removed_emergency_access(removed: Vec<EmergencyAccess>, conn: &DbConn) {
+    // Group removed contacts into one mail per grantor.
     let mut by_grantor: HashMap<UserId, Vec<String>> = HashMap::new();
     if CONFIG.mail_enabled() {
         for emergency_access in &removed {
@@ -52,10 +54,6 @@ pub async fn delete_all_emergency_access_of_user(user_id: &UserId, conn: &DbConn
         }
     }
 
-    for emergency_access in removed {
-        emergency_access.delete(conn).await?;
-    }
-
     for (grantor_uuid, mut grantee_emails) in by_grantor {
         let Some(grantor) = User::find_by_uuid(&grantor_uuid, conn).await else {
             warn!("Skipping the emergency access removal notification for {grantor_uuid}, the account is gone");
@@ -70,8 +68,6 @@ pub async fn delete_all_emergency_access_of_user(user_id: &UserId, conn: &DbConn
             error!("Failed to notify {} about its removed emergency access contacts: {e:?}", grantor.email);
         }
     }
-
-    Ok(())
 }
 
 pub fn routes() -> Vec<Route> {
@@ -277,7 +273,7 @@ async fn send_invite(data: Json<EmergencyAccessInviteData>, headers: Headers, co
     }
 
     // Auto-confirm organizations forbid handing member accounts to unvetted emergency-access contacts.
-    if AutoConfirmRequirement::for_user(&grantor_user.uuid, &conn).await.forbids_emergency_access() {
+    if AutoConfirmRequirement::for_user(&grantor_user.uuid, &conn).await?.forbids_emergency_access() {
         err!("You are a member of an organization which does not allow emergency access.")
     }
 
@@ -412,11 +408,6 @@ async fn accept_invite(
     } else {
         err!("Invited user not found")
     };
-
-    // See `send_invite`, the same restriction applies to the grantee side of an emergency access.
-    if AutoConfirmRequirement::for_user(&grantee_user.uuid, &conn).await.forbids_emergency_access() {
-        err!("You are a member of an organization which does not allow emergency access.")
-    }
 
     // We need to search for the uuid in combination with the email, since we do not yet store the uuid of the grantee in the database.
     // The uuid of the grantee gets stored once accepted.

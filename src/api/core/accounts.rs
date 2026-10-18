@@ -348,6 +348,7 @@ pub async fn register(data: Json<RegisterData>, conn: DbConn, nt: Notify<'_>) ->
     let password_hint = clean_password_hint(data.master_password_hint.as_ref());
     enforce_password_hint_setting(password_hint.as_ref())?;
 
+    let mut accept_invitations = false;
     let mut user = match User::find_by_mail(&email, &conn).await {
         Some(user) => {
             if !user.password_hash.is_empty() {
@@ -364,7 +365,7 @@ pub async fn register(data: Json<RegisterData>, conn: DbConn, nt: Notify<'_>) ->
                     err!("Registration email does not match invite email")
                 }
             } else if Invitation::take(&email, &conn).await {
-                accept_user_invitations(&user.uuid, &conn, &nt).await?;
+                accept_invitations = true;
                 user
             } else if CONFIG.is_signup_allowed(&email)
                 || (CONFIG.emergency_access_allowed()
@@ -429,6 +430,10 @@ pub async fn register(data: Json<RegisterData>, conn: DbConn, nt: Notify<'_>) ->
 
     user.save(&conn).await?;
 
+    if accept_invitations {
+        accept_user_invitations(&user.uuid, &conn, &nt).await?;
+    }
+
     // accept any open emergency access invitations
     if !CONFIG.mail_enabled() && CONFIG.emergency_access_allowed() {
         for mut emergency_invite in EmergencyAccess::find_all_invited_by_grantee_email(&user.email, &conn).await {
@@ -472,7 +477,7 @@ async fn post_set_password(data: Json<SetPasswordData>, headers: Headers, conn: 
         user.public_key = Some(keys.public_key);
     }
 
-    if let Some(identifier) = data.org_identifier
+    let membership = if let Some(identifier) = data.org_identifier
         && identifier != crate::sso::FAKE_SSO_IDENTIFIER
         && identifier != crate::api::admin::FAKE_ADMIN_UUID
     {
@@ -484,6 +489,14 @@ async fn post_set_password(data: Json<SetPasswordData>, headers: Headers, conn: 
             err!("Failed to retrieve the invitation")
         };
 
+        Some(membership)
+    } else {
+        None
+    };
+
+    // Confirmation notifications need the persisted public key, including SSO account setup.
+    user.save(&conn).await?;
+    if let Some(membership) = membership {
         accept_org_invite(&user, membership, None, &conn, &nt).await?;
     }
 
@@ -494,8 +507,6 @@ async fn post_set_password(data: Json<SetPasswordData>, headers: Headers, conn: 
     }
 
     log_user_event(EventType::UserChangedPassword, &user.uuid, headers.device.atype, &headers.ip.ip, &conn).await;
-
-    user.save(&conn).await?;
 
     Ok(Json(json!({
       "object": "set-password",

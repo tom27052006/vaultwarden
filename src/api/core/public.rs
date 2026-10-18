@@ -9,12 +9,15 @@ use rocket::{
 
 use crate::{
     CONFIG,
-    api::EmptyResult,
+    api::{
+        EmptyResult, Notify,
+        core::{enforce_membership_policies, notify_pending_auto_confirm},
+    },
     auth,
     db::{
         DbConn,
         models::{
-            Group, GroupUser, Invitation, Membership, MembershipStatus, MembershipType, OrgPolicy, Organization,
+            Group, GroupUser, Invitation, Membership, MembershipStatus, MembershipType, Organization,
             OrganizationApiKey, OrganizationId, User,
         },
     },
@@ -51,12 +54,13 @@ struct OrgImportData {
 }
 
 #[post("/public/organization/import", data = "<data>")]
-async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn) -> EmptyResult {
+async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn, nt: Notify<'_>) -> EmptyResult {
     // Most of the logic for this function can be found here
     // https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Core/AdminConsole/Services/Implementations/OrganizationService.cs#L1203
 
     let org_id = token.0;
     let data = data.into_inner();
+    let mut pending = Vec::new();
 
     // Like upstream, the import never removes Owners, so it doesn't revoke or restore them either.
     for user_data in &data.members {
@@ -76,13 +80,16 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
             let ext_modified = member.set_external_id(Some(user_data.external_id.clone()));
             // Enforce org policies as every other restore path does.
             // If the user is not allowed, we revoke again and continue so the external_id is still updated.
-            if restored && let Err(e) = OrgPolicy::check_user_allowed(&member, "restore", &conn).await {
+            if restored && let Err(e) = enforce_membership_policies(&member, "restore", &conn).await {
                 warn!("Not restoring {}: {e:?}", user_data.email);
                 member.revoke();
                 restored = false;
             }
             if restored || ext_modified {
                 member.save(&conn).await?;
+            }
+            if restored {
+                pending.push(member);
             }
         } else {
             // If user is not part of the organization
@@ -117,6 +124,9 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
             new_member.atype = MembershipType::User as i32;
             new_member.status = member_status;
 
+            if new_member.status == MembershipStatus::Accepted as i32 {
+                enforce_membership_policies(&new_member, "join", &conn).await?;
+            }
             new_member.save(&conn).await?;
 
             if CONFIG.mail_enabled()
@@ -132,6 +142,7 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
 
                 err!(format!("Error sending invite: {e:?} "));
             }
+            pending.push(new_member);
         }
     }
 
@@ -179,6 +190,9 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
         }
     }
 
+    for member in pending {
+        notify_pending_auto_confirm(&member, &conn, &nt).await;
+    }
     Ok(())
 }
 

@@ -4,13 +4,16 @@ use diesel::prelude::*;
 use serde_json::Value;
 
 use crate::{
-    api::EmptyResult,
-    db::{DbConn, schema::emergency_access},
+    api::{ApiResult, EmptyResult},
+    db::{
+        DbConn, DbConnInner,
+        schema::{emergency_access, users},
+    },
     error::MapResult,
 };
 use macros::UuidFromParam;
 
-use super::{User, UserId};
+use super::{AutoConfirmRequirement, User, UserId};
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
 #[diesel(table_name = emergency_access)]
@@ -33,6 +36,26 @@ pub struct EmergencyAccess {
 
 // Local methods
 impl EmergencyAccess {
+    /// Called inside the policy/confirmation transaction; mail is sent only after commit.
+    pub(super) fn delete_for_users(user_ids: &[UserId], conn: &mut DbConnInner) -> ApiResult<Vec<Self>> {
+        let removed = emergency_access::table
+            .filter(emergency_access::grantor_uuid.eq_any(user_ids).or(emergency_access::grantee_uuid.eq_any(user_ids)))
+            .load::<Self>(conn)
+            .map_res("Error loading emergency access for removal")?;
+        diesel::update(users::table.filter(users::uuid.eq_any(removed.iter().map(|ea| &ea.grantor_uuid))))
+            .set(users::updated_at.eq(Utc::now().naive_utc()))
+            .execute(conn)?;
+        diesel::delete(
+            emergency_access::table.filter(emergency_access::uuid.eq_any(removed.iter().map(|ea| &ea.uuid))),
+        )
+        .execute(conn)?;
+        Ok(removed)
+    }
+
+    pub async fn take_all_by_user(user_id: &UserId, conn: &DbConn) -> ApiResult<Vec<Self>> {
+        conn.run(move |conn| conn.transaction(|conn| Self::delete_for_users(std::slice::from_ref(user_id), conn))).await
+    }
+
     pub fn new(grantor_uuid: UserId, email: String, status: i32, atype: i32, wait_time_days: i32) -> Self {
         let now = Utc::now().naive_utc();
 
@@ -370,6 +393,10 @@ impl EmergencyAccess {
 
         if self.status == EmergencyAccessStatus::Accepted as i32 {
             err!("Emergency contact already accepted.");
+        }
+
+        if AutoConfirmRequirement::for_user(grantee_uuid, conn).await?.forbids_emergency_access() {
+            err!("You are a member of an organization which does not allow emergency access.")
         }
 
         self.status = EmergencyAccessStatus::Accepted as i32;

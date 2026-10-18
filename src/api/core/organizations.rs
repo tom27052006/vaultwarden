@@ -10,8 +10,8 @@ use crate::{
     api::{
         EmptyResult, JsonResult, Notify, PasswordOrOtpData, UpdateType,
         core::{
-            CipherSyncData, CipherSyncType, accept_org_invite, emergency_access::delete_all_emergency_access_of_user,
-            log_event, notify_pending_auto_confirm, two_factor,
+            CipherSyncData, CipherSyncType, accept_org_invite, emergency_access::notify_removed_emergency_access,
+            enforce_membership_policies, log_event, notify_pending_auto_confirm, two_factor,
         },
     },
     auth::{AdminHeaders, Headers, ManagerHeaders, ManagerHeadersLoose, OrgMemberHeaders, OwnerHeaders, decode_invite},
@@ -194,7 +194,7 @@ async fn create_organization(headers: Headers, data: Json<OrgData>, conn: DbConn
     }
     // Unlike SingleOrg, auto-confirm forbids additional memberships for every role and status.
     // https://github.com/bitwarden/server/blob/b3d1eb9a7854322f106efa55c191c1a4da9f8645/src/Core/AdminConsole/OrganizationFeatures/Organizations/SelfHostedOrganizationSignUpCommand.cs
-    if AutoConfirmRequirement::for_user(&headers.user.uuid, &conn).await.forbids_creating_organization() {
+    if AutoConfirmRequirement::for_user(&headers.user.uuid, &conn).await?.forbids_creating_organization() {
         err!(
             "You may not create an organization. You belong to an organization which confirms its members automatically and prohibits you from being a member of any other organization."
         )
@@ -1082,6 +1082,9 @@ async fn send_invite(
         new_member.access_all = access_all;
         new_member.atype = new_type;
         new_member.status = member_status;
+        if new_member.status == MembershipStatus::Accepted as i32 {
+            enforce_membership_policies(&new_member, "join", &conn).await?;
+        }
         new_member.save(&conn).await?;
 
         if CONFIG.mail_enabled() {
@@ -1246,6 +1249,7 @@ async fn reinvite_member_impl(
         Invitation::take(&user.email, conn).await;
         let mut member = member;
         member.status = MembershipStatus::Accepted as i32;
+        enforce_membership_policies(&member, "join", conn).await?;
         member.save(conn).await?;
         notify_pending_auto_confirm(&member, conn, nt).await;
     }
@@ -1319,14 +1323,20 @@ async fn accept_invite(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ConfirmData {
-    id: Option<MembershipId>,
-    key: Option<String>,
+    key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BulkConfirmEntry {
+    id: MembershipId,
+    key: String,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BulkConfirmData {
-    keys: Option<Vec<ConfirmData>>,
+    keys: Vec<BulkConfirmEntry>,
 }
 
 #[post("/organizations/<org_id>/users/confirm", data = "<data>")]
@@ -1353,34 +1363,26 @@ async fn bulk_confirm(
         err!("Organization not found", "Organization id's do not match");
     }
 
+    // Reject malformed entries before any member is confirmed, as upstream request validation does.
+    if data.keys.iter().any(|entry| uuid::Uuid::parse_str(&entry.id).is_err() || entry.key.trim().is_empty()) {
+        err!("Member id and key are required")
+    }
     let mut bulk_response = Vec::new();
-    match data.keys {
-        Some(keys) => {
-            for invite in keys {
-                let Some(member_id) = invite.id else {
-                    err!("Member id is required")
-                };
-                let user_key = invite.key.unwrap_or_default();
-                let result = if automatic {
-                    auto_confirm_member_impl(org_id, &member_id, &user_key, headers, conn, nt).await
-                } else {
-                    confirm_invite_impl(org_id, &member_id, &user_key, headers, conn, nt).await
-                };
-                let err_msg = match result {
-                    Ok(()) => String::new(),
-                    Err(e) => format!("{e:?}"),
-                };
-
-                bulk_response.push(json!(
-                    {
-                        "object": "OrganizationBulkConfirmResponseModel",
-                        "id": member_id,
-                        "error": err_msg
-                    }
-                ));
-            }
-        }
-        None => error!("No keys to confirm"),
+    for invite in data.keys {
+        let result = if automatic {
+            auto_confirm_member_impl(org_id, &invite.id, &invite.key, headers, conn, nt).await
+        } else {
+            confirm_invite_impl(org_id, &invite.id, &invite.key, headers, conn, nt).await
+        };
+        let err_msg = match result {
+            Ok(()) => String::new(),
+            Err(e) => format!("{e:?}"),
+        };
+        bulk_response.push(json!({
+            "object": "OrganizationBulkConfirmResponseModel",
+            "id": invite.id,
+            "error": err_msg
+        }));
     }
 
     Ok(Json(json!({
@@ -1400,7 +1402,7 @@ async fn confirm_invite(
     nt: Notify<'_>,
 ) -> EmptyResult {
     let data = data.into_inner();
-    let user_key = data.key.unwrap_or_default();
+    let user_key = data.key;
     confirm_invite_impl(&org_id, &member_id, &user_key, &headers, &conn, &nt).await
 }
 
@@ -1415,7 +1417,7 @@ async fn confirm_invite_impl(
     if org_id != &headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
-    if key.is_empty() || member_id.is_empty() {
+    if key.trim().is_empty() || member_id.is_empty() {
         err!("Key or UserId is not set, unable to process request");
     }
 
@@ -1451,12 +1453,10 @@ async fn confirm_member(
     // This check is also done at accept_invite, _confirm_invite, _activate_member, edit_member, admin::update_membership_type
     OrgPolicy::check_user_allowed(&member_to_confirm, "confirm", conn).await?;
 
-    // Remove emergency access created after policy activation; it could expose the organization vault.
-    // Bitwarden applies this to manual confirmation as well.
-    // https://github.com/bitwarden/server/blob/b3d1eb9a7854322f106efa55c191c1a4da9f8645/src/Core/AdminConsole/OrganizationFeatures/OrganizationUsers/ConfirmOrganizationUserCommand.cs
-    if OrgPolicy::is_auto_confirm_enabled(&org_id, conn).await {
-        delete_all_emergency_access_of_user(&member_to_confirm.user_uuid, conn).await?;
-    }
+    let removed = member_to_confirm
+        .confirm(key, matches!(event_type, EventType::OrganizationUserAutomaticallyConfirmed), conn)
+        .await?;
+    notify_removed_emergency_access(removed, conn).await;
 
     log_event(
         event_type,
@@ -1469,27 +1469,16 @@ async fn confirm_member(
     )
     .await;
 
-    if CONFIG.mail_enabled() {
-        let org_name = if let Some(org) = Organization::find_by_uuid(&org_id, conn).await {
-            org.name
-        } else {
-            err!("Error looking up organization.")
-        };
-        let address = if let Some(user) = User::find_by_uuid(&member_to_confirm.user_uuid, conn).await {
-            user.email
-        } else {
-            err!("Error looking up user.")
-        };
-        mail::send_invite_confirmed(&address, &org_name).await?;
-    }
-
-    let save_result = member_to_confirm.save(conn).await;
-
     if let Some(user) = User::find_by_uuid(&member_to_confirm.user_uuid, conn).await {
         nt.send_user_update(UpdateType::SyncOrgKeys, &user, headers.device.push_uuid.as_ref(), conn).await;
+        if CONFIG.mail_enabled()
+            && let Some(org) = Organization::find_by_uuid(&org_id, conn).await
+            && let Err(e) = mail::send_invite_confirmed(&user.email, &org.name).await
+        {
+            error!("Failed to send organization confirmation email: {e:?}");
+        }
     }
-
-    save_result
+    Ok(())
 }
 
 // The server lacks the organization key; an admin client performs auto-confirmation in the background.
@@ -1502,14 +1491,14 @@ async fn get_pending_auto_confirm_members(org_id: OrganizationId, headers: Admin
     }
 
     // Bitwarden responds with an empty list instead of an error when the feature or the policy is off.
-    let members = if OrgPolicy::is_auto_confirm_enabled(&org_id, &conn).await {
+    let members = if OrgPolicy::is_auto_confirm_enabled(&org_id, &conn).await? {
         Membership::find_by_org(&org_id, &conn)
             .await
             .into_iter()
             .filter(Membership::can_be_auto_confirmed)
             .map(|m| {
                 json!({
-                    "object": "organizationUserPendingAutoConfirm",
+                    "object": "OrganizationUserPendingAutoConfirmResponseModel",
                     "id": m.uuid,
                     "userId": m.user_uuid,
                 })
@@ -1536,7 +1525,7 @@ async fn auto_confirm_member(
     nt: Notify<'_>,
 ) -> EmptyResult {
     let data = data.into_inner();
-    let user_key = data.key.unwrap_or_default();
+    let user_key = data.key;
     auto_confirm_member_impl(&org_id, &member_id, &user_key, &headers, &conn, &nt).await
 }
 
@@ -1562,11 +1551,11 @@ async fn auto_confirm_member_impl(
     if org_id != &headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
-    if key.is_empty() || member_id.is_empty() {
+    if key.trim().is_empty() || member_id.is_empty() {
         err!("Key or UserId is not set, unable to process request");
     }
 
-    if !OrgPolicy::is_auto_confirm_enabled(org_id, conn).await {
+    if !OrgPolicy::is_auto_confirm_enabled(org_id, conn).await? {
         err!("Automatic user confirmation is not enabled for this organization")
     }
 
@@ -2233,31 +2222,6 @@ async fn put_policy(
         err!("Automatic user confirmation is not enabled on this server.")
     }
 
-    // Only disabled -> enabled has side effects; repeating them on each save would delete new emergency access.
-    let auto_confirm_turned_on = enables_auto_confirm && !policy.enabled;
-    if auto_confirm_turned_on {
-        if !OrgPolicy::is_enabled(&org_id, OrgPolicyType::SingleOrg, &conn).await {
-            err!("Single Organization policy is not enabled. It is mandatory for this policy to be enabled.")
-        }
-
-        // Reject non-compliant members instead of revoking them: Owner/Admin are covered and could lock out the org.
-        for member in Membership::find_by_org(&org_id, &conn).await {
-            if member.counts_for_auto_confirm()
-                && Membership::count_accepted_confirmed_and_revoked_by_user(&member.user_uuid, &org_id, &conn).await > 0
-            {
-                err!("This policy forbids members to be part of other organizations, but at least one member still is.")
-            }
-        }
-    }
-
-    // Keep SingleOrg enabled while automatic confirmation depends on it.
-    if pol_type_enum == OrgPolicyType::SingleOrg
-        && !data.enabled
-        && OrgPolicy::is_auto_confirm_enabled(&org_id, &conn).await
-    {
-        err!("Automatic user confirmation is enabled. It is not allowed to disable this policy.")
-    }
-
     // When enabling the TwoFactorAuthentication policy, revoke all members that do not have 2FA
     if pol_type_enum == OrgPolicyType::TwoFactorAuthentication && data.enabled {
         two_factor::enforce_2fa_policy_for_org(
@@ -2307,20 +2271,11 @@ async fn put_policy(
 
     policy.enabled = data.enabled;
     policy.data = serde_json::to_string(&data.data)?;
-    policy.save(&conn).await?;
-
-    // Remove emergency access only after saving and only for joined members. A failed save must delete
-    // nothing, and an unaccepted invitation must not delete account data. New relationships are blocked elsewhere.
-    if auto_confirm_turned_on {
-        for member in Membership::find_by_org(&org_id, &conn).await {
-            if member.counts_for_auto_confirm() {
-                info!(
-                    "Removing emergency access of {} because automatic user confirmation was enabled for {org_id}",
-                    member.user_uuid
-                );
-                delete_all_emergency_access_of_user(&member.user_uuid, &conn).await?;
-            }
-        }
+    if matches!(pol_type_enum, OrgPolicyType::SingleOrg | OrgPolicyType::AutomaticUserConfirmation) {
+        let removed = policy.save_auto_confirm_dependency(&conn).await?;
+        notify_removed_emergency_access(removed, &conn).await;
+    } else {
+        policy.save(&conn).await?;
     }
 
     log_event(
@@ -2489,10 +2444,11 @@ async fn restore_member_vnext(
     member_id: MembershipId,
     headers: AdminHeaders,
     conn: DbConn,
+    nt: Notify<'_>,
 ) -> EmptyResult {
     // Vaultwarden does not (yet) support the per User Collection linked to the `Enforce organization data ownership` policy.
     // Therefor we ignore the `defaultUserCollectionName` data sent and just call restore_member
-    restore_member_impl(&org_id, &member_id, &headers, &conn).await
+    restore_member_impl(&org_id, &member_id, &headers, &conn, &nt).await
 }
 
 #[put("/organizations/<org_id>/users/<member_id>/restore")]
@@ -2501,8 +2457,9 @@ async fn restore_member(
     member_id: MembershipId,
     headers: AdminHeaders,
     conn: DbConn,
+    nt: Notify<'_>,
 ) -> EmptyResult {
-    restore_member_impl(&org_id, &member_id, &headers, &conn).await
+    restore_member_impl(&org_id, &member_id, &headers, &conn, &nt).await
 }
 
 #[put("/organizations/<org_id>/users/restore", data = "<data>")]
@@ -2511,6 +2468,7 @@ async fn bulk_restore_members(
     data: Json<BulkMembershipIds>,
     headers: AdminHeaders,
     conn: DbConn,
+    nt: Notify<'_>,
 ) -> JsonResult {
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
@@ -2519,7 +2477,7 @@ async fn bulk_restore_members(
 
     let mut bulk_response = Vec::new();
     for member_id in data.ids {
-        let err_msg = match restore_member_impl(&org_id, &member_id, &headers, &conn).await {
+        let err_msg = match restore_member_impl(&org_id, &member_id, &headers, &conn, &nt).await {
             Ok(()) => String::new(),
             Err(e) => format!("{e:?}"),
         };
@@ -2545,6 +2503,7 @@ async fn restore_member_impl(
     member_id: &MembershipId,
     headers: &AdminHeaders,
     conn: &DbConn,
+    nt: &Notify<'_>,
 ) -> EmptyResult {
     if org_id != &headers.org_id {
         err!("Organization not found", "Organization id's do not match");
@@ -2561,16 +2520,11 @@ async fn restore_member_impl(
             member.restore();
             // This check is also done at accept_invite, _confirm_invite, _activate_member, edit_member, admin::update_membership_type
             // This check need to be done after restoring to work with the correct status
-            OrgPolicy::check_user_allowed(&member, "restore", conn).await?;
-
-            // Restore has no Accepted transition, so remove emergency access created while revoked.
-            // Invited remains exempt because that account never joined.
-            // https://github.com/bitwarden/server/blob/b3d1eb9a7854322f106efa55c191c1a4da9f8645/src/Core/AdminConsole/OrganizationFeatures/OrganizationUsers/RestoreUser/v1/RestoreOrganizationUserCommand.cs
-            if member.counts_for_auto_confirm() && OrgPolicy::is_auto_confirm_enabled(org_id, conn).await {
-                delete_all_emergency_access_of_user(&member.user_uuid, conn).await?;
-            }
+            enforce_membership_policies(&member, "restore", conn).await?;
 
             member.save(conn).await?;
+
+            notify_pending_auto_confirm(&member, conn, nt).await;
 
             log_event(
                 EventType::OrganizationUserRestored,

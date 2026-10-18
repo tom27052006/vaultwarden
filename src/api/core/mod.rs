@@ -24,7 +24,7 @@ use crate::{
     auth::Headers,
     db::{
         DbConn,
-        models::{Membership, MembershipStatus, MembershipType, OrgPolicy, Organization, User, UserId},
+        models::{Membership, MembershipStatus, MembershipType, OrgPolicy, OrgPolicyType, Organization, User, UserId},
     },
     error::Error,
     http_client::make_http_request,
@@ -220,8 +220,6 @@ fn config() -> Json<Value> {
         &FeatureFlagFilter::ValidOnly,
     );
     feature_states.insert("pm-19148-innovation-archive".to_owned(), true);
-    // Web vaults through 2026.4.x need this flag; newer clients use `useAutomaticUserConfirmation`.
-    feature_states.insert("pm-19934-auto-confirm-organization-users".to_owned(), CONFIG.org_auto_confirm_enabled());
 
     Json(json!({
         // Note: The clients use this version to handle backwards compatibility concerns
@@ -282,8 +280,19 @@ fn api_not_found() -> Json<Value> {
 /// Notifies eligible admins when a member reaches Accepted; their unlocked browser extension holds the
 /// organization key and performs confirmation. Call this at every transition to Accepted.
 pub async fn notify_pending_auto_confirm(member: &Membership, conn: &DbConn, nt: &Notify<'_>) {
-    if !member.can_be_auto_confirmed() || !OrgPolicy::is_auto_confirm_enabled(&member.org_uuid, conn).await {
+    if !member.can_be_auto_confirmed() {
         return;
+    }
+    if User::find_by_uuid(&member.user_uuid, conn).await.and_then(|user| user.public_key).is_none() {
+        return;
+    }
+    match OrgPolicy::is_auto_confirm_enabled(&member.org_uuid, conn).await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            error!("Failed to check automatic confirmation before notifying: {e:?}");
+            return;
+        }
     }
 
     // Confirming requires `AdminHeaders`, so skip the managers this also returns.
@@ -300,13 +309,24 @@ pub async fn notify_pending_auto_confirm(member: &Membership, conn: &DbConn, nt:
 pub async fn accept_user_invitations(user_id: &UserId, conn: &DbConn, nt: &Notify<'_>) -> EmptyResult {
     let invited = Membership::find_invited_by_user(user_id, conn).await;
 
-    Membership::accept_user_invitations(user_id, conn).await?;
-
     for mut member in invited {
         member.status = MembershipStatus::Accepted as i32;
+        enforce_membership_policies(&member, "join", conn).await?;
+        member.accept_invitation(conn).await?;
         notify_pending_auto_confirm(&member, conn, nt).await;
     }
 
+    Ok(())
+}
+
+/// Required for every acceptance/restoration path, including SMTP-disabled and imported members.
+pub async fn enforce_membership_policies(member: &Membership, action: &str, conn: &DbConn) -> EmptyResult {
+    if member.counts_for_auto_confirm() {
+        OrgPolicy::check_user_allowed(member, action, conn).await?;
+        if OrgPolicy::is_enabled(&member.org_uuid, OrgPolicyType::AutomaticUserConfirmation, conn).await? {
+            emergency_access::delete_all_emergency_access_of_user(&member.user_uuid, conn).await?;
+        }
+    }
     Ok(())
 }
 
@@ -325,7 +345,7 @@ async fn accept_org_invite(
     member.reset_password_key = reset_password_key;
 
     // This check is also done at accept_invite, _confirm_invite, _activate_member, edit_member, admin::update_membership_type
-    OrgPolicy::check_user_allowed(&member, "join", conn).await?;
+    enforce_membership_policies(&member, "join", conn).await?;
 
     member.save(conn).await?;
 

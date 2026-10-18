@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::{
     CONFIG,
-    api::EmptyResult,
+    api::{ApiResult, EmptyResult},
     db::{
         DbConn,
         schema::{
@@ -21,8 +21,8 @@ use crate::{
 use macros::UuidFromParam;
 
 use super::{
-    Cipher, CipherId, Collection, CollectionId, CollectionUser, Group, GroupId, GroupUser, OrgPolicy, OrgPolicyType,
-    TwoFactor, User, UserId,
+    Cipher, CipherId, Collection, CollectionId, CollectionUser, EmergencyAccess, Group, GroupId, GroupUser, OrgPolicy,
+    OrgPolicyType, TwoFactor, User, UserId,
 };
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
@@ -258,6 +258,81 @@ impl Organization {
 const ACTIVATE_REVOKE_DIFF: i32 = 128;
 
 impl Membership {
+    /// Persist an internally accepted invitation without overwriting a concurrent membership change.
+    pub async fn accept_invitation(&self, conn: &DbConn) -> EmptyResult {
+        let changed: usize = conn
+            .run(move |conn| {
+                diesel::update(
+                    users_organizations::table
+                        .filter(users_organizations::uuid.eq(&self.uuid))
+                        .filter(users_organizations::org_uuid.eq(&self.org_uuid))
+                        .filter(users_organizations::user_uuid.eq(&self.user_uuid))
+                        .filter(users_organizations::atype.eq(self.atype))
+                        .filter(users_organizations::status.eq(MembershipStatus::Invited as i32)),
+                )
+                .set(users_organizations::status.eq(MembershipStatus::Accepted as i32))
+                .execute(conn)
+                .map_res("Error accepting organization invitation")
+            })
+            .await?;
+        if changed != 1 {
+            err!("Membership changed before acceptance; refresh and try again")
+        }
+        Ok(())
+    }
+
+    /// Confirm only the accepted snapshot that was authorized; never upsert a deleted member.
+    pub async fn confirm(&self, key: &str, automatic: bool, conn: &DbConn) -> ApiResult<Vec<EmergencyAccess>> {
+        conn.run(move |conn| {
+            conn.transaction::<_, crate::error::Error, _>(|conn| {
+                let changed: usize = diesel::update(
+                    users_organizations::table
+                        .filter(users_organizations::uuid.eq(&self.uuid))
+                        .filter(users_organizations::org_uuid.eq(&self.org_uuid))
+                        .filter(users_organizations::user_uuid.eq(&self.user_uuid))
+                        .filter(users_organizations::atype.eq(self.atype))
+                        .filter(users_organizations::status.eq(MembershipStatus::Accepted as i32)),
+                )
+                .set((
+                    users_organizations::status.eq(MembershipStatus::Confirmed as i32),
+                    users_organizations::akey.eq(key),
+                ))
+                .execute(conn)
+                .map_res("Error confirming organization membership")?;
+                if changed != 1 {
+                    err!("Membership changed before confirmation; refresh and try again")
+                }
+                let policy_enabled = org_policies::table
+                    .filter(org_policies::org_uuid.eq(&self.org_uuid))
+                    .filter(org_policies::atype.eq(OrgPolicyType::AutomaticUserConfirmation as i32))
+                    .select(org_policies::enabled)
+                    .first::<bool>(conn)
+                    .optional()?
+                    .unwrap_or(false);
+                if automatic && (!policy_enabled || self.atype != MembershipType::User) {
+                    err!("Automatic user confirmation is not enabled for this member")
+                }
+                let removed = if policy_enabled {
+                    EmergencyAccess::delete_for_users(std::slice::from_ref(&self.user_uuid), conn)?
+                } else {
+                    Vec::new()
+                };
+                diesel::update(users::table.filter(users::uuid.eq(&self.user_uuid)))
+                    .set(users::updated_at.eq(Utc::now().naive_utc()))
+                    .execute(conn)?;
+                Ok(removed)
+            })
+        })
+        .await
+    }
+
+    pub const JOINED_STATUSES: [i32; 4] = [
+        MembershipStatus::Accepted as i32,
+        MembershipStatus::Confirmed as i32,
+        MembershipStatus::Accepted as i32 - ACTIVATE_REVOKE_DIFF,
+        MembershipStatus::Confirmed as i32 - ACTIVATE_REVOKE_DIFF,
+    ];
+
     pub fn new(user_uuid: UserId, org_uuid: OrganizationId, invited_by_email: Option<String>) -> Self {
         Self {
             uuid: MembershipId(crate::util::get_uuid()),
@@ -842,20 +917,6 @@ impl Membership {
         .await
     }
 
-    // Should be used only when email are disabled.
-    // In Organizations::send_invite status is set to Accepted only if the user has a password.
-    pub async fn accept_user_invitations(user_uuid: &UserId, conn: &DbConn) -> EmptyResult {
-        conn.run(move |conn| {
-            diesel::update(users_organizations::table)
-                .filter(users_organizations::user_uuid.eq(user_uuid))
-                .filter(users_organizations::status.eq(MembershipStatus::Invited as i32))
-                .set(users_organizations::status.eq(MembershipStatus::Accepted as i32))
-                .execute(conn)
-                .map_res("Error confirming invitations")
-        })
-        .await
-    }
-
     pub async fn find_any_state_by_user(user_uuid: &UserId, conn: &DbConn) -> Vec<Self> {
         conn.run(move |conn| {
             users_organizations::table
@@ -887,10 +948,10 @@ impl Membership {
         .await
     }
 
-    /// Every role and status except Invited counts; Revoked counts because restore has no accept step.
+    /// Only previously joined members count, including revoked Accepted/Confirmed members.
     /// https://github.com/bitwarden/server/blob/b3d1eb9a7854322f106efa55c191c1a4da9f8645/src/Core/AdminConsole/OrganizationFeatures/Policies/Enforcement/AutoConfirm/AutomaticUserConfirmationPolicyEnforcementHandler.cs
     pub fn counts_for_auto_confirm(&self) -> bool {
-        self.status != MembershipStatus::Invited as i32
+        Self::JOINED_STATUSES.contains(&self.status)
     }
 
     /// Only an Accepted plain User may be auto-confirmed; elevated roles require manual confirmation.
@@ -898,25 +959,20 @@ impl Membership {
         self.status == MembershipStatus::Accepted as i32 && self.atype == MembershipType::User
     }
 
-    /// Counts non-Invited memberships outside `excluded_org`, including Revoked; stricter than SingleOrg.
+    /// Counts previously joined memberships outside `excluded_org`, including their revoked states.
     pub async fn count_accepted_confirmed_and_revoked_by_user(
         user_uuid: &UserId,
         excluded_org: &OrganizationId,
         conn: &DbConn,
-    ) -> i64 {
+    ) -> ApiResult<i64> {
         conn.run(move |conn| {
             users_organizations::table
                 .filter(users_organizations::user_uuid.eq(user_uuid))
                 .filter(users_organizations::org_uuid.ne(excluded_org))
-                .filter(
-                    users_organizations::status
-                        .eq(MembershipStatus::Accepted as i32)
-                        .or(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
-                        .or(users_organizations::status.lt(MembershipStatus::Invited as i32)),
-                )
+                .filter(users_organizations::status.eq_any(Self::JOINED_STATUSES))
                 .count()
                 .first::<i64>(conn)
-                .unwrap_or(0)
+                .map_res("Error counting joined organization memberships")
         })
         .await
     }
@@ -1273,7 +1329,7 @@ mod tests {
         assert!(MembershipType::Manager == MembershipType::from_str("4").unwrap());
     }
 
-    /// All but Invited count for the policy; only an Accepted plain User may be auto-confirmed.
+    /// Invitations never count as joined, even after revocation.
     #[test]
     fn auto_confirm_membership_rules() {
         let mut member = Membership::new("user".to_owned().into(), "org".to_owned().into(), None);
@@ -1285,7 +1341,11 @@ mod tests {
             assert_eq!(member.can_be_auto_confirmed(), status == MembershipStatus::Accepted as i32, "status {status}");
 
             assert!(member.revoke(), "status {status} can not be revoked");
-            assert!(member.counts_for_auto_confirm(), "revoked {status} must count");
+            assert_eq!(
+                member.counts_for_auto_confirm(),
+                status != MembershipStatus::Invited as i32,
+                "revoked {status}"
+            );
             assert!(!member.can_be_auto_confirmed(), "revoked {status} must not be confirmed automatically");
             // `count_accepted_confirmed_and_revoked_by_user` relies on this.
             assert!(member.status < MembershipStatus::Invited as i32, "revoked {status} must stay below Invited");
