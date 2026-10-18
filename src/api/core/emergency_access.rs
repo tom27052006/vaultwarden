@@ -25,14 +25,6 @@ use crate::{
     util::NumberOrString,
 };
 
-/// Deletes emergency access granted by or to `user_id` and sends each grantor one mail listing lost contacts.
-/// https://github.com/bitwarden/server/blob/b3d1eb9a7854322f106efa55c191c1a4da9f8645/src/Core/Auth/UserFeatures/EmergencyAccess/Commands/DeleteEmergencyAccessCommand.cs
-pub async fn delete_all_emergency_access_of_user(user_id: &UserId, conn: &DbConn) -> EmptyResult {
-    let removed = EmergencyAccess::take_all_by_user(user_id, conn).await?;
-    notify_removed_emergency_access(removed, conn).await;
-    Ok(())
-}
-
 pub async fn notify_removed_emergency_access(removed: Vec<EmergencyAccess>, conn: &DbConn) {
     // Group removed contacts into one mail per grantor.
     let mut by_grantor: HashMap<UserId, Vec<String>> = HashMap::new();

@@ -431,7 +431,9 @@ pub async fn register(data: Json<RegisterData>, conn: DbConn, nt: Notify<'_>) ->
     user.save(&conn).await?;
 
     if accept_invitations {
-        accept_user_invitations(&user.uuid, &conn, &nt).await?;
+        // The account is already persisted. A rejected invitation must not fail registration
+        // or prevent independent invitations from being accepted.
+        accept_user_invitations(&user.uuid, &conn, &nt, true).await?;
     }
 
     // accept any open emergency access invitations
@@ -503,7 +505,7 @@ async fn post_set_password(data: Json<SetPasswordData>, headers: Headers, conn: 
     if CONFIG.mail_enabled() {
         mail::send_welcome(&user.email.to_lowercase()).await?;
     } else {
-        accept_user_invitations(&user.uuid, &conn, &nt).await?;
+        accept_user_invitations(&user.uuid, &conn, &nt, false).await?;
     }
 
     log_user_event(EventType::UserChangedPassword, &user.uuid, headers.device.atype, &headers.ip.ip, &conn).await;

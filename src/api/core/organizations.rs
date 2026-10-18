@@ -1250,7 +1250,7 @@ async fn reinvite_member_impl(
         let mut member = member;
         member.status = MembershipStatus::Accepted as i32;
         enforce_membership_policies(&member, "join", conn).await?;
-        member.save(conn).await?;
+        member.accept_invitation(conn).await?;
         notify_pending_auto_confirm(&member, conn, nt).await;
     }
 

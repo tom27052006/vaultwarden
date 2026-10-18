@@ -8,9 +8,9 @@ use serde_json::Value;
 
 use crate::{
     CONFIG,
-    api::{ApiResult, EmptyResult},
+    api::{ApiResult, EmptyResult, core::notify_removed_emergency_access},
     db::{
-        DbConn,
+        DbConn, DbConnInner,
         schema::{
             ciphers, ciphers_collections, collections_groups, groups, groups_users, org_policies, organization_api_key,
             organizations, users, users_collections, users_organizations,
@@ -21,8 +21,8 @@ use crate::{
 use macros::UuidFromParam;
 
 use super::{
-    Cipher, CipherId, Collection, CollectionId, CollectionUser, EmergencyAccess, Group, GroupId, GroupUser, OrgPolicy,
-    OrgPolicyType, TwoFactor, User, UserId,
+    AutoConfirmRequirement, Cipher, CipherId, Collection, CollectionId, CollectionUser, EmergencyAccess, Group,
+    GroupId, GroupUser, OrgPolicy, OrgPolicyType, TwoFactor, User, UserId,
 };
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
@@ -258,26 +258,93 @@ impl Organization {
 const ACTIVATE_REVOKE_DIFF: i32 = 128;
 
 impl Membership {
-    /// Persist an internally accepted invitation without overwriting a concurrent membership change.
+    /// Called first in membership transactions, before any snapshot reads.
+    fn lock_for_auto_confirm(&self, conn: &mut DbConnInner) -> EmptyResult {
+        // The organization lock excludes policy activation while the user lock serializes joins
+        // across organizations. Both writes are portable and also acquire SQLite's write lock.
+        diesel::update(organizations::table.filter(organizations::uuid.eq(&self.org_uuid)))
+            .set(organizations::name.eq(organizations::name))
+            .execute(conn)?;
+        diesel::update(users::table.filter(users::uuid.eq(&self.user_uuid)))
+            .set(users::updated_at.eq(Utc::now().naive_utc()))
+            .execute(conn)?;
+        Ok(())
+    }
+
+    fn enforce_auto_confirm(&self, conn: &mut DbConnInner) -> ApiResult<Vec<EmergencyAccess>> {
+        self.lock_for_auto_confirm(conn)?;
+        if !self.counts_for_auto_confirm() {
+            return Ok(Vec::new());
+        }
+        // Revoking or updating an already joined member adds no membership. In particular,
+        // directory import must still save external_id after a rejected restoration.
+        if self.status < MembershipStatus::Invited as i32 {
+            let already_joined = users_organizations::table
+                .filter(users_organizations::uuid.eq(&self.uuid))
+                .filter(users_organizations::org_uuid.eq(&self.org_uuid))
+                .filter(users_organizations::user_uuid.eq(&self.user_uuid))
+                .filter(users_organizations::status.eq_any(Self::JOINED_STATUSES))
+                .count()
+                .first::<i64>(conn)?;
+            if already_joined > 0 {
+                return Ok(Vec::new());
+            }
+        }
+        if AutoConfirmRequirement::load_for_user(&self.user_uuid, conn)?.forbids_membership_outside(&self.org_uuid) {
+            err!("Another organization confirms its members automatically and forbids other memberships")
+        }
+        let policy_enabled = org_policies::table
+            .filter(org_policies::org_uuid.eq(&self.org_uuid))
+            .filter(org_policies::atype.eq(OrgPolicyType::AutomaticUserConfirmation as i32))
+            .select(org_policies::enabled)
+            .first::<bool>(conn)
+            .optional()?
+            .unwrap_or(false);
+        if policy_enabled {
+            let conflicts = users_organizations::table
+                .filter(users_organizations::user_uuid.eq(&self.user_uuid))
+                .filter(users_organizations::org_uuid.ne(&self.org_uuid))
+                .filter(users_organizations::status.eq_any(Self::JOINED_STATUSES))
+                .count()
+                .first::<i64>(conn)?;
+            if conflicts > 0 {
+                err!("This organization confirms its members automatically and forbids other memberships")
+            }
+            EmergencyAccess::delete_for_users(std::slice::from_ref(&self.user_uuid), conn)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Accept only the invited snapshot that was authorized; cleanup commits with the update.
     pub async fn accept_invitation(&self, conn: &DbConn) -> EmptyResult {
-        let changed: usize = conn
+        let removed = conn
             .run(move |conn| {
-                diesel::update(
-                    users_organizations::table
-                        .filter(users_organizations::uuid.eq(&self.uuid))
-                        .filter(users_organizations::org_uuid.eq(&self.org_uuid))
-                        .filter(users_organizations::user_uuid.eq(&self.user_uuid))
-                        .filter(users_organizations::atype.eq(self.atype))
-                        .filter(users_organizations::status.eq(MembershipStatus::Invited as i32)),
-                )
-                .set(users_organizations::status.eq(MembershipStatus::Accepted as i32))
-                .execute(conn)
-                .map_res("Error accepting organization invitation")
+                conn.transaction::<_, crate::error::Error, _>(|conn| {
+                    let removed = self.enforce_auto_confirm(conn)?;
+                    let changed: usize = diesel::update(
+                        users_organizations::table
+                            .filter(users_organizations::uuid.eq(&self.uuid))
+                            .filter(users_organizations::org_uuid.eq(&self.org_uuid))
+                            .filter(users_organizations::user_uuid.eq(&self.user_uuid))
+                            .filter(users_organizations::atype.eq(self.atype))
+                            .filter(users_organizations::status.eq(MembershipStatus::Invited as i32)),
+                    )
+                    .set((
+                        users_organizations::status.eq(MembershipStatus::Accepted as i32),
+                        users_organizations::reset_password_key.eq(&self.reset_password_key),
+                        users_organizations::invited_by_email.eq(&self.invited_by_email),
+                    ))
+                    .execute(conn)
+                    .map_res("Error accepting organization invitation")?;
+                    if changed != 1 {
+                        err!("Membership changed before acceptance; refresh and try again")
+                    }
+                    Ok(removed)
+                })
             })
             .await?;
-        if changed != 1 {
-            err!("Membership changed before acceptance; refresh and try again")
-        }
+        notify_removed_emergency_access(removed, conn).await;
         Ok(())
     }
 
@@ -285,6 +352,7 @@ impl Membership {
     pub async fn confirm(&self, key: &str, automatic: bool, conn: &DbConn) -> ApiResult<Vec<EmergencyAccess>> {
         conn.run(move |conn| {
             conn.transaction::<_, crate::error::Error, _>(|conn| {
+                let removed = self.enforce_auto_confirm(conn)?;
                 let changed: usize = diesel::update(
                     users_organizations::table
                         .filter(users_organizations::uuid.eq(&self.uuid))
@@ -312,14 +380,6 @@ impl Membership {
                 if automatic && (!policy_enabled || self.atype != MembershipType::User) {
                     err!("Automatic user confirmation is not enabled for this member")
                 }
-                let removed = if policy_enabled {
-                    EmergencyAccess::delete_for_users(std::slice::from_ref(&self.user_uuid), conn)?
-                } else {
-                    Vec::new()
-                };
-                diesel::update(users::table.filter(users::uuid.eq(&self.user_uuid)))
-                    .set(users::updated_at.eq(Utc::now().naive_utc()))
-                    .execute(conn)?;
                 Ok(removed)
             })
         })
@@ -788,40 +848,53 @@ impl Membership {
     }
 
     pub async fn save(&self, conn: &DbConn) -> EmptyResult {
-        User::update_uuid_revision(&self.user_uuid, conn).await;
-
-        db_run! { conn:
-            mysql {
-                diesel::insert_into(users_organizations::table)
-                    .values(self)
-                    .on_conflict(diesel::dsl::DuplicatedKeys)
-                    .do_update()
-                    .set(self)
-                    .execute(conn)
-                    .map_res("Error adding user to organization")
-            }
-            postgresql, sqlite {
-                diesel::insert_into(users_organizations::table)
-                    .values(self)
-                    .on_conflict(users_organizations::uuid)
-                    .do_update()
-                    .set(self)
-                    .execute(conn)
-                    .map_res("Error adding user to organization")
-            }
-        }
+        let removed = conn
+            .run(move |conn| {
+                conn.transaction::<_, crate::error::Error, _>(|conn| {
+                    let removed = self.enforce_auto_confirm(conn)?;
+                    let _: () = match conn {
+                        #[cfg(mysql)]
+                        DbConnInner::Mysql(conn) => diesel::insert_into(users_organizations::table)
+                            .values(self)
+                            .on_conflict(diesel::dsl::DuplicatedKeys)
+                            .do_update()
+                            .set(self)
+                            .execute(conn),
+                        #[cfg(postgresql)]
+                        DbConnInner::Postgresql(conn) => diesel::insert_into(users_organizations::table)
+                            .values(self)
+                            .on_conflict(users_organizations::uuid)
+                            .do_update()
+                            .set(self)
+                            .execute(conn),
+                        #[cfg(sqlite)]
+                        DbConnInner::Sqlite(conn) => diesel::insert_into(users_organizations::table)
+                            .values(self)
+                            .on_conflict(users_organizations::uuid)
+                            .do_update()
+                            .set(self)
+                            .execute(conn),
+                    }
+                    .map_res("Error adding user to organization")?;
+                    Ok(removed)
+                })
+            })
+            .await?;
+        notify_removed_emergency_access(removed, conn).await;
+        Ok(())
     }
 
     pub async fn delete(self, conn: &DbConn) -> EmptyResult {
-        User::update_uuid_revision(&self.user_uuid, conn).await;
-
         CollectionUser::delete_all_by_user_and_org(&self.user_uuid, &self.org_uuid, conn).await?;
         GroupUser::delete_all_by_member(&self.uuid, conn).await?;
 
         conn.run(move |conn| {
-            diesel::delete(users_organizations::table.filter(users_organizations::uuid.eq(self.uuid)))
-                .execute(conn)
-                .map_res("Error removing user from organization")
+            conn.transaction::<_, crate::error::Error, _>(|conn| {
+                self.lock_for_auto_confirm(conn)?;
+                diesel::delete(users_organizations::table.filter(users_organizations::uuid.eq(self.uuid)))
+                    .execute(conn)
+                    .map_res("Error removing user from organization")
+            })
         })
         .await
     }

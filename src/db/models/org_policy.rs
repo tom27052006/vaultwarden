@@ -8,8 +8,8 @@ use crate::{
     CONFIG,
     api::{ApiResult, EmptyResult, core::two_factor},
     db::{
-        DbConn,
-        schema::{org_policies, organizations, users_organizations},
+        DbConn, DbConnInner,
+        schema::{org_policies, organizations, users, users_organizations},
     },
     error::MapResult,
     util::format_date,
@@ -75,8 +75,7 @@ pub struct ResetPasswordDataModel {
 
 /// Local methods
 impl OrgPolicy {
-    /// Serialize policy 3/18 changes on the organization row. Cleanup and policy state commit together.
-    /// Other membership/emergency-access writers do not all share this lock.
+    /// Serialize policy 3/18 changes with membership writes, including those in other organizations.
     pub async fn save_auto_confirm_dependency(&mut self, conn: &DbConn) -> ApiResult<Vec<EmergencyAccess>> {
         self.revision_date = Utc::now().naive_utc();
         conn.run(move |conn| {
@@ -85,6 +84,15 @@ impl OrgPolicy {
                 diesel::update(organizations::table.filter(organizations::uuid.eq(&self.org_uuid)))
                     .set(organizations::name.eq(organizations::name))
                     .execute(conn)?;
+                // Membership writers lock their organization, then the user. Lock all affected users
+                // before any snapshot reads, including on MySQL's default REPEATABLE READ isolation.
+                diesel::update(users::table.filter(users::uuid.eq_any(
+                    users_organizations::table
+                        .filter(users_organizations::org_uuid.eq(&self.org_uuid))
+                        .select(users_organizations::user_uuid),
+                )))
+                .set(users::updated_at.eq(users::updated_at))
+                .execute(conn)?;
                 let policies = org_policies::table.filter(org_policies::org_uuid.eq(&self.org_uuid))
                     .load::<Self>(conn).map_res("Error loading organization policies")?;
                 let enabled = |kind: OrgPolicyType| policies.iter().any(|p| p.has_type(kind) && p.enabled);
@@ -501,21 +509,21 @@ impl AutoConfirmRequirement {
     /// Stored policies remain enforced when the server-wide capability is disabled.
     /// https://github.com/bitwarden/server/blob/b3d1eb9a7854322f106efa55c191c1a4da9f8645/src/Core/AdminConsole/OrganizationFeatures/Policies/PolicyRequirements/BasePolicyRequirementFactory.cs
     pub async fn for_user(user_uuid: &UserId, conn: &DbConn) -> ApiResult<Self> {
-        let members = conn
-            .run(move |conn| {
-                org_policies::table
-                    .inner_join(
-                        users_organizations::table.on(users_organizations::org_uuid
-                            .eq(org_policies::org_uuid)
-                            .and(users_organizations::user_uuid.eq(user_uuid))),
-                    )
-                    .filter(org_policies::atype.eq(OrgPolicyType::AutomaticUserConfirmation as i32))
-                    .filter(org_policies::enabled.eq(true))
-                    .select(users_organizations::all_columns)
-                    .load::<Membership>(conn)
-                    .map_res("Error loading memberships by org_policy")
-            })
-            .await?;
+        conn.run(move |conn| Self::load_for_user(user_uuid, conn)).await
+    }
+
+    pub(super) fn load_for_user(user_uuid: &UserId, conn: &mut DbConnInner) -> ApiResult<Self> {
+        let members = org_policies::table
+            .inner_join(
+                users_organizations::table.on(users_organizations::org_uuid
+                    .eq(org_policies::org_uuid)
+                    .and(users_organizations::user_uuid.eq(user_uuid))),
+            )
+            .filter(org_policies::atype.eq(OrgPolicyType::AutomaticUserConfirmation as i32))
+            .filter(org_policies::enabled.eq(true))
+            .select(users_organizations::all_columns)
+            .load::<Membership>(conn)
+            .map_res("Error loading memberships by org_policy")?;
         Ok(Self(
             members
                 .into_iter()

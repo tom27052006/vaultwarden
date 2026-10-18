@@ -52,10 +52,6 @@ impl EmergencyAccess {
         Ok(removed)
     }
 
-    pub async fn take_all_by_user(user_id: &UserId, conn: &DbConn) -> ApiResult<Vec<Self>> {
-        conn.run(move |conn| conn.transaction(|conn| Self::delete_for_users(std::slice::from_ref(user_id), conn))).await
-    }
-
     pub fn new(grantor_uuid: UserId, email: String, status: i32, atype: i32, wait_time_days: i32) -> Self {
         let now = Utc::now().naive_utc();
 

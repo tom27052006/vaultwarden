@@ -11,6 +11,7 @@ mod sends;
 
 pub use accounts::purge_auth_requests;
 pub use ciphers::{CipherData, CipherSyncData, CipherSyncType, purge_trashed_ciphers};
+pub(crate) use emergency_access::notify_removed_emergency_access;
 pub use emergency_access::{emergency_notification_reminder_job, emergency_request_timeout_job};
 pub use events::{event_cleanup_job, log_event, log_user_event};
 pub use sends::purge_sends;
@@ -24,7 +25,7 @@ use crate::{
     auth::Headers,
     db::{
         DbConn,
-        models::{Membership, MembershipStatus, MembershipType, OrgPolicy, OrgPolicyType, Organization, User, UserId},
+        models::{Membership, MembershipStatus, MembershipType, OrgPolicy, Organization, User, UserId},
     },
     error::Error,
     http_client::make_http_request,
@@ -306,13 +307,28 @@ pub async fn notify_pending_auto_confirm(member: &Membership, conn: &DbConn, nt:
 }
 
 /// Accepts all invitations at once and notifies for each; used when mail is disabled.
-pub async fn accept_user_invitations(user_id: &UserId, conn: &DbConn, nt: &Notify<'_>) -> EmptyResult {
+pub async fn accept_user_invitations(
+    user_id: &UserId,
+    conn: &DbConn,
+    nt: &Notify<'_>,
+    continue_on_error: bool,
+) -> EmptyResult {
     let invited = Membership::find_invited_by_user(user_id, conn).await;
 
     for mut member in invited {
         member.status = MembershipStatus::Accepted as i32;
-        enforce_membership_policies(&member, "join", conn).await?;
-        member.accept_invitation(conn).await?;
+        let result = async {
+            enforce_membership_policies(&member, "join", conn).await?;
+            member.accept_invitation(conn).await
+        }
+        .await;
+        if let Err(e) = result {
+            if !continue_on_error {
+                return Err(e);
+            }
+            warn!("Not accepting organization invitation {} after registration: {e:?}", member.uuid);
+            continue;
+        }
         notify_pending_auto_confirm(&member, conn, nt).await;
     }
 
@@ -323,9 +339,7 @@ pub async fn accept_user_invitations(user_id: &UserId, conn: &DbConn, nt: &Notif
 pub async fn enforce_membership_policies(member: &Membership, action: &str, conn: &DbConn) -> EmptyResult {
     if member.counts_for_auto_confirm() {
         OrgPolicy::check_user_allowed(member, action, conn).await?;
-        if OrgPolicy::is_enabled(&member.org_uuid, OrgPolicyType::AutomaticUserConfirmation, conn).await? {
-            emergency_access::delete_all_emergency_access_of_user(&member.user_uuid, conn).await?;
-        }
+        // Policy 18 is rechecked and Emergency Access is removed in the membership transaction.
     }
     Ok(())
 }
@@ -347,7 +361,7 @@ async fn accept_org_invite(
     // This check is also done at accept_invite, _confirm_invite, _activate_member, edit_member, admin::update_membership_type
     enforce_membership_policies(&member, "join", conn).await?;
 
-    member.save(conn).await?;
+    member.accept_invitation(conn).await?;
 
     notify_pending_auto_confirm(&member, conn, nt).await;
 
