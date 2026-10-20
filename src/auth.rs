@@ -860,7 +860,6 @@ impl<'r> FromRequest<'r> for OrgHeaders {
 }
 
 pub struct AdminHeaders {
-    pub host: String,
     pub device: Device,
     pub user: User,
     pub membership_type: MembershipType,
@@ -882,7 +881,6 @@ impl<'r> FromRequest<'r> for AdminHeaders {
         let headers = try_outcome!(OrgHeaders::from_request(request).await);
         if headers.is_confirmed_and_admin() {
             Outcome::Success(Self {
-                host: headers.host,
                 device: headers.device,
                 user: headers.user,
                 membership_type: headers.membership_type,
@@ -902,6 +900,7 @@ macro_rules! permission_headers {
         $(#[$doc])*
         #[allow(dead_code, reason = "Not every route reads every field")]
         pub struct $name {
+            pub host: String,
             pub device: Device,
             pub user: User,
             pub membership_type: MembershipType,
@@ -918,6 +917,7 @@ macro_rules! permission_headers {
                 let headers = try_outcome!(OrgHeaders::from_request(request).await);
                 if headers.is_confirmed_and_admin() || headers.membership.has_custom_permission($permission) {
                     Outcome::Success(Self {
+                        host: headers.host,
                         device: headers.device,
                         user: headers.user,
                         membership_type: headers.membership_type,
@@ -947,6 +947,16 @@ permission_headers!(
     /// For the routes that manage the groups of an organization.
     ManageGroupsHeaders,
     CustomPermission::ManageGroups
+);
+permission_headers!(
+    /// For the routes that read the event logs of an organization.
+    AccessEventLogsHeaders,
+    CustomPermission::AccessEventLogs
+);
+permission_headers!(
+    /// For the routes that export the vault of an organization.
+    AccessImportExportHeaders,
+    CustomPermission::AccessImportExport
 );
 
 // col_id is usually the fourth path param ("/organizations/<org_id>/collections/<col_id>"),
