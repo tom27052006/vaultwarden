@@ -2102,7 +2102,7 @@ async fn put_policy(
                 }
 
                 log_event(
-                    EventType::OrganizationUserRemoved,
+                    EventType::OrganizationUserRevokedSingleOrganizationNonCompliance,
                     &member.uuid,
                     &org_id,
                     &headers.user.uuid,
