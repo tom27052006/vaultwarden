@@ -2135,7 +2135,7 @@ async fn put_policy(
     }
 
     // When enabling the TwoFactorAuthentication policy, revoke all members that do not have 2FA
-    if pol_type_enum == OrgPolicyType::TwoFactorAuthentication && data.enabled {
+    if pol_type_enum == OrgPolicyType::TwoFactorAuthentication && data.enabled && !is_currently_enabled {
         two_factor::enforce_2fa_policy_for_org(
             &org_id,
             &headers.user.uuid,
@@ -2146,23 +2146,27 @@ async fn put_policy(
         .await?;
     }
 
-    // When enabling the SingleOrg policy, remove this org's members that are members of other orgs
-    if pol_type_enum == OrgPolicyType::SingleOrg && data.enabled {
+    // Match upstream: enforce SingleOrg only when it transitions from disabled to enabled.
+    if pol_type_enum == OrgPolicyType::SingleOrg && data.enabled && !is_currently_enabled {
         for mut member in Membership::find_by_org(&org_id, &conn).await {
-            // Policy only applies to non-Owner/non-Admin members who have accepted joining the org
-            // Exclude invited and revoked users when checking for this policy.
-            // Those users will not be allowed to accept or be activated because of the policy checks done there.
+            // Only active non-admin members other than the actor are eligible.
             if member.atype < MembershipType::Admin
-                && member.status != MembershipStatus::Invited as i32
-                && Membership::count_accepted_and_confirmed_by_user(&member.user_uuid, &member.org_uuid, &conn).await
-                    > 0
+                && matches!(
+                    MembershipStatus::from_i32(member.status),
+                    Some(MembershipStatus::Accepted | MembershipStatus::Confirmed)
+                )
+                && member.user_uuid != headers.user.uuid
+                && Membership::has_other_org_membership_for_single_org_policy(
+                    &member.user_uuid,
+                    &member.org_uuid,
+                    &conn,
+                )
+                .await
             {
-                if CONFIG.mail_enabled() {
-                    let org = Organization::find_by_uuid(&member.org_uuid, &conn).await.unwrap();
-                    let user = User::find_by_uuid(&member.user_uuid, &conn).await.unwrap();
-
-                    mail::send_single_org_removed_from_org(&user.email, &org.name).await?;
+                if !member.revoke() {
+                    continue;
                 }
+                member.save(&conn).await?;
 
                 log_event(
                     EventType::OrganizationUserRemoved,
@@ -2175,8 +2179,12 @@ async fn put_policy(
                 )
                 .await;
 
-                member.revoke();
-                member.save(&conn).await?;
+                if CONFIG.mail_enabled() {
+                    let org = Organization::find_by_uuid(&member.org_uuid, &conn).await.unwrap();
+                    let user = User::find_by_uuid(&member.user_uuid, &conn).await.unwrap();
+
+                    mail::send_single_org_removed_from_org(&user.email, &org.name).await?;
+                }
             }
         }
     }

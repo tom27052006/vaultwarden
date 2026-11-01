@@ -886,6 +886,30 @@ impl Membership {
         .await
     }
 
+    /// When enabling SingleOrg, upstream also considers memberships revoked in other organizations.
+    pub async fn has_other_org_membership_for_single_org_policy(
+        user_uuid: &UserId,
+        excluded_org: &OrganizationId,
+        conn: &DbConn,
+    ) -> bool {
+        conn.run(move |conn| {
+            users_organizations::table
+                .filter(users_organizations::user_uuid.eq(user_uuid))
+                .filter(users_organizations::org_uuid.ne(excluded_org))
+                .filter(
+                    users_organizations::status
+                        .eq(MembershipStatus::Accepted as i32)
+                        .or(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
+                        .or(users_organizations::status.lt(MembershipStatus::Invited as i32)),
+                )
+                .count()
+                .first::<i64>(conn)
+                .unwrap_or(0)
+                > 0
+        })
+        .await
+    }
+
     pub async fn find_by_org(org_uuid: &OrganizationId, conn: &DbConn) -> Vec<Self> {
         conn.run(move |conn| {
             users_organizations::table
