@@ -29,9 +29,9 @@ use crate::{
     db::{
         DbConn,
         models::{
-            AuthRequest, AuthRequestId, Device, DeviceId, DeviceType, EventType, Invitation, OIDCCodeResponseError,
-            OrganizationApiKey, OrganizationId, SendId, SsoAuth, SsoUser, TwoFactor, TwoFactorIncomplete,
-            TwoFactorType, User, UserId,
+            AuthRequest, AuthRequestId, Device, DeviceId, DeviceType, EventType, Invitation, Membership,
+            MembershipStatus, OIDCCodeResponseError, OrgPolicy, Organization, OrganizationApiKey, OrganizationId,
+            SendId, SsoAuth, SsoUser, TwoFactor, TwoFactorIncomplete, TwoFactorType, User, UserId,
         },
     },
     error::MapResult,
@@ -378,7 +378,7 @@ async fn sso_login(
     // We passed 2FA get auth tokens
     let auth_tokens = sso::redeem(&device, &user, data.client_id, sso_user, sso_auth, user_infos, conn).await?;
 
-    authenticated_response(&user, &mut device, auth_tokens, twofactor_token, conn, ip).await
+    authenticated_response(&user, &mut device, auth_tokens, twofactor_token, true, conn, ip).await
 }
 
 async fn password_login(
@@ -418,16 +418,10 @@ async fn password_login(
             )
         };
 
-        let expiration_time = auth_request.creation_date + chrono::Duration::minutes(5);
-        let request_expired = Utc::now().naive_utc() >= expiration_time;
-
-        if auth_request.user_uuid != user.uuid
-            || !auth_request.approved.unwrap_or(false)
-            || auth_request.authentication_date.is_some()
-            || request_expired
-            || ip.ip.to_string() != auth_request.request_ip
-            || !auth_request.check_access_code(password)
-        {
+        // Like upstream, only a request that asked to authenticate can be used to log in. An unlock request or an
+        // administrator's approval only hands the asking device the user key. Unlike upstream, the login has to come
+        // from the IP that asked, within five minutes.
+        if !auth_request.is_valid_for_login(&user.uuid, password) || ip.ip.to_string() != auth_request.request_ip {
             err!(
                 "Username or access code is incorrect. Try again",
                 format!("IP: {}. Username: {log_username}.", ip.ip),
@@ -450,6 +444,20 @@ async fn password_login(
     if !user.enabled {
         err!(
             "This user has been disabled",
+            format!("IP: {}. Username: {log_username}.", ip.ip),
+            ErrorEvent {
+                event: EventType::UserFailedLogIn
+            }
+        )
+    }
+
+    // An account without a master password only exists through SSO, so it logs in with SSO, also with an approved auth
+    // request. Upstream gets there with its Require SSO policy, which it turns on together with trusted devices. Checked
+    // after the credentials, so that only someone with a valid auth request learns that the account needs SSO.
+    // Ref: <https://github.com/bitwarden/server/blob/462476e92ee9bb608a94fa2f30d5f0fe5021b6d1/src/Identity/IdentityServer/RequestValidators/SsoRequestValidator.cs#L27-L66>
+    if CONFIG.sso_enabled() && user.password_hash.is_empty() {
+        err!(
+            "SSO sign-in is required",
             format!("IP: {}. Username: {log_username}.", ip.ip),
             ErrorEvent {
                 event: EventType::UserFailedLogIn
@@ -517,7 +525,91 @@ async fn password_login(
 
     let auth_tokens = auth::AuthTokens::new(&device, &user, AuthMethod::Password, data.client_id);
 
-    authenticated_response(&user, &mut device, auth_tokens, twofactor_token, conn, ip).await
+    authenticated_response(&user, &mut device, auth_tokens, twofactor_token, false, conn, ip).await
+}
+
+/// Not upstream: why the account creation that a client runs for an account without a master password or admin
+/// approval would fail, if it would. The client posts new keys, enrolls into the account recovery of the organization
+/// that `auto-enroll-status` names, which accepts the invitation, and then trusts the device. Upstream turns on the
+/// policies this needs together with trusted devices. Here an administrator sets them, and a failure would leave keys
+/// that nothing unlocks, as the web vault can't approve devices.
+async fn account_creation_blocker(user: &User, conn: &DbConn) -> Option<&'static str> {
+    if user.private_key.is_some() || user.public_key.is_some() {
+        return Some("its keys exist, but neither this device, a master password nor account recovery unlocks them");
+    }
+
+    let Some(mut membership) = Membership::find_main_user_org(&user.uuid, conn).await else {
+        return Some("it is no member of an organization");
+    };
+    // The enrollment needs the policy, and automatic enrollment keeps the account from withdrawing, as upstream's
+    if !OrgPolicy::org_is_reset_password_auto_enroll(&membership.org_uuid, conn).await {
+        return Some("its organization has no account recovery policy with automatic enrollment, or email is disabled");
+    }
+    if Organization::find_by_uuid(&membership.org_uuid, conn)
+        .await
+        .is_none_or(|org| org.public_key.is_none_or(|key| key.is_empty()))
+    {
+        return Some("its organization has no keys");
+    }
+    // The enrollment accepts the invitation, see `put_reset_password_enrollment`
+    if membership.status == MembershipStatus::Invited as i32 && !CONFIG.sso_allow_unknown_email_verification() {
+        membership.status = MembershipStatus::Accepted as i32;
+        if !OrgPolicy::is_user_allowed(&membership, "join", conn).await {
+            return Some("a policy refuses its invitation");
+        }
+    }
+
+    None
+}
+
+/// Like upstream, `SSO_TRUSTED_DEVICE_ENCRYPTION` standing for the member decryption type of the SSO organization.
+/// SSO is configured for the whole server, so every membership counts as that organization's.
+/// Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Identity/IdentityServer/UserDecryptionOptionsBuilder.cs>
+async fn trusted_device_option(user: &User, device: &Device, conn: &DbConn) -> Option<Value> {
+    let is_tde_active = CONFIG.sso_trusted_device_encryption();
+    let has_master_password = !user.password_hash.is_empty();
+    let is_tde_offboarding = !has_master_password && device.is_trusted() && !is_tde_active;
+    if !is_tde_active && !is_tde_offboarding {
+        return None;
+    }
+
+    let (encrypted_private_key, encrypted_user_key) = if device.is_trusted() {
+        (device.encrypted_private_key.as_ref(), device.encrypted_user_key.as_ref())
+    } else {
+        (None, None)
+    };
+
+    let has_login_approving_device = Device::find_by_user(&user.uuid, conn)
+        .await
+        .iter()
+        .any(|other| other.uuid != device.uuid && DeviceType::can_approve_login_requests(other.atype));
+
+    // Like upstream, every active membership counts, so an admin provisioned by their first SSO login is asked for a
+    // master password before anyone confirms them
+    let memberships = Membership::find_by_user(&user.uuid, conn).await;
+    let has_manage_reset_password_permission =
+        memberships.iter().any(|membership| membership.is_not_revoked() && membership.has_manage_reset_password_role());
+    // They are only able to be approved by an admin if they have enrolled in account recovery
+    let has_admin_approval = memberships.iter().any(Membership::is_enrolled_in_account_recovery);
+
+    if is_tde_active
+        && !device.is_trusted()
+        && !has_master_password
+        && !has_admin_approval
+        && let Some(reason) = account_creation_blocker(user, conn).await
+    {
+        warn!("Trusted device encryption isn't offered to the account of {}, as {reason}", user.email);
+        return None;
+    }
+
+    Some(json!({
+        "HasAdminApproval": has_admin_approval,
+        "HasLoginApprovingDevice": has_login_approving_device,
+        "HasManageResetPasswordPermission": has_manage_reset_password_permission,
+        "IsTdeOffboarding": is_tde_offboarding,
+        "EncryptedPrivateKey": encrypted_private_key,
+        "EncryptedUserKey": encrypted_user_key,
+    }))
 }
 
 /// Like upstream's `ClientVersionValidator`, every login needs the `Bitwarden-Client-Version` header, and a V2 account
@@ -585,6 +677,7 @@ async fn authenticated_response(
     device: &mut Device,
     auth_tokens: auth::AuthTokens,
     twofactor_token: Option<String>,
+    sso_login: bool,
     conn: &DbConn,
     ip: &ClientIp,
 ) -> JsonResult {
@@ -635,6 +728,16 @@ async fn authenticated_response(
 
     let account_keys = user.account_keys_json(conn).await;
 
+    let mut user_decryption_options = json!({
+        "HasMasterPassword": has_master_password,
+        "MasterPasswordUnlock": master_password_unlock,
+        "Object": "userDecryptionOptions"
+    });
+
+    if sso_login && let Some(option) = trusted_device_option(user, device, conn).await {
+        user_decryption_options["TrustedDeviceOption"] = option;
+    }
+
     let mut result = json!({
         "access_token": auth_tokens.access_token(),
         "expires_in": auth_tokens.expires_in(),
@@ -649,11 +752,7 @@ async fn authenticated_response(
         "MasterPasswordPolicy": master_password_policy,
         "scope": auth_tokens.scope(),
         "AccountKeys": account_keys,
-        "UserDecryptionOptions": {
-            "HasMasterPassword": has_master_password,
-            "MasterPasswordUnlock": master_password_unlock,
-            "Object": "userDecryptionOptions"
-        },
+        "UserDecryptionOptions": user_decryption_options,
     });
 
     if !user.akey.is_empty() {

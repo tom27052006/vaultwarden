@@ -92,13 +92,11 @@ async fn send_email_login(data: Json<SendEmailLoginData>, client_headers: Client
                 err!("AuthRequest doesn't exist", "Invalid auth request or does not belong to user")
             };
 
-            let request_expired = Utc::now().naive_utc() >= auth_request.creation_date + TimeDelta::minutes(5);
-            if !auth_request.approved.unwrap_or(false)
-                || auth_request.authentication_date.is_some()
-                || request_expired
+            // Like upstream, only a request that can log in, and unlike upstream, from the device type and IP that asked,
+            // within five minutes
+            if !auth_request.is_valid_for_login(&user.uuid, code)
                 || auth_request.device_type != client_headers.device_type
                 || auth_request.request_ip != client_headers.ip.ip.to_string()
-                || !auth_request.check_access_code(code)
             {
                 err!(
                     "AuthRequest doesn't exist",

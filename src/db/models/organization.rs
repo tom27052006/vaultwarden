@@ -24,8 +24,8 @@ use crate::{
 use macros::UuidFromParam;
 
 use super::{
-    Cipher, CipherId, Collection, CollectionId, CollectionUser, Group, GroupId, GroupUser, KeyId, OrgPolicy,
-    OrgPolicyType, TwoFactor, User, UserId,
+    AuthRequest, Cipher, CipherId, Collection, CollectionId, CollectionUser, Group, GroupId, GroupUser, KeyId,
+    OrgPolicy, OrgPolicyType, TwoFactor, User, UserId,
 };
 
 /// A membership whose account recovery key still wraps the member's V1 user key: an upgrade to V2 encryption can't
@@ -479,6 +479,22 @@ impl Membership {
         }
     }
 
+    /// Revoking moves the status out of the range `MembershipStatus::from_i32` knows.
+    pub fn is_not_revoked(&self) -> bool {
+        MembershipStatus::from_i32(self.status).is_some()
+    }
+
+    /// Owners and Admins hold the account recovery permission by their role, Custom members when granted. Unlike
+    /// `ManageResetPasswordHeaders`, any status counts.
+    pub fn has_manage_reset_password_role(&self) -> bool {
+        self.atype >= MembershipType::Admin || self.grants_custom_permission(CustomPermission::ManageResetPassword)
+    }
+
+    /// Like upstream's `IsEnrolledInAccountRecovery`
+    pub fn is_enrolled_in_account_recovery(&self) -> bool {
+        self.reset_password_key.as_ref().is_some_and(|key| !key.trim().is_empty())
+    }
+
     fn custom_permission_mut(&mut self, permission: CustomPermission) -> &mut bool {
         match permission {
             CustomPermission::ManageUsers => &mut self.manage_users,
@@ -717,6 +733,8 @@ impl Organization {
     }
 
     pub async fn delete(self, conn: &DbConn) -> EmptyResult {
+        // First, as their foreign key would refuse the deletion of the organization after everything else is gone
+        AuthRequest::delete_all_by_organization(&self.uuid, conn).await?;
         Cipher::delete_all_by_organization(&self.uuid, conn).await?;
         Collection::delete_all_by_organization(&self.uuid, conn).await?;
         Membership::delete_all_by_organization(&self.uuid, conn).await?;
@@ -1573,7 +1591,7 @@ impl Membership {
         conn.run(move |conn| {
             users_organizations::table
                 .filter(users_organizations::user_uuid.eq(user_uuid))
-                .filter(users_organizations::status.ne(MembershipStatus::Revoked as i32))
+                .filter(users_organizations::status.ge(MembershipStatus::Invited as i32))
                 .order(users_organizations::atype.asc())
                 .first::<Self>(conn)
                 .ok()
@@ -1847,5 +1865,40 @@ mod tests {
         assert!(empty.shown_custom_permissions().is_empty());
         assert!(!empty.can_list_all_collections() && !empty.can_list_all_ciphers());
         test_flag::CUSTOM_ROLES_ENABLED.set(None);
+    }
+
+    #[test]
+    fn the_account_recovery_role_counts_for_every_active_membership() {
+        let mut membership = Membership::new(String::from("user").into(), String::from("org").into(), None);
+        test_flag::CUSTOM_ROLES_ENABLED.set(Some(true));
+
+        for (atype, holds_role) in [(Owner, true), (Admin, true), (Manager, false), (User, false)] {
+            membership.atype = atype as i32;
+            for status in [MembershipStatus::Invited, MembershipStatus::Accepted, MembershipStatus::Confirmed] {
+                membership.status = status as i32;
+                assert!(membership.is_not_revoked());
+                assert_eq!(membership.has_manage_reset_password_role(), holds_role);
+                assert!(membership.revoke());
+                assert!(!membership.is_not_revoked());
+            }
+        }
+
+        membership.atype = Custom as i32;
+        membership.status = MembershipStatus::Invited as i32;
+        membership.manage_reset_password = true;
+        for enabled in [true, false] {
+            test_flag::CUSTOM_ROLES_ENABLED.set(Some(enabled));
+            assert_eq!(membership.has_manage_reset_password_role(), enabled);
+        }
+        test_flag::CUSTOM_ROLES_ENABLED.set(None);
+    }
+
+    #[test]
+    fn an_empty_reset_password_key_is_no_enrollment() {
+        let mut membership = Membership::new(String::from("user").into(), String::from("org").into(), None);
+        for (key, enrolled) in [(None, false), (Some(""), false), (Some("  "), false), (Some("4.a2V5"), true)] {
+            membership.reset_password_key = key.map(String::from);
+            assert_eq!(membership.is_enrolled_in_account_recovery(), enrolled, "{key:?}");
+        }
     }
 }

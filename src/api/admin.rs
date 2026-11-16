@@ -501,7 +501,8 @@ async fn deauth_user(user_id: UserId, _token: AdminToken, conn: DbConn, nt: Noti
         }
     }
 
-    Device::delete_all_by_user(&user.uuid, &conn).await?;
+    // Keeps the devices, so that trusted devices still unlock after the next login
+    Device::end_sessions_by_user(&user.uuid, &conn).await?;
     user.reset_security_stamp(&conn).await?;
 
     user.save(&conn).await
@@ -517,7 +518,8 @@ async fn disable_user(user_id: UserId, _token: AdminToken, conn: DbConn, nt: Not
 
     nt.send_logout(&user, None, &conn).await;
 
-    Device::delete_all_by_user(&user.uuid, &conn).await?;
+    // Keeps the devices, so that trusted devices still unlock once the user is enabled again
+    Device::end_sessions_by_user(&user.uuid, &conn).await?;
 
     save_result
 }

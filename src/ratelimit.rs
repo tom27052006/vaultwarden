@@ -27,6 +27,13 @@ static LIMITER_UNAUTHENTICATED: LazyLock<Limiter> = LazyLock::new(|| {
     )
 });
 
+// Close to upstream's limit on every POST request of an IP, 5 a second and 60 a minute: bursts of 5, then one a second
+// Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Api/appsettings.json>
+static LIMITER_ADMIN_AUTH_REQUEST: LazyLock<Limiter> = LazyLock::new(|| {
+    let burst = NonZeroU32::new(5).expect("Non-zero admin auth request burst");
+    RateLimiter::keyed(Quota::per_second(NonZeroU32::MIN).allow_burst(burst))
+});
+
 pub fn check_limit_unauthenticated(ip: &IpAddr) -> Result<(), Error> {
     match LIMITER_UNAUTHENTICATED.check_key(ip) {
         Ok(()) => Ok(()),
@@ -50,6 +57,16 @@ pub fn check_limit_admin(ip: &IpAddr) -> Result<(), Error> {
         Ok(()) => Ok(()),
         Err(_e) => {
             err_code!("Too many admin requests", 429);
+        }
+    }
+}
+
+/// The admin approval requests, each of which mails the approvers of the organizations
+pub fn check_limit_admin_auth_request(ip: &IpAddr) -> Result<(), Error> {
+    match LIMITER_ADMIN_AUTH_REQUEST.check_key(ip) {
+        Ok(()) => Ok(()),
+        Err(_e) => {
+            err_code!("Too many requests", 429);
         }
     }
 }
