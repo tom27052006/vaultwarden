@@ -118,6 +118,23 @@ fn sanitize_data(data: &mut serde_json::Value) {
     }
 }
 
+/// Like upstream's `CoreHelpers.SanitizeForEmail`, so that a mail client doesn't turn a name someone chose into a link
+/// Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Core/Utilities/CoreHelpers.cs>
+fn sanitize_for_email(value: &str) -> String {
+    use regex::Regex;
+    use std::sync::LazyLock;
+    static DOT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\.\w").unwrap());
+    static SCHEME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(^|\b)\w*://").unwrap());
+
+    let value = value.replace('@', "[at]");
+    let mut value =
+        DOT.replace_all(&value, |caps: &regex::Captures<'_>| format!("[dot]{}", &caps[0][1..])).into_owned();
+    while SCHEME.is_match(&value) {
+        value = SCHEME.replace_all(&value, "").into_owned();
+    }
+    value
+}
+
 fn get_text(template_name: &'static str, data: serde_json::Value) -> Result<(String, String, String), Error> {
     let mut data = data;
     sanitize_data(&mut data);
@@ -537,6 +554,47 @@ pub async fn send_recover_twofactor(address: &str, ip: &str, dt: &NaiveDateTime)
     send_email(address, &subject, body_html, body_text).await
 }
 
+/// Like upstream's `SendDeviceApprovalRequestedNotificationEmailAsync`
+pub async fn send_device_approval_requested(
+    address: &str,
+    org_id: &OrganizationId,
+    user_email: &str,
+    user_name: &str,
+) -> EmptyResult {
+    let (subject, body_html, body_text) = get_text(
+        "email/device_approval_requested",
+        json!({
+            "url": format!("{}/#/organizations/{}/settings/device-approvals", CONFIG.domain(), org_id),
+            "img_src": CONFIG._smtp_img_src(),
+            "user": if user_name.is_empty() { user_email.to_owned() } else { sanitize_for_email(user_name) },
+        }),
+    )?;
+
+    send_email(address, &subject, body_html, body_text).await
+}
+
+/// Like upstream's `SendTrustedDeviceAdminApprovalEmailAsync`
+pub async fn send_trusted_device_admin_approval(
+    address: &str,
+    dt: &NaiveDateTime,
+    ip: &str,
+    device_type: &str,
+) -> EmptyResult {
+    let fmt = "%A, %B %_d, %Y at %r %Z";
+    let (subject, body_html, body_text) = get_text(
+        "email/trusted_device_admin_approval",
+        json!({
+            "url": CONFIG.domain(),
+            "img_src": CONFIG._smtp_img_src(),
+            "datetime": crate::util::format_naive_datetime_local(dt, fmt),
+            "ip": ip,
+            "device_type": device_type,
+        }),
+    )?;
+
+    send_email(address, &subject, body_html, body_text).await
+}
+
 pub async fn send_incomplete_2fa_login(
     address: &str,
     ip: &str,
@@ -755,4 +813,22 @@ async fn send_email(address: &str, subject: &str, body_html: String, body_text: 
         .multipart(body)?;
 
     send_with_selected_transport(email).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_for_email;
+
+    #[test]
+    fn a_chosen_name_cannot_become_a_link() {
+        for (name, sanitized) in [
+            ("Jane Doe", "Jane Doe"),
+            ("jane@example.com", "jane[at]example[dot]com"),
+            ("Approve at evil.example/approve", "Approve at evil[dot]example/approve"),
+            ("https://evil.example", "evil[dot]example"),
+            ("hthttp://tp://evil", "evil"),
+        ] {
+            assert_eq!(sanitize_for_email(name), sanitized, "{name}");
+        }
+    }
 }

@@ -1527,12 +1527,14 @@ pub async fn refresh_tokens(
         err!("Invalid refresh token")
     };
 
-    // Save to update `updated_at`.
-    device.save(true, conn).await?;
-
+    // Read before the save below, which only succeeds while the refresh token is still the device's: a logout or a
+    // security stamp change after that save leaves the tokens below with a stamp that is no longer the user's.
     let Some(user) = User::find_by_uuid(&device.user_uuid, conn).await else {
         err!("Impossible to find user")
     };
+
+    // Save to update `updated_at`.
+    device.save(true, conn).await?;
 
     let auth_tokens = match refresh_claims.sub {
         AuthMethod::Sso if CONFIG.sso_enabled() && CONFIG.sso_auth_only_not_session() => {

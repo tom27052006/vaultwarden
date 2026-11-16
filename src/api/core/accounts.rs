@@ -13,7 +13,9 @@ use crate::{
     CONFIG,
     api::{
         AnonymousNotify, ApiResult, EmptyResult, JsonResult, LogOutReason, Notify, PasswordOrOtpData,
-        core::{accept_org_invite, log_user_event, two_factor::email},
+        core::{
+            accept_org_invite, log_event, log_user_event, log_user_event_including_accepted_orgs, two_factor::email,
+        },
         master_password_policy, push_logout_to_relay, register_push_device, unregister_push_device,
     },
     auth::{ClientHeaders, ClientIp, Headers, decode_delete, decode_invite, decode_verify_email},
@@ -21,14 +23,14 @@ use crate::{
     db::{
         DbConn, DbPool,
         models::{
-            AuthRequest, AuthRequestId, Cipher, CipherId, Device, DeviceId, DeviceWithAuthRequest, EmergencyAccess,
-            EmergencyAccessId, EventType, Folder, FolderId, Invitation, KeyId, Membership, MembershipId, OrgPolicy,
-            OrgPolicyType, Organization, OrganizationId, Send, SendId, SignatureAlgorithm, User, UserId, UserKdfType,
-            UserSignatureKeyPair,
+            AuthRequest, AuthRequestId, AuthRequestType, Cipher, CipherId, Device, DeviceId, DeviceType,
+            DeviceWithAuthRequest, EmergencyAccess, EmergencyAccessId, EventType, Folder, FolderId, Invitation, KeyId,
+            Membership, MembershipId, MembershipStatus, OrgPolicy, OrgPolicyType, Organization, OrganizationId, Send,
+            SendId, SignatureAlgorithm, SsoUser, User, UserId, UserKdfType, UserSignatureKeyPair,
         },
     },
     mail,
-    util::{NumberOrString, deser_opt_nonempty_str, format_date},
+    util::{NumberOrString, deser_opt_nonempty_str, format_date, validate_enc_string},
 };
 
 use super::{
@@ -48,6 +50,7 @@ pub fn routes() -> Vec<rocket::Route> {
         post_keys,
         post_password,
         post_set_password,
+        put_update_tde_offboarding_password,
         post_kdf,
         get_key_rotation_data,
         post_rotatekey,
@@ -74,8 +77,16 @@ pub fn routes() -> Vec<rocket::Route> {
         put_device_token,
         put_clear_device_token,
         post_clear_device_token,
+        put_device_keys,
+        post_device_keys,
+        post_device_retrieve_keys,
+        post_devices_untrust,
+        post_devices_lost_trust,
+        delete_device,
+        post_deactivate_device,
         get_tasks,
         post_auth_request,
+        post_admin_auth_request,
         get_auth_request,
         put_auth_request,
         get_auth_request_response,
@@ -577,7 +588,9 @@ pub async fn register(data: Json<RegisterData>, conn: DbConn) -> JsonResult {
     let is_new_user = existing_user.is_none();
     let mut user = match existing_user {
         Some(user) => {
-            if !user.password_hash.is_empty() {
+            // Only an invited or SSO provisioned stub registers. A trusted device account has keys but no master
+            // password, and registering would replace both. Like upstream, which never registers an existing user.
+            if !user.password_hash.is_empty() || user.private_key.is_some() || user.public_key.is_some() {
                 err!("Registration not allowed or user already exists")
             }
 
@@ -714,8 +727,9 @@ async fn post_set_password(data: Json<Value>, headers: Headers, conn: DbConn) ->
     }
     let mut user = headers.user;
 
-    if user.private_key.is_some() || !user.password_hash.is_empty() {
-        err!("Account already initialized, cannot set password")
+    // A trusted device account has its keys but no master password yet
+    if !user.password_hash.is_empty() {
+        err!("User already has a master password set.")
     }
 
     if data.compat.unprocessable(&user.email) {
@@ -729,7 +743,7 @@ async fn post_set_password(data: Json<Value>, headers: Headers, conn: DbConn) ->
 
     // Like upstream, `accountKeys` only through the v2 JIT flow
     // Ref: <https://github.com/bitwarden/server/blob/9030c42bf7d8f9ac2ff9fee85c39588d5eb81499/src/Api/Auth/Controllers/AccountsController.cs#L314-L359>
-    let account_keys = match data.account_keys {
+    let mut account_keys = match data.account_keys {
         Some(account_keys) => {
             if !matches!(data.compat, RegisterDataCompat::RegisterDataCur(_))
                 || !crate::util::is_client_feature_flag_enabled(
@@ -746,6 +760,33 @@ async fn post_set_password(data: Json<Value>, headers: Headers, conn: DbConn) ->
         }
         None => data.keys.map(ValidatedAccountKeys::from),
     };
+
+    // A trusted device account, which has its keys already
+    let has_keys = user.private_key.is_some() || user.public_key.is_some();
+    if has_keys {
+        // Like upstream's `KeysRequestModel.ToUser`, the account keeps the keys it has, so only the same key pair may come
+        // along. Never V2 keys, which upstream's V2 path would write over the existing ones.
+        if let Some(keys) = account_keys.take()
+            && (keys.is_v2()
+                || user.private_key.as_ref() != Some(&keys.private_key)
+                || user.public_key.as_ref() != Some(&keys.public_key))
+        {
+            err!("Cannot replace existing key(s) with new key(s).")
+        }
+
+        // Not upstream: the clients ask a trusted device account for a master password only for the account recovery
+        // permission. Upstream turns on its Require SSO policy together with trusted devices, so that a password
+        // doesn't log in past SSO for anyone else; here only `SSO_ONLY` would prevent that.
+        if !Membership::find_by_user(&user.uuid, &conn)
+            .await
+            .iter()
+            .any(|membership| membership.is_not_revoked() && membership.has_manage_reset_password_role())
+        {
+            err!(
+                "Only a member with the account recovery permission sets a master password on a trusted device account."
+            )
+        }
+    }
 
     set_kdf_data(&mut user, data.compat.kdf())?;
 
@@ -779,13 +820,19 @@ async fn post_set_password(data: Json<Value>, headers: Headers, conn: DbConn) ->
             err!("Failed to retrieve the invitation")
         };
 
-        accept_org_invite(&user, membership, None, &conn).await?;
+        // Like upstream's `TdeSetPasswordCommand`, a trusted device account keeps its membership as it is
+        if !has_keys {
+            accept_org_invite(&user, membership, None, &conn).await?;
+        }
     }
 
-    if CONFIG.mail_enabled() {
-        mail::send_welcome(&user.email.to_lowercase()).await?;
-    } else {
-        Membership::accept_user_invitations(&user.uuid, &conn).await?;
+    // A trusted device account was set up before, upstream neither welcomes it nor accepts anything for it
+    if !has_keys {
+        if CONFIG.mail_enabled() {
+            mail::send_welcome(&user.email.to_lowercase()).await?;
+        } else {
+            Membership::accept_user_invitations(&user.uuid, &conn).await?;
+        }
     }
 
     log_user_event(EventType::UserChangedPassword, &user.uuid, headers.device.atype, &headers.ip.ip, &conn).await;
@@ -799,6 +846,110 @@ async fn post_set_password(data: Json<Value>, headers: Headers, conn: DbConn) ->
     Ok(Json(json!({
       "object": "set-password",
     })))
+}
+
+/// Upstream's `UpdateTdeOffboardingPasswordRequestModel`, shaped like `ChangePassData`
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateTdeOffboardingPasswordData {
+    master_password_hint: Option<String>,
+    authentication_data: Option<AuthenticationData>,
+    unlock_data: Option<UnlockData>,
+
+    // Outdated values, might still be used by older clients
+    new_master_password_hash: Option<String>,
+    key: Option<String>,
+}
+
+/// The master password of a trusted device account once trusted devices are switched off. Upstream asks for the SSO
+/// organization's member decryption to be the master password, here that is `SSO_ENABLED` without
+/// `SSO_TRUSTED_DEVICE_ENCRYPTION`.
+/// Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Core/Auth/UserFeatures/TdeOffboardingPassword/TdeOffboardingPasswordCommand.cs>
+#[put("/accounts/update-tde-offboarding-password", data = "<data>")]
+async fn put_update_tde_offboarding_password(
+    data: Json<UpdateTdeOffboardingPasswordData>,
+    headers: Headers,
+    conn: DbConn,
+    nt: Notify<'_>,
+) -> EmptyResult {
+    let data = data.into_inner();
+    let mut user = headers.user;
+
+    if data.master_password_hint.as_ref().is_some_and(|hint| hint.encode_utf16().count() > 50) {
+        err!("The field MasterPasswordHint must be a string with a maximum length of 50.")
+    }
+    if data.new_master_password_hash.as_ref().is_some_and(|hash| hash.encode_utf16().count() > 300) {
+        err!("The field NewMasterPasswordHash must be a string with a maximum length of 300.")
+    }
+
+    // Like upstream, the current fields win over the outdated ones
+    let (password_hash, key) = if let (Some(authentication), Some(unlock)) =
+        (data.authentication_data, data.unlock_data)
+    {
+        required(Some(authentication.master_password_authentication_hash.clone()), "MasterPasswordAuthenticationHash")?;
+        authentication.check(&user, &unlock)?;
+        // Like upstream's `KdfSettingsValidator.ValidateAuthenticationAndUnlockData`, the first master password has to
+        // meet the current KDF ranges, `set_kdf_data` below only knows the lower ones every other flow still accepts
+        unlock.kdf.validate_new_settings()?;
+        validate_enc_string("MasterKeyWrappedUserKey", Some(&unlock.master_key_wrapped_user_key))?;
+        check_tde_offboarding(&user, &conn).await?;
+        if !user.password_hash.is_empty() {
+            err!("User already has a master password set.")
+        }
+        if !user.akey.is_empty() {
+            err!("User already has a key set.")
+        }
+        set_kdf_data(&mut user, &unlock.kdf)?;
+        (authentication.master_password_authentication_hash, unlock.master_key_wrapped_user_key)
+    } else {
+        let (Some(password_hash), Some(key)) = (data.new_master_password_hash, data.key) else {
+            err!(
+                "Must provide either new payloads (UnlockData/AuthenticationData) or legacy payloads (NewMasterPasswordHash/Key)."
+            )
+        };
+        if password_hash.trim().is_empty() {
+            err!("Master password is required.")
+        }
+        if key.trim().is_empty() {
+            err!("Key is required.")
+        }
+        if !user.password_hash.is_empty() {
+            err!("User already has a master password.")
+        }
+        check_tde_offboarding(&user, &conn).await?;
+        (password_hash, key)
+    };
+
+    let password_hint = clean_password_hint(data.master_password_hint.as_ref());
+    enforce_password_hint_setting(password_hint.as_ref())?;
+
+    user.set_password(&password_hash, Some(key), true, None, &conn).await?;
+    user.password_hint = password_hint;
+    user.save(&conn).await?;
+
+    log_user_event(EventType::UserTdeOffboardingPasswordSet, &user.uuid, headers.device.atype, &headers.ip.ip, &conn)
+        .await;
+    nt.send_logout(&user, None, &conn).await;
+
+    Ok(())
+}
+
+/// The organization checks of upstream's `TdeOffboardingPasswordCommand`. SSO is configured for the whole server, so
+/// every membership counts as one of an organization with SSO, and the user's SSO link is to the only configuration.
+async fn check_tde_offboarding(user: &User, conn: &DbConn) -> EmptyResult {
+    if Membership::find_by_user(&user.uuid, conn).await.is_empty() {
+        err!("User is not part of any organization that has SSO enabled.")
+    }
+    if SsoUser::find_by_mail(&user.email, conn).await.and_then(|(_, sso_user)| sso_user).is_none() {
+        err!("User is part of no or multiple SSO configurations.")
+    }
+    if !CONFIG.sso_enabled() {
+        err!("Organization SSO configuration not found.")
+    }
+    if CONFIG.sso_trusted_device_encryption() {
+        err!("Organization SSO Member Decryption Type is not Master Password.")
+    }
+    Ok(())
 }
 
 #[get("/accounts/profile")]
@@ -953,10 +1104,7 @@ async fn post_keys(data: Json<PostKeysData>, headers: Headers, conn: DbConn) -> 
         .into(),
     };
 
-    account_keys.apply(&mut user)?;
-    // The key pair first, as in a rotation: if saving the user then fails, the account stays without keys
-    account_keys.save_signature_key_pair(&user.uuid, &conn).await?;
-    user.save(&conn).await?;
+    save_initial_account_keys(&account_keys, &mut user, &conn).await?;
 
     Ok(Json(json!({
         "key": (!user.akey.is_empty()).then_some(&user.akey),
@@ -965,6 +1113,20 @@ async fn post_keys(data: Json<PostKeysData>, headers: Headers, conn: DbConn) -> 
         "accountKeys": user.account_keys_json(&conn).await,
         "object":"keys"
     })))
+}
+
+/// Writes the first keys of the account together with its signature key pair, in one transaction like upstream's, and
+/// only while the account still has none: of two requests that set up the keys at once, only one lands, and whole.
+async fn save_initial_account_keys(account_keys: &ValidatedAccountKeys, user: &mut User, conn: &DbConn) -> EmptyResult {
+    account_keys.apply(user)?;
+
+    conn.transaction(async || {
+        if !user.save_if_keys_unset(conn).await? {
+            err!("User has existing keypair")
+        }
+        account_keys.save_signature_key_pair(&user.uuid, conn).await
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -1220,6 +1382,14 @@ struct RotateAccountUnlockData {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct UpdateDeviceKeysData {
+    device_id: DeviceId,
+    encrypted_user_key: String,
+    encrypted_public_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct MasterPasswordUnlockData {
     #[serde(flatten)]
     kdf: KDFData,
@@ -1231,7 +1401,7 @@ struct MasterPasswordUnlockData {
     contained_key_id: Option<KeyId>,
 }
 
-/// The unlock data of both rotation endpoints; passkey and device keys are ignored, as we support neither.
+/// The unlock data of both rotation endpoints; passkey keys remain unsupported.
 ///
 /// Ref: <https://github.com/bitwarden/server/blob/9030c42bf7d8f9ac2ff9fee85c39588d5eb81499/src/Api/KeyManagement/Models/Requests/CommonUnlockDataRequestModel.cs#L7-L14>
 #[derive(Deserialize)]
@@ -1241,8 +1411,7 @@ struct CommonUnlockData {
     organization_account_recovery_unlock_data: Vec<UpdateResetPasswordData>,
     #[expect(dead_code, reason = "Required like upstream, but unused")]
     passkey_unlock_data: Vec<Value>,
-    #[expect(dead_code, reason = "Required like upstream, but unused")]
-    device_key_unlock_data: Vec<Value>,
+    device_key_unlock_data: Vec<UpdateDeviceKeysData>,
     v2_upgrade_token: Option<V2UpgradeTokenData>,
 }
 
@@ -1261,6 +1430,28 @@ struct RotateAccountData {
     ciphers: Vec<CipherData>,
     folders: Vec<UpdateFolderData>,
     sends: Vec<SendData>,
+}
+
+/// The new keys of every trusted device; entries for any other device are ignored, like upstream.
+/// Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Api/KeyManagement/Validators/DeviceRotationValidator.cs>
+fn validate_device_keydata(
+    updates: &[UpdateDeviceKeysData],
+    existing_devices: &[Device],
+) -> ApiResult<Vec<(DeviceId, String, String)>> {
+    for update in updates {
+        validate_enc_string("EncryptedPublicKey", Some(&update.encrypted_public_key))?;
+        validate_enc_string("EncryptedUserKey", Some(&update.encrypted_user_key))?;
+    }
+
+    let mut rotated = Vec::new();
+    for device in existing_devices.iter().filter(|device| device.is_trusted()) {
+        let Some(update) = updates.iter().find(|update| update.device_id == device.uuid) else {
+            err!("All existing trusted devices must be included in the rotation.")
+        };
+        rotated.push((device.uuid.clone(), update.encrypted_user_key.clone(), update.encrypted_public_key.clone()));
+    }
+
+    Ok(rotated)
 }
 
 /// Body of `rotate-user-keys`, which rotates the keys without touching the master password.
@@ -1290,6 +1481,20 @@ struct UnlockMethodData {
     unlock_method: i32,
     master_password_unlock_data: Option<UnlockData>,
     key_connector_key_wrapped_user_key: Option<String>,
+}
+
+impl UnlockMethodData {
+    fn validate_tde(&self, user: &User) -> EmptyResult {
+        if self.master_password_unlock_data.is_some() || self.key_connector_key_wrapped_user_key.is_some() {
+            err!(
+                "Invalid Tde unlock method request, MasterPasswordUnlockData must be null and KeyConnectorKeyWrappedUserKey must be null"
+            )
+        }
+        if !user.password_hash.is_empty() || !user.akey.is_empty() {
+            err!("User is in an invalid state for TDE key rotation.")
+        }
+        Ok(())
+    }
 }
 
 /// Ref: <https://github.com/bitwarden/server/blob/9030c42bf7d8f9ac2ff9fee85c39588d5eb81499/src/Api/KeyManagement/Enums/UnlockMethod.cs#L3-L8>
@@ -1472,10 +1677,24 @@ async fn get_key_rotation_data(headers: Headers, conn: DbConn) -> JsonResult {
         }));
     }
 
+    let trusted_device_data: Vec<_> = Device::find_by_user(user_id, &conn)
+        .await
+        .into_iter()
+        .filter(Device::is_trusted)
+        .map(|device| {
+            json!({
+                "id": device.uuid,
+                "encryptedPublicKey": device.encrypted_public_key,
+                "encryptedUserKey": device.encrypted_user_key,
+                "object": "trustedDeviceKeyData",
+            })
+        })
+        .collect();
+
     Ok(Json(json!({
         "organizationPasswordResetKeyData": organization_data,
         "emergencyAccessKeyData": emergency_access_data,
-        "trustedDeviceKeyData": [],
+        "trustedDeviceKeyData": trusted_device_data,
         "passkeyKeyData": [],
         "object": "keyRotationData",
     })))
@@ -1518,6 +1737,29 @@ impl KDFData {
             }
         } else {
             err!("Invalid KdfType")
+        }
+        Ok(())
+    }
+
+    /// Upstream's `KdfSettingsValidator.Validate`, the ranges the KDF of a master password that is being set must be
+    /// in. Like upstream, a type it doesn't know isn't checked.
+    /// Ref: <https://github.com/bitwarden/server/blob/9c109b6b4addad5eb821e263e5cdc25657dc6563/src/Core/Utilities/KdfSettingsValidator.cs#L111-L139>
+    /// Ref: <https://github.com/bitwarden/server/blob/9c109b6b4addad5eb821e263e5cdc25657dc6563/src/Core/KeyManagement/Kdf/KdfConstants.cs#L10-L14>
+    fn validate_new_settings(&self) -> EmptyResult {
+        if self.kdf == UserKdfType::Pbkdf2 as i32 {
+            if !(600_000..=2_000_000).contains(&self.kdf_iterations) {
+                err!("KDF iterations must be between 600000 and 2000000.")
+            }
+        } else if self.kdf == UserKdfType::Argon2id as i32 {
+            if !(2..=10).contains(&self.kdf_iterations) {
+                err!("Argon2 iterations must be between 2 and 10.")
+            }
+            if !self.kdf_memory.is_some_and(|memory| (15..=1024).contains(&memory)) {
+                err!("Argon2 memory must be between 15mb and 1024mb.")
+            }
+            if !self.kdf_parallelism.is_some_and(|parallelism| (1..=16).contains(&parallelism)) {
+                err!("Argon2 parallelism must be between 1 and 16.")
+            }
         }
         Ok(())
     }
@@ -1638,6 +1880,7 @@ async fn rotate_account(data: RotateData, headers: Headers, conn: DbConn, nt: No
     // We only rotate the reset password key if it is set.
     existing_memberships.retain(|m| m.reset_password_key.is_some());
     let mut existing_sends = Send::find_by_user(user_id, &conn).await;
+    let existing_devices = Device::find_by_user(user_id, &conn).await;
 
     validate_rotation_data(
         &data,
@@ -1647,6 +1890,8 @@ async fn rotate_account(data: RotateData, headers: Headers, conn: DbConn, nt: No
         &existing_memberships,
         &existing_sends,
     )?;
+
+    let rotated_devices = validate_device_keydata(&data.unlock_data.device_key_unlock_data, &existing_devices)?;
 
     // Like upstream, a client that rotates a user key that was already replaced has to sync first
     // Ref: <https://github.com/bitwarden/server/blob/15c94ac58bf361a162381749c146d254a21b2098/src/Core/KeyManagement/UserKey/Models/Data/BaseRotateUserAccountKeysData.cs#L34-L46>
@@ -1760,6 +2005,8 @@ async fn rotate_account(data: RotateData, headers: Headers, conn: DbConn, nt: No
         }
     }
 
+    Device::update_keys_for_rotation(&headers.user.uuid, rotated_devices, &conn).await?;
+
     // Update user data
     let mut user = headers.user;
     user.v2_upgrade_token = upgrade_token;
@@ -1835,7 +2082,11 @@ async fn post_rotate_user_keys(
             validate_contained_key_id(unlock_data.contained_key_id.as_ref(), data.new_user_key_id.as_ref())?;
             unlock_data.master_key_wrapped_user_key
         }
-        Some(UnlockMethod::Tde) => err!("Trusted device encryption is not supported"),
+        Some(UnlockMethod::Tde) => {
+            data.unlock_method_data.validate_tde(&headers.user)?;
+            // A passwordless account has no master-key-wrapped user key to replace.
+            String::new()
+        }
         Some(UnlockMethod::KeyConnector) => err!("Key connector is not supported"),
         None => err!("Unrecognized unlock method"),
     };
@@ -1882,12 +2133,12 @@ async fn post_sstamp(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbCo
 
     data.validate(&mut user, true, &conn).await?;
 
+    // Ends the sessions of the devices, which are kept, so that trusted devices still unlock after the next login, as
+    // upstream's do
     user.reset_security_stamp(&conn).await?;
     let save_result = user.save(&conn).await;
 
     nt.send_logout(&user, None, &conn).await;
-
-    Device::delete_all_by_user(&user.uuid, &conn).await?;
 
     save_result
 }
@@ -2447,6 +2698,123 @@ async fn post_clear_device_token(device_id: DeviceId, ip: ClientIp, conn: DbConn
     put_clear_device_token(device_id, ip, conn).await
 }
 
+// Trusted device encryption
+// Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Api/Controllers/DevicesController.cs>
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrustedDeviceKeysData {
+    encrypted_user_key: String,
+    encrypted_public_key: String,
+    encrypted_private_key: String,
+}
+
+#[put("/devices/<device_id>/keys", data = "<data>")]
+async fn put_device_keys(
+    device_id: DeviceId,
+    data: Json<TrustedDeviceKeysData>,
+    headers: Headers,
+    conn: DbConn,
+) -> JsonResult {
+    let data = data.into_inner();
+
+    validate_enc_string("EncryptedUserKey", Some(&data.encrypted_user_key))?;
+    validate_enc_string("EncryptedPublicKey", Some(&data.encrypted_public_key))?;
+    validate_enc_string("EncryptedPrivateKey", Some(&data.encrypted_private_key))?;
+
+    let Some(mut device) = Device::find_by_uuid_and_user(&device_id, &headers.user.uuid, &conn).await else {
+        err_code!("Resource not found.", "No device found", Status::NotFound.code)
+    };
+
+    device.encrypted_user_key = Some(data.encrypted_user_key);
+    device.encrypted_public_key = Some(data.encrypted_public_key);
+    device.encrypted_private_key = Some(data.encrypted_private_key);
+    device.save_trust_keys(&conn).await?;
+
+    Ok(Json(device.to_json()))
+}
+
+#[post("/devices/<device_id>/keys", data = "<data>")]
+async fn post_device_keys(
+    device_id: DeviceId,
+    data: Json<TrustedDeviceKeysData>,
+    headers: Headers,
+    conn: DbConn,
+) -> JsonResult {
+    put_device_keys(device_id, data, headers, conn).await
+}
+
+#[post("/devices/<device_id>/retrieve-keys")]
+async fn post_device_retrieve_keys(device_id: DeviceId, headers: Headers, conn: DbConn) -> JsonResult {
+    let Some(device) = Device::find_by_uuid_and_user(&device_id, &headers.user.uuid, &conn).await else {
+        err_code!("Resource not found.", "No device found", Status::NotFound.code)
+    };
+
+    Ok(Json(device.to_protected_json()))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UntrustDevicesData {
+    devices: Vec<DeviceId>,
+}
+
+#[post("/devices/untrust", data = "<data>")]
+async fn post_devices_untrust(data: Json<UntrustDevicesData>, headers: Headers, conn: DbConn) -> EmptyResult {
+    let data = data.into_inner();
+
+    let owned: HashSet<DeviceId> =
+        Device::find_by_user(&headers.user.uuid, &conn).await.into_iter().map(|device| device.uuid).collect();
+
+    if let Some(unknown) = data.devices.iter().find(|device_id| !owned.contains(*device_id)) {
+        err_code!(
+            "Unauthorized.",
+            format!("User {} does not have access to device {unknown}", headers.user.uuid),
+            Status::Unauthorized.code
+        )
+    }
+
+    Device::untrust_many(&headers.user.uuid, data.devices, &conn).await
+}
+
+// No `POST /devices/update-trust`: no client calls it, the key rotation re-wraps the device keys, and upstream removed
+// it for that reason.
+// Ref: <https://github.com/bitwarden/server/commit/9edf11112df3de36de87b20635f9f1ac591fd883>
+
+#[expect(clippy::needless_pass_by_value, reason = "Not beneficial for Headers")]
+#[post("/devices/lost-trust")]
+fn post_devices_lost_trust(headers: Headers) -> EmptyResult {
+    error!(
+        "User {} has a device key, but didn't receive decryption keys for device {} of type {}",
+        headers.user.uuid,
+        headers.device.uuid,
+        DeviceType::from_i32(headers.device.atype)
+    );
+
+    Ok(())
+}
+
+/// Upstream deactivates the device, which hides it and drops its keys. Removing it does both here, and also ends its
+/// session, as its refresh token goes with it.
+/// Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Core/Services/Implementations/DeviceService.cs>
+#[delete("/devices/<device_id>")]
+async fn delete_device(device_id: DeviceId, headers: Headers, conn: DbConn) -> EmptyResult {
+    let Some(device) = Device::find_by_uuid_and_user(&device_id, &headers.user.uuid, &conn).await else {
+        err_code!("Resource not found.", "No device found", Status::NotFound.code)
+    };
+
+    if let Err(e) = unregister_push_device(device.push_uuid.as_ref()).await {
+        error!("Unable to unregister the device {} from the push relay: {e}", device.uuid);
+    }
+
+    device.delete(&conn).await
+}
+
+#[post("/devices/<device_id>/deactivate")]
+async fn post_deactivate_device(device_id: DeviceId, headers: Headers, conn: DbConn) -> EmptyResult {
+    delete_device(device_id, headers, conn).await
+}
+
 #[get("/tasks")]
 fn get_tasks(_client_headers: ClientHeaders) -> JsonResult {
     Ok(Json(json!({
@@ -2462,9 +2830,29 @@ struct AuthRequestRequest {
     device_identifier: DeviceId,
     email: String,
     public_key: String,
-    // Not used for now
-    // #[serde(alias = "type")]
-    // _type: i32,
+    #[serde(rename = "type")]
+    atype: Option<i32>,
+}
+
+impl AuthRequestRequest {
+    /// Upstream's `[Required]` fields, which a blank value doesn't meet either, and `[StringLength(25)]` on the access
+    /// code. A blank email or device identifier finds no user or device.
+    fn validate(&self) -> EmptyResult {
+        if self.access_code.trim().is_empty()
+            || self.access_code.encode_utf16().count() > 25
+            || self.public_key.trim().is_empty()
+        {
+            err!("Invalid auth request")
+        }
+        if self.atype.is_none() {
+            err!("The Type field is required.")
+        }
+        Ok(())
+    }
+
+    fn atype(&self) -> Option<AuthRequestType> {
+        self.atype.and_then(AuthRequestType::from_i32)
+    }
 }
 
 #[post("/auth-requests", data = "<data>")]
@@ -2478,18 +2866,27 @@ async fn post_auth_request(
 
     let data = data.into_inner();
 
-    let Some(user) = User::find_by_mail(&data.email, &conn).await else {
-        err!("AuthRequest doesn't exist", "User not found")
+    // Before looking up the user, so that the answer tells nothing about them
+    data.validate()?;
+    let atype = match data.atype() {
+        Some(AuthRequestType::AdminApproval) => err!("You must be authenticated to create a request of that type."),
+        Some(atype) => atype,
+        None => err!("Unknown auth request type"),
     };
 
-    // Validate device uuid and type
+    let Some(user) = User::find_by_mail(&data.email, &conn).await else {
+        err!("User or known device not found.", "User not found")
+    };
+
+    // Like upstream, only from a known device of the user, here also of the type it has
     let device = match Device::find_by_uuid_and_user(&data.device_identifier, &user.uuid, &conn).await {
         Some(device) if device.atype == client_headers.device_type => device,
-        _ => err!("AuthRequest doesn't exist", "Device verification failed"),
+        _ => err!("User or known device not found.", "Device verification failed"),
     };
 
     let auth_request = AuthRequest::new(
         user.uuid.clone(),
+        atype,
         data.device_identifier.clone(),
         client_headers.device_type,
         client_headers.ip.ip.to_string(),
@@ -2498,25 +2895,121 @@ async fn post_auth_request(
     );
     auth_request.save(&conn).await?;
 
+    // Like upstream, only pushed to the other devices, an event is only logged for an admin approval
     nt.send_auth_request(&user.uuid, &auth_request.uuid, &device, &conn).await;
-
-    log_user_event(
-        EventType::UserRequestedDeviceApproval,
-        &user.uuid,
-        client_headers.device_type,
-        &client_headers.ip.ip,
-        &conn,
-    )
-    .await;
 
     Ok(Json(auth_request.to_json()))
 }
 
+/// Upstream makes one request per organization of the user and the clients follow the first one only. Its TDE
+/// organization requires the single organization policy, so there is the one request, to the organization that holds
+/// the user key through account recovery, as its own TODO intends. Here every membership counts as one of the SSO
+/// organization and none has to be the only one, so the one request goes to an organization that can approve it: the
+/// one the account enrolled in when it was created, which `find_main_user_org` names, or else the first enrolled. An
+/// approval of a second request would only tell the user so, while the client keeps waiting for the first.
+/// Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Core/Auth/Services/Implementations/AuthRequestService.cs>
+/// Ref: <https://github.com/bitwarden/server/blob/9c109b6b4addad5eb821e263e5cdc25657dc6563/src/Core/Auth/Services/Implementations/SsoConfigService.cs#L68-L90>
+#[post("/auth-requests/admin-request", data = "<data>")]
+async fn post_admin_auth_request(data: Json<AuthRequestRequest>, headers: Headers, conn: DbConn) -> JsonResult {
+    // Every request mails the approvers, which upstream's limit on every POST of an IP keeps in check
+    crate::ratelimit::check_limit_admin_auth_request(&headers.ip.ip)?;
+
+    let data = data.into_inner();
+
+    data.validate()?;
+    if data.atype() != Some(AuthRequestType::AdminApproval) {
+        err!("Invalid AuthRequestType. Expected AdminApproval.")
+    }
+
+    // The user of the email has to be the caller, and the device one of theirs
+    if User::find_by_mail(&data.email, &conn).await.is_none_or(|user| user.uuid != headers.user.uuid)
+        || Device::find_by_uuid_and_user(&data.device_identifier, &headers.user.uuid, &conn).await.is_none()
+    {
+        err!("User or known device not found.")
+    }
+
+    let memberships: Vec<Membership> = Membership::find_by_user(&headers.user.uuid, &conn)
+        .await
+        .into_iter()
+        .filter(Membership::has_admin_approval)
+        .collect();
+    let main_org =
+        Membership::find_main_user_org(&headers.user.uuid, &conn).await.map(|membership| membership.org_uuid);
+    let Some(membership) = memberships
+        .iter()
+        .find(|membership| main_org.as_ref() == Some(&membership.org_uuid))
+        .or_else(|| memberships.first())
+    else {
+        err!("User does not belong to any organizations.")
+    };
+
+    log_user_event_including_accepted_orgs(
+        EventType::UserRequestedDeviceApproval,
+        &headers.user.uuid,
+        headers.device.atype,
+        &headers.ip.ip,
+        &conn,
+    )
+    .await;
+
+    let auth_request = create_admin_auth_request(&data, &headers, &membership.org_uuid, &conn).await?;
+
+    Ok(Json(auth_request.to_json()))
+}
+
+/// The admin approval request for the organization, whose approvers are mailed about it
+async fn create_admin_auth_request(
+    data: &AuthRequestRequest,
+    headers: &Headers,
+    org_id: &OrganizationId,
+    conn: &DbConn,
+) -> ApiResult<AuthRequest> {
+    let mut auth_request = AuthRequest::new(
+        headers.user.uuid.clone(),
+        AuthRequestType::AdminApproval,
+        data.device_identifier.clone(),
+        headers.device.atype,
+        headers.ip.ip.to_string(),
+        data.access_code.clone(),
+        data.public_key.clone(),
+    );
+    auth_request.organization_uuid = Some(org_id.clone());
+    auth_request.save(conn).await?;
+
+    notify_device_approval_requested(&headers.user, org_id, conn).await;
+    Ok(auth_request)
+}
+
+/// Mails the confirmed members who may answer, like upstream's `NotifyAdminsOfDeviceApprovalRequestAsync`.
+async fn notify_device_approval_requested(user: &User, org_id: &OrganizationId, conn: &DbConn) {
+    if !CONFIG.mail_enabled() {
+        return;
+    }
+
+    let approvers = Membership::find_by_org(org_id, conn)
+        .await
+        .into_iter()
+        .filter(|member| member.has_status(MembershipStatus::Confirmed) && member.has_manage_reset_password_role());
+
+    for approver in approvers {
+        let Some(admin) = User::find_by_uuid(&approver.user_uuid, conn).await else {
+            continue;
+        };
+
+        if let Err(e) = mail::send_device_approval_requested(&admin.email, org_id, &user.email, &user.name).await {
+            error!("Error sending device approval request email: {e:#?}");
+        }
+    }
+}
+
+/// Like upstream, a request that is gone is not found, which has the clients make a new one, and one that ran out is
+/// returned until it is purged.
+/// Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Api/Auth/Controllers/AuthRequestsController.cs>
 #[get("/auth-requests/<auth_request_id>")]
 async fn get_auth_request(auth_request_id: AuthRequestId, headers: Headers, conn: DbConn) -> JsonResult {
     let Some(auth_request) = AuthRequest::find_by_uuid_and_user(&auth_request_id, &headers.user.uuid, &conn).await
     else {
-        err!("AuthRequest doesn't exist", "Record not found or user uuid does not match")
+        err_code!("Resource not found.", "Record not found or user uuid does not match", Status::NotFound.code)
     };
 
     Ok(Json(auth_request.to_json()))
@@ -2526,7 +3019,7 @@ async fn get_auth_request(auth_request_id: AuthRequestId, headers: Headers, conn
 #[serde(rename_all = "camelCase")]
 struct AuthResponseRequest {
     device_identifier: DeviceId,
-    key: String,
+    key: Option<String>,
     master_password_hash: Option<String>,
     request_approved: bool,
 }
@@ -2543,49 +3036,68 @@ async fn put_auth_request(
     let data = data.into_inner();
     let Some(mut auth_request) = AuthRequest::find_by_uuid_and_user(&auth_request_id, &headers.user.uuid, &conn).await
     else {
-        err!("AuthRequest doesn't exist", "Record not found or user uuid does not match")
+        err_code!("Resource not found.", "Record not found or user uuid does not match", Status::NotFound.code)
     };
 
-    if headers.device.uuid != data.device_identifier {
-        err!("AuthRequest doesn't exist", "Device verification failed")
+    // Like upstream, only the newest request of a device can be approved
+    // Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Api/Auth/Controllers/AuthRequestsController.cs>
+    if data.request_approved
+        && AuthRequest::find_by_user_and_requested_device(
+            &headers.user.uuid,
+            &auth_request.request_device_identifier,
+            &conn,
+        )
+        .await
+        .is_none_or(|newest| newest.uuid != auth_request.uuid)
+    {
+        err!("This request is no longer valid. Make sure to approve the most recent request.")
     }
 
+    // Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Core/Auth/Services/Implementations/AuthRequestService.cs>
     if auth_request.approved.is_some() {
-        err!("An authentication request with the same device already exists")
+        err!("An authentication request with the same device already exists.")
     }
 
-    // Set the date now so that the response returns it
+    if auth_request.is_expired() {
+        err_code!("Resource not found.", "Request has expired", Status::NotFound.code)
+    }
+
+    // Like upstream, any device of the user can answer a request between devices, an admin approval names none
+    if !auth_request.is_admin_approval() {
+        let Some(device) = Device::find_by_uuid_and_user(&data.device_identifier, &headers.user.uuid, &conn).await
+        else {
+            err!("Invalid device.")
+        };
+        auth_request.response_device_id = Some(device.uuid);
+    }
+
+    // Like upstream, a denial is kept as the answer, which is not pushed, but which the asking device sees when it checks
+    auth_request.approved = Some(data.request_approved);
     auth_request.response_date = Some(Utc::now().naive_utc());
+    if data.request_approved {
+        auth_request.enc_key = data.key;
+        auth_request.master_password_hash = data.master_password_hash;
+    }
+    if !auth_request.save_answer(&conn).await? {
+        err!("An authentication request with the same device already exists.")
+    }
 
     if data.request_approved {
-        auth_request.approved = Some(data.request_approved);
-        auth_request.enc_key = Some(data.key);
-        auth_request.master_password_hash = data.master_password_hash;
-        auth_request.response_device_id = Some(data.device_identifier.clone());
-        auth_request.save(&conn).await?;
-
         ant.send_auth_response(&auth_request.user_uuid, &auth_request.uuid).await;
-        nt.send_auth_response(&auth_request.user_uuid, &auth_request.uuid, &headers.device, &conn).await;
+        nt.send_auth_response(&auth_request.user_uuid, &auth_request.uuid, Some(&headers.device), &conn).await;
+    }
 
-        log_user_event(
-            EventType::OrganizationUserApprovedAuthRequest,
-            &headers.user.uuid,
-            headers.device.atype,
-            &headers.ip.ip,
-            &conn,
-        )
-        .await;
-    } else {
-        // If denied, there's no reason to keep the request
-        auth_request.delete(&conn).await?;
-        log_user_event(
-            EventType::OrganizationUserRejectedAuthRequest,
-            &headers.user.uuid,
-            headers.device.atype,
-            &headers.ip.ip,
-            &conn,
-        )
-        .await;
+    // Like upstream, only the answer to a request of an organization is an event, one of that organization
+    if let Some(org_id) = &auth_request.organization_uuid
+        && let Some(member) = Membership::find_by_user_and_org(&auth_request.user_uuid, org_id, &conn).await
+    {
+        let event_type = if data.request_approved {
+            EventType::OrganizationUserApprovedAuthRequest
+        } else {
+            EventType::OrganizationUserRejectedAuthRequest
+        };
+        log_event(event_type, &member.uuid, org_id, &headers.user.uuid, headers.device.atype, &headers.ip.ip, &conn)
+            .await;
     }
 
     Ok(Json(auth_request.to_json()))
@@ -2600,37 +3112,54 @@ async fn get_auth_request_response(
 ) -> JsonResult {
     crate::ratelimit::check_limit_unauthenticated(&client_headers.ip.ip)?;
 
+    // Like upstream's `GetValidatedAuthRequestAsync`, anything but a valid request is not found
     let Some(auth_request) = AuthRequest::find_by_uuid(&auth_request_id, &conn).await else {
-        err!("AuthRequest doesn't exist", "User not found")
+        err_code!("Resource not found.", "Record not found", Status::NotFound.code)
     };
 
+    // Unlike upstream, from the IP that asked, except for an admin approval: it waits for days and its device moves
+    // between networks meanwhile, while the iOS app polls it here. Its answer is the user key for the public key of
+    // the request, which only the device that asked can unwrap, and only an authenticated session can ask for one.
     if auth_request.device_type != client_headers.device_type
-        || auth_request.request_ip != client_headers.ip.ip.to_string()
+        || (!auth_request.is_admin_approval() && auth_request.request_ip != client_headers.ip.ip.to_string())
         || !auth_request.check_access_code(code)
     {
-        err!("AuthRequest doesn't exist", "Invalid device, IP or code")
+        err_code!("Resource not found.", "Invalid device, IP or code", Status::NotFound.code)
+    }
+
+    if auth_request.is_expired() {
+        err_code!("Resource not found.", "Request has expired", Status::NotFound.code)
     }
 
     Ok(Json(auth_request.to_json()))
 }
 
-// Now unused but not yet removed
-// cf https://github.com/bitwarden/clients/blob/9b2fbdba1c028bf3394064609630d2ec224baefa/libs/common/src/services/api.service.ts#L245
+/// Like upstream, every request of the user
 #[get("/auth-requests")]
 async fn get_auth_requests(headers: Headers, conn: DbConn) -> JsonResult {
-    get_auth_requests_pending(headers, conn).await
-}
-
-#[get("/auth-requests/pending")]
-async fn get_auth_requests_pending(headers: Headers, conn: DbConn) -> JsonResult {
     let auth_requests = AuthRequest::find_by_user(&headers.user.uuid, &conn).await;
 
     Ok(Json(json!({
-        "data": auth_requests
-            .iter()
-            .filter(|request| request.approved.is_none())
-            .map(AuthRequest::to_json)
-            .collect::<Vec<Value>>(),
+        "data": auth_requests.iter().map(AuthRequest::to_json).collect::<Vec<Value>>(),
+        "continuationToken": null,
+        "object": "list"
+    })))
+}
+
+/// Like upstream's `PendingAuthRequestResponseModel`, the pending request of each device, with the device if it is known
+#[get("/auth-requests/pending")]
+async fn get_auth_requests_pending(headers: Headers, conn: DbConn) -> JsonResult {
+    let mut auth_requests = Vec::new();
+    for auth_request in AuthRequest::find_pending_by_user(&headers.user.uuid, &conn).await {
+        let device =
+            Device::find_by_uuid_and_user(&auth_request.request_device_identifier, &headers.user.uuid, &conn).await;
+        let mut json = auth_request.to_json();
+        json["requestDeviceId"] = json!(device.map(|device| device.uuid));
+        auth_requests.push(json);
+    }
+
+    Ok(Json(json!({
+        "data": auth_requests,
         "continuationToken": null,
         "object": "list"
     })))
@@ -2648,6 +3177,194 @@ pub async fn purge_auth_requests(pool: DbPool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const AES_KEY: &str = "2.AAAAAAAAAAAAAAAAAAAAAA==|Y2lwaGVy|AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    fn device(id: &str, trusted: bool) -> Device {
+        let mut device = Device::new(id.to_owned().into(), String::from("user").into(), String::new(), 9);
+        if trusted {
+            device.encrypted_user_key = Some(String::from("4.b2xk"));
+            device.encrypted_public_key = Some(String::from(AES_KEY));
+            device.encrypted_private_key = Some(String::from(AES_KEY));
+        }
+        device
+    }
+
+    fn update(device_id: &str) -> UpdateDeviceKeysData {
+        UpdateDeviceKeysData {
+            device_id: device_id.to_owned().into(),
+            encrypted_user_key: String::from("4.bmV3"),
+            encrypted_public_key: String::from(AES_KEY),
+        }
+    }
+
+    fn rotated(result: &[(DeviceId, String, String)]) -> Vec<String> {
+        result.iter().map(|(device_id, ..)| device_id.to_string()).collect()
+    }
+
+    #[test]
+    fn only_trusted_devices_are_rotated() {
+        let mut half_trusted = device("d", true);
+        half_trusted.encrypted_user_key = None;
+        let devices = [device("a", true), device("b", true), device("c", false), half_trusted];
+
+        // Entries for untrusted, unknown or repeated devices are ignored, like upstream.
+        let updates = [update("a"), update("b"), update("b"), update("c"), update("d"), update("stranger")];
+        assert_eq!(rotated(&validate_device_keydata(&updates, &devices).unwrap()), ["a", "b"]);
+        assert_eq!(rotated(&validate_device_keydata(&[update("a"), update("b")], &devices).unwrap()), ["a", "b"]);
+        assert_eq!(rotated(&validate_device_keydata(&[], &devices[2..]).unwrap()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_rotation_must_cover_every_trusted_device_with_valid_keys() {
+        let devices = [device("a", true), device("b", true)];
+        let mut bad_user_key = update("a");
+        bad_user_key.encrypted_user_key = String::from("not an enc string");
+        let mut bad_public_key = update("c");
+        bad_public_key.encrypted_public_key = String::new();
+
+        for (updates, expected) in [
+            (vec![update("a")], "All existing trusted devices must be included"),
+            (vec![bad_user_key, update("b")], "EncryptedUserKey"),
+            (vec![update("a"), update("b"), bad_public_key], "EncryptedPublicKey"),
+        ] {
+            let err = validate_device_keydata(&updates, &devices).unwrap_err();
+            assert!(format!("{err}").contains(expected), "expected {expected:?}, got {err}");
+        }
+    }
+
+    #[test]
+    fn an_auth_request_needs_its_type() {
+        let mut body = serde_json::json!({
+            "accessCode": "code",
+            "deviceIdentifier": "device",
+            "email": "user@example.com",
+            "publicKey": "key"
+        });
+        let request: AuthRequestRequest = serde_json::from_value(body.clone()).unwrap();
+        assert!(request.validate().is_err());
+
+        body["type"] = serde_json::json!(2);
+        let request: AuthRequestRequest = serde_json::from_value(body.clone()).unwrap();
+        assert!(request.validate().is_ok());
+        assert_eq!(request.atype(), Some(AuthRequestType::AdminApproval));
+
+        // Upstream's `[Required]` refuses a blank value, and `[StringLength(25)]` a longer access code
+        for (field, value) in
+            [("accessCode", String::from(" ")), ("accessCode", "a".repeat(26)), ("publicKey", String::from("\t "))]
+        {
+            let mut body = body.clone();
+            body[field] = serde_json::json!(value);
+            let request: AuthRequestRequest = serde_json::from_value(body).unwrap();
+            assert!(request.validate().is_err(), "{field}: {value:?}");
+        }
+    }
+
+    #[test]
+    fn a_new_master_password_needs_the_current_kdf_ranges() {
+        let kdf = |kdf, kdf_iterations, kdf_memory, kdf_parallelism| KDFData {
+            kdf,
+            kdf_iterations,
+            kdf_memory,
+            kdf_parallelism,
+        };
+        let (pbkdf2, argon2) = (UserKdfType::Pbkdf2 as i32, UserKdfType::Argon2id as i32);
+        for (settings, valid) in [
+            (kdf(pbkdf2, 600_000, None, None), true),
+            (kdf(pbkdf2, 2_000_000, None, None), true),
+            (kdf(pbkdf2, 599_999, None, None), false),
+            (kdf(pbkdf2, 100_000, None, None), false),
+            (kdf(pbkdf2, 2_000_001, None, None), false),
+            (kdf(argon2, 2, Some(15), Some(1)), true),
+            (kdf(argon2, 10, Some(1024), Some(16)), true),
+            (kdf(argon2, 1, Some(64), Some(4)), false),
+            (kdf(argon2, 11, Some(64), Some(4)), false),
+            (kdf(argon2, 3, Some(14), Some(4)), false),
+            (kdf(argon2, 3, Some(1025), Some(4)), false),
+            (kdf(argon2, 3, None, Some(4)), false),
+            (kdf(argon2, 3, Some(64), Some(0)), false),
+            (kdf(argon2, 3, Some(64), Some(17)), false),
+            (kdf(argon2, 3, Some(64), None), false),
+            // Like upstream, a type it doesn't know isn't checked here
+            (kdf(7, 1, None, None), true),
+        ] {
+            assert_eq!(settings.validate_new_settings().is_ok(), valid, "{settings:?}");
+        }
+    }
+
+    #[cfg(sqlite)]
+    fn account_keys(name: &str, v2: bool) -> ValidatedAccountKeys {
+        ValidatedAccountKeys {
+            private_key: format!("2.{name}-private"),
+            public_key: format!("{name}-public"),
+            v2: v2.then(|| ValidatedV2AccountKeys {
+                signed_public_key: format!("{name}-signed-public"),
+                signing_key: format!("{name}-signing"),
+                verifying_key: format!("{name}-verifying"),
+                signature_algorithm: SignatureAlgorithm::Ed25519,
+                security_state: format!("{name}-security-state"),
+                security_version: 2,
+            }),
+        }
+    }
+
+    /// Two key setups of one account read it before either wrote: only the first lands, and the second leaves neither
+    /// its key pair on the user nor its signature key pair behind.
+    #[cfg(sqlite)]
+    #[test]
+    fn only_one_of_two_concurrent_key_setups_lands() {
+        crate::db::test_db::run(async |db| {
+            let conn = db.conn();
+            for v2 in [true, false] {
+                let mut user = User::new(&format!("{}@example.com", crate::util::get_uuid()), None);
+                user.save(&conn).await.unwrap();
+                let mut first = User::find_by_uuid(&user.uuid, &conn).await.unwrap();
+                let mut second = User::find_by_uuid(&user.uuid, &conn).await.unwrap();
+
+                save_initial_account_keys(&account_keys("first", v2), &mut first, &conn).await.unwrap();
+                let err = save_initial_account_keys(&account_keys("second", v2), &mut second, &conn).await.unwrap_err();
+                assert_eq!(err.message(), "User has existing keypair");
+
+                let saved = User::find_by_uuid(&user.uuid, &conn).await.unwrap();
+                assert_eq!(saved.private_key.as_deref(), Some("2.first-private"));
+                assert_eq!(saved.public_key.as_deref(), Some("first-public"));
+                let pair = UserSignatureKeyPair::find_by_user(&user.uuid, &conn).await;
+                if v2 {
+                    assert_eq!(saved.signed_public_key.as_deref(), Some("first-signed-public"));
+                    let pair = pair.unwrap();
+                    assert_eq!(
+                        (pair.signing_key.as_str(), pair.verifying_key.as_str()),
+                        ("first-signing", "first-verifying")
+                    );
+                } else {
+                    assert!(saved.signed_public_key.is_none() && pair.is_none());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn rotation_requires_device_key_unlock_data() {
+        let mut unlock_data = serde_json::json!({
+            "emergencyAccessUnlockData": [],
+            "masterPasswordUnlockData": {
+                "kdfType": 0,
+                "kdfIterations": 600_000,
+                "email": "user@example.com",
+                "masterKeyAuthenticationHash": "hash",
+                "masterKeyEncryptedUserKey": "key"
+            },
+            "organizationAccountRecoveryUnlockData": [],
+            "passkeyUnlockData": [],
+            "deviceKeyUnlockData": []
+        });
+
+        let data: RotateAccountUnlockData = serde_json::from_value(unlock_data.clone()).unwrap();
+        assert!(data.common.device_key_unlock_data.is_empty());
+
+        unlock_data.as_object_mut().unwrap().remove("deviceKeyUnlockData");
+        assert!(serde_json::from_value::<RotateAccountUnlockData>(unlock_data).is_err());
+    }
 
     #[test]
     fn test_register_data_current_format() {

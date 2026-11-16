@@ -501,7 +501,7 @@ async fn deauth_user(user_id: UserId, _token: AdminToken, conn: DbConn, nt: Noti
         }
     }
 
-    Device::delete_all_by_user(&user.uuid, &conn).await?;
+    // Ends the sessions of the devices, which are kept, so that trusted devices still unlock after the next login
     user.reset_security_stamp(&conn).await?;
 
     user.save(&conn).await
@@ -510,14 +510,14 @@ async fn deauth_user(user_id: UserId, _token: AdminToken, conn: DbConn, nt: Noti
 #[post("/users/<user_id>/disable", format = "application/json")]
 async fn disable_user(user_id: UserId, _token: AdminToken, conn: DbConn, nt: Notify<'_>) -> EmptyResult {
     let mut user = get_user_or_404(&user_id, &conn).await?;
+    // Ends the sessions of the devices, which are kept, so that trusted devices still unlock once the user is enabled
+    // again
     user.reset_security_stamp(&conn).await?;
     user.enabled = false;
 
     let save_result = user.save(&conn).await;
 
     nt.send_logout(&user, None, &conn).await;
-
-    Device::delete_all_by_user(&user.uuid, &conn).await?;
 
     save_result
 }
