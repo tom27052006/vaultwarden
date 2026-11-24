@@ -431,6 +431,37 @@ pub async fn log_send_event(event_type: EventType, send: &Send, device_type: i32
     Event::save_user_event(events, conn).await.unwrap_or(());
 }
 
+/// Logs the Sends the Send controls policy of an organization enabled or disabled, like upstream's
+/// `LogSendEventsAsync`: only in that organization, and done by whoever saved the policy.
+/// Upstream: https://github.com/bitwarden/server/blob/9c109b6b4/src/Core/Dirt/Services/Implementations/EventService.cs#L799
+pub async fn log_send_policy_events(
+    event_type: EventType,
+    sends: &[Send],
+    org_id: &OrganizationId,
+    act_user_id: &UserId,
+    device_type: i32,
+    ip: &IpAddr,
+    conn: &DbConn,
+) {
+    if !CONFIG.org_events_enabled() || sends.is_empty() {
+        return;
+    }
+    let events = sends
+        .iter()
+        .filter_map(|send| {
+            let mut event = Event::new(event_type as i32, None);
+            event.user_uuid = Some(send.user_uuid.clone()?);
+            event.org_uuid = Some(org_id.clone());
+            event.act_user_uuid = Some(act_user_id.clone());
+            event.send_uuid = Some(send.uuid.clone());
+            event.device_type = Some(device_type);
+            event.ip_address = Some(ip.to_string());
+            Some(event)
+        })
+        .collect();
+    Event::save_user_event(events, conn).await.unwrap_or(());
+}
+
 pub async fn event_cleanup_job(pool: DbPool) {
     debug!("Start events cleanup job");
     if CONFIG.events_days_retain().is_none_or(|d| d == 0) {

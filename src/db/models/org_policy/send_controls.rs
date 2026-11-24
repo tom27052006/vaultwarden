@@ -15,7 +15,7 @@ use crate::{
     api::{ApiResult, EmptyResult},
     db::{
         DbConn,
-        models::{MembershipStatus, MembershipType, OrganizationId, Send, SendType, UserId},
+        models::{Membership, MembershipStatus, MembershipType, OrganizationId, Send, SendType, UserId},
         schema::{org_policies, users_organizations},
     },
 };
@@ -93,19 +93,20 @@ impl SendControlsPolicyData {
         };
     }
 
-    /// Checks the Send as it would be saved, like upstream's `SendValidationService`.
-    fn check_send(&self, send: &Send) -> EmptyResult {
+    /// Why the Send as it would be saved doesn't comply, like upstream's `SendValidationService`.
+    fn violation(&self, send: &Send) -> Option<String> {
         if self.disable_send {
-            err!("Due to an Enterprise Policy, you are only able to delete an existing Send.")
+            return Some("Due to an Enterprise Policy, you are only able to delete an existing Send.".into());
         }
         if self.disable_hide_email && send.hide_email.unwrap_or(false) {
-            err!(
+            return Some(
                 "Due to an Enterprise Policy, you are not allowed to hide your email address \
                   from recipients when creating or editing a Send."
-            )
+                    .into(),
+            );
         }
         if self.who_can_access == Some(ACCESS_PASSWORD) && send.password_hash.is_none() {
-            err!("Due to an Enterprise policy your Sends must be protected by password")
+            return Some("Due to an Enterprise policy your Sends must be protected by password".into());
         }
         if let Some(types) = &self.allowed_send_types
             && !types.contains(&send.atype)
@@ -118,7 +119,10 @@ impl SendControlsPolicyData {
                     _ => "Unknown",
                 })
                 .collect();
-            err!(format!("Due to an Enterprise policy your Sends must be of the following types: {}", names.join(", ")))
+            return Some(format!(
+                "Due to an Enterprise policy your Sends must be of the following types: {}",
+                names.join(", ")
+            ));
         }
         // Upstream allows for up to a minute of skew between the deletion and the creation date.
         if let Some(hours) = self.deletion_hours
@@ -134,9 +138,17 @@ impl SendControlsPolicyData {
             } else {
                 ""
             };
-            err!(format!(
+            return Some(format!(
                 "Due to an Enterprise policy your Sends must have deletion dates no more than {duration} {unit}{plural} from their creation dates"
-            ))
+            ));
+        }
+        None
+    }
+
+    /// Checks the Send as it would be saved.
+    fn check_send(&self, send: &Send) -> EmptyResult {
+        if let Some(violation) = self.violation(send) {
+            err!(violation)
         }
         Ok(())
     }
@@ -254,9 +266,57 @@ impl OrgPolicy {
         )
     }
 
+    /// Like upstream's `SendControlsSyncPolicyEvent`, saving Send controls disables the Sends of the organization's
+    /// accepted and confirmed members that don't comply with it, except those of its confirmed Owners and Admins, and
+    /// enables the disabled ones that comply with it again. Returns the enabled and the disabled Sends.
+    /// Upstream: https://github.com/bitwarden/server/blob/9c109b6b4/src/Core/AdminConsole/OrganizationFeatures/Policies/PolicyEventHandlers/SendControlsSyncPolicyEvent.cs#L88
+    pub async fn update_sends_by_policy(saved: &Self, conn: &DbConn) -> ApiResult<(Vec<Send>, Vec<Send>)> {
+        let (mut enabled, mut disabled) = (Vec::new(), Vec::new());
+        if !saved.has_type(OrgPolicyType::SendControls) {
+            return Ok((enabled, disabled));
+        }
+        let data = saved.send_controls_data();
+        let exempt: Vec<UserId> = Membership::find_by_org(&saved.org_uuid, conn)
+            .await
+            .into_iter()
+            .filter(|m| m.has_status(MembershipStatus::Confirmed) && m.atype >= MembershipType::Admin)
+            .map(|m| m.user_uuid)
+            .collect();
+
+        let mut sends = Send::find_by_org_members(&saved.org_uuid, conn).await.into_iter().peekable();
+        while sends.peek().is_some() {
+            let (mut to_enable, mut to_disable) = (Vec::new(), Vec::new());
+            for send in sends.by_ref().take(50) {
+                let Some(owner) = send.user_uuid.clone() else {
+                    continue;
+                };
+                let compliant = data.violation(&send).is_none();
+                if !send.disabled && saved.enabled && !exempt.contains(&owner) && !compliant {
+                    to_disable.push(send);
+                } else if send.disabled
+                    && (!saved.enabled || compliant)
+                    // Unlike upstream, a Send stays disabled while the policy of another organization doesn't allow it
+                    && Self::user_send_controls(&owner, conn).await?.violation(&send).is_none()
+                {
+                    to_enable.push(send);
+                }
+            }
+            Send::update_many_disabled(&mut to_enable, false, conn).await?;
+            Send::update_many_disabled(&mut to_disable, true, conn).await?;
+            enabled.append(&mut to_enable);
+            disabled.append(&mut to_disable);
+        }
+        Ok((enabled, disabled))
+    }
+
     /// Enforces the Send policies of every organization in which the user is an accepted or confirmed
     /// member below Admin on the Send as it would be saved. Deleting a Send stays possible.
     pub async fn check_send(user_id: &UserId, send: &Send, conn: &DbConn) -> EmptyResult {
+        Self::user_send_controls(user_id, conn).await?.check_send(send)
+    }
+
+    /// The Send policies of every organization in which the user is an accepted or confirmed member below Admin.
+    async fn user_send_controls(user_id: &UserId, conn: &DbConn) -> ApiResult<SendControlsPolicyData> {
         let policies = conn
             .run(move |conn| {
                 org_policies::table
@@ -284,6 +344,6 @@ impl OrgPolicy {
                 _ => controls.merge(policy.send_controls_data()),
             }
         }
-        controls.check_send(send)
+        Ok(controls)
     }
 }

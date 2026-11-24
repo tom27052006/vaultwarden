@@ -9,7 +9,7 @@ use crate::{
     api::admin::FAKE_ADMIN_UUID,
     api::{
         ApiResult, EmptyResult, JsonResult, Notify, PasswordOrOtpData, UpdateType,
-        core::{CipherSyncData, CipherSyncType, accept_org_invite, log_event, two_factor},
+        core::{CipherSyncData, CipherSyncType, accept_org_invite, log_event, log_send_policy_events, two_factor},
     },
     auth::{
         AccessImportExportHeaders, AdminHeaders, CollectionAction, CollectionDeleteHeaders, CollectionReadHeaders,
@@ -2585,6 +2585,20 @@ async fn put_policy(
     .await;
 
     OrgPolicy::sync_send_policies(&policy, &conn).await?;
+
+    let (enabled, disabled) = OrgPolicy::update_sends_by_policy(&policy, &conn).await?;
+    for (event_type, sends) in [(EventType::SendPolicyEnabled, enabled), (EventType::SendPolicyDisabled, disabled)] {
+        log_send_policy_events(
+            event_type,
+            &sends,
+            &org_id,
+            &headers.user.uuid,
+            headers.device.atype,
+            &headers.ip.ip,
+            &conn,
+        )
+        .await;
+    }
 
     Ok(Json(policy.to_json()))
 }

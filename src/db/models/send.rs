@@ -12,12 +12,15 @@ use crate::{
     CONFIG,
     api::EmptyResult,
     config::PathType,
-    db::{DbConn, schema::sends},
+    db::{
+        DbConn,
+        schema::{sends, users_organizations},
+    },
     error::MapResult,
     util::{LowerCase, NumberOrString, format_date},
 };
 
-use super::{OrganizationId, User, UserId};
+use super::{MembershipStatus, OrganizationId, User, UserId};
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
 #[diesel(table_name = sends)]
@@ -351,6 +354,55 @@ impl Send {
             sends::table.filter(sends::deletion_date.lt(now)).load::<Self>(conn).expect("Error loading sends")
         })
         .await
+    }
+
+    /// The Sends of the accepted and confirmed members of an organization.
+    /// Upstream SQL: https://github.com/bitwarden/server/blob/9c109b6b4/src/Sql/dbo/Tools/Stored%20Procedures/Send_ReadIdsByOrganizationId.sql
+    pub async fn find_by_org_members(org_uuid: &OrganizationId, conn: &DbConn) -> Vec<Self> {
+        conn.run(move |conn| {
+            let members = users_organizations::table
+                .filter(users_organizations::org_uuid.eq(org_uuid))
+                .filter(
+                    users_organizations::status
+                        .eq_any([MembershipStatus::Accepted as i32, MembershipStatus::Confirmed as i32]),
+                )
+                .select(users_organizations::user_uuid.nullable());
+            sends::table.filter(sends::user_uuid.eq_any(members)).load::<Self>(conn).expect("Error loading sends")
+        })
+        .await
+    }
+
+    /// Enables or disables these Sends, like upstream's `UpdateManyDisabledAsync`.
+    pub async fn update_many_disabled(sends: &mut [Self], disabled: bool, conn: &DbConn) -> EmptyResult {
+        if sends.is_empty() {
+            return Ok(());
+        }
+        let revision_date = Utc::now().naive_utc();
+        let uuids: Vec<SendId> = sends.iter().map(|send| send.uuid.clone()).collect();
+        let updated: EmptyResult = conn
+            .run(move |conn| {
+                diesel::update(sends::table.filter(sends::uuid.eq_any(uuids)))
+                    .set((sends::disabled.eq(disabled), sends::revision_date.eq(revision_date)))
+                    .execute(conn)
+                    .map_res("Error updating sends")
+            })
+            .await;
+        updated?;
+
+        let mut owners = Vec::new();
+        for send in sends.iter_mut() {
+            send.disabled = disabled;
+            send.revision_date = revision_date;
+            if let Some(owner) = &send.user_uuid
+                && !owners.contains(owner)
+            {
+                owners.push(owner.clone());
+            }
+        }
+        for owner in &owners {
+            User::update_uuid_revision(owner, conn).await;
+        }
+        Ok(())
     }
 }
 

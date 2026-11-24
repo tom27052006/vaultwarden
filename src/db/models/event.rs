@@ -161,8 +161,8 @@ pub enum EventType {
     SendDeletedFile = 2509,
     SendAccessedText = 2510,
     SendAccessedFile = 2511,
-    // SendPolicyDisabled = 2512, // Not supported, the Send controls policy doesn't disable existing Sends
-    // SendPolicyEnabled = 2513, // Not supported, the Send controls policy doesn't disable existing Sends
+    SendPolicyDisabled = 2512,
+    SendPolicyEnabled = 2513,
     // SendCreatedItem = 2514, // Not supported
     // SendEditedItem = 2515, // Not supported
     // SendDeletedItem = 2516, // Not supported
