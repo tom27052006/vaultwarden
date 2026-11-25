@@ -264,6 +264,22 @@ pub async fn log_user_event(event_type: EventType, user_id: &UserId, device_type
     log_user_event_impl(event_type as i32, user_id, device_type, None, ip, conn).await;
 }
 
+/// Like `log_user_event`, but also for the organizations the user has only accepted, like upstream's
+/// `includeAcceptedStatusOrgs`.
+pub async fn log_user_event_including_accepted_orgs(
+    event_type: EventType,
+    user_id: &UserId,
+    device_type: i32,
+    ip: &IpAddr,
+    conn: &DbConn,
+) {
+    if !CONFIG.org_events_enabled() {
+        return;
+    }
+    let memberships = Membership::find_accepted_and_confirmed_by_user(user_id, conn).await;
+    save_user_events(event_type as i32, user_id, device_type, None, ip, memberships, conn).await;
+}
+
 async fn log_user_event_impl(
     event_type: i32,
     user_id: &UserId,
@@ -273,6 +289,18 @@ async fn log_user_event_impl(
     conn: &DbConn,
 ) {
     let memberships = Membership::find_confirmed_by_user(user_id, conn).await;
+    save_user_events(event_type, user_id, device_type, event_date, ip, memberships, conn).await;
+}
+
+async fn save_user_events(
+    event_type: i32,
+    user_id: &UserId,
+    device_type: i32,
+    event_date: Option<NaiveDateTime>,
+    ip: &IpAddr,
+    memberships: Vec<Membership>,
+    conn: &DbConn,
+) {
     let mut events: Vec<Event> = Vec::with_capacity(memberships.len() + 1); // We need an event per org and one without an org
 
     // Upstream saves the event also without any org_id.

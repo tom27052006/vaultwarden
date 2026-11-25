@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use chrono::Utc;
 use num_traits::FromPrimitive;
 use rocket::{Route, http::Status, serde::json::Json};
 use serde_json::Value;
@@ -8,7 +9,7 @@ use crate::{
     CONFIG,
     api::admin::FAKE_ADMIN_UUID,
     api::{
-        ApiResult, EmptyResult, JsonResult, Notify, PasswordOrOtpData, UpdateType,
+        AnonymousNotify, ApiResult, EmptyResult, JsonResult, Notify, PasswordOrOtpData, UpdateType,
         core::{CipherSyncData, CipherSyncType, accept_org_invite, log_event, two_factor},
     },
     auth::{
@@ -20,16 +21,16 @@ use crate::{
     db::{
         DbConn,
         models::{
-            Cipher, CipherAccessScope, CipherId, Collection, CollectionCipher, CollectionGroup, CollectionId,
-            CollectionUser, CustomPermission, Device, EventType, FillAssistPolicyData, Group, GroupId, GroupUser,
-            Invitation, KeyId, Membership, MembershipId, MembershipStatus, MembershipType, OrgPolicy, OrgPolicyType,
-            Organization, OrganizationApiKey, OrganizationId, TwoFactor, TwoFactorType, User, UserId,
-            custom_roles_enabled,
+            AuthRequest, AuthRequestId, Cipher, CipherAccessScope, CipherId, Collection, CollectionCipher,
+            CollectionGroup, CollectionId, CollectionUser, CustomPermission, Device, DeviceType, EventType,
+            FillAssistPolicyData, Group, GroupId, GroupUser, Invitation, KeyId, Membership, MembershipId,
+            MembershipStatus, MembershipType, OrgPolicy, OrgPolicyType, Organization, OrganizationApiKey,
+            OrganizationId, TwoFactor, TwoFactorType, User, UserId, custom_roles_enabled,
         },
     },
     mail,
     sso::FAKE_SSO_IDENTIFIER,
-    util::{NumberOrString, convert_json_key_lcase_first},
+    util::{NumberOrString, convert_json_key_lcase_first, validate_enc_string},
 };
 
 use super::accounts::{AuthenticationData, UnlockData, V2UpgradeTokenData};
@@ -95,10 +96,15 @@ pub fn routes() -> Vec<Route> {
         get_group_members,
         put_reset_password_enrollment,
         get_reset_password_details,
+        post_account_recovery_details,
         get_pending_v2_upgrades,
         post_v2_upgrades,
         get_organization_private_key,
         put_recover_account,
+        get_organization_auth_requests,
+        deny_organization_auth_requests,
+        update_organization_auth_request,
+        update_many_organization_auth_requests,
         get_org_export,
         post_api_key,
         rotate_api_key,
@@ -3675,10 +3681,49 @@ async fn get_reset_password_details(
 
     check_reset_password_applicable_and_permissions(&org_id, &member_id, &headers.membership, &conn).await?;
 
-    // https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Api/AdminConsole/Models/Response/Organizations/OrganizationUserResponseModel.cs#L190
+    Ok(Json(reset_password_details_json(&member, &user, &org)))
+}
+
+/// The details of many members at once, which the device approvals use to approve many requests. Like upstream, the
+/// members that can't be recovered are left out.
+/// Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Api/AdminConsole/Controllers/OrganizationUsersController.cs>
+#[post("/organizations/<org_id>/users/account-recovery-details", data = "<data>")]
+async fn post_account_recovery_details(
+    org_id: OrganizationId,
+    data: Json<BulkMembershipIds>,
+    headers: ManageResetPasswordHeaders,
+    conn: DbConn,
+) -> JsonResult {
+    if org_id != headers.org_id {
+        err!("Organization not found", "Organization id's do not match");
+    }
+    let Some(org) = Organization::find_by_uuid(&org_id, &conn).await else {
+        err!("Required organization not found")
+    };
+    check_reset_password_applicable(&org_id, &conn).await?;
+
+    let mut details = Vec::new();
+    for member_id in data.into_inner().ids {
+        if let Some(member) = Membership::find_by_uuid_and_org(&member_id, &org_id, &conn).await
+            && may_recover_account(&headers.membership, &member)
+            && let Some(user) = User::find_by_uuid(&member.user_uuid, &conn).await
+        {
+            details.push(reset_password_details_json(&member, &user, &org));
+        }
+    }
+
     Ok(Json(json!({
+        "data": details,
+        "continuationToken": null,
+        "object": "list"
+    })))
+}
+
+/// Ref: <https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Api/AdminConsole/Models/Response/Organizations/OrganizationUserResponseModel.cs#L190>
+fn reset_password_details_json(member: &Membership, user: &User, org: &Organization) -> Value {
+    json!({
         "object": "organizationUserResetPasswordDetails",
-        "organizationUserId": member_id,
+        "organizationUserId": member.uuid,
         "kdf": user.client_kdf_type,
         "kdfIterations": user.client_kdf_iter,
         "kdfMemory": user.client_kdf_memory,
@@ -3686,7 +3731,7 @@ async fn get_reset_password_details(
         "masterPasswordSalt": user.master_password_salt(),
         "resetPasswordKey": member.reset_password_key,
         "encryptedPrivateKey": org.private_key,
-    })))
+    })
 }
 
 async fn check_reset_password_applicable_and_permissions(
@@ -3789,6 +3834,244 @@ async fn put_reset_password_enrollment(
     Ok(())
 }
 
+// Device approvals, answered with the user key a member's account recovery enrollment left the organization.
+// Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Api/AdminConsole/Controllers/OrganizationAuthRequestsController.cs>
+
+/// Like upstream's `ValidateAdminRequest`, which answers anyone who can't manage account recovery as unauthorized
+/// instead of forbidden
+fn check_manage_reset_password(org_id: &OrganizationId, headers: &OrgMemberHeaders) -> EmptyResult {
+    if *org_id != headers.membership.org_uuid {
+        err!("Organization not found", "Organization id's do not match");
+    }
+    let member = &headers.membership;
+    if !(member.has_status(MembershipStatus::Confirmed) && member.has_manage_reset_password_role()) {
+        err_code!("Unauthorized.", "The member cannot manage account recovery", Status::Unauthorized.code)
+    }
+    Ok(())
+}
+
+#[get("/organizations/<org_id>/auth-requests")]
+async fn get_organization_auth_requests(org_id: OrganizationId, headers: OrgMemberHeaders, conn: DbConn) -> JsonResult {
+    check_manage_reset_password(&org_id, &headers)?;
+
+    let requests: Vec<Value> = AuthRequest::find_pending_admin_approvals_by_org(&org_id, &conn)
+        .await
+        .iter()
+        .map(|(auth_request, member_id, email)| auth_request.to_json_for_organization(email, member_id))
+        .collect();
+
+    Ok(Json(json!({
+        "data": requests,
+        "continuationToken": null,
+        "object": "list"
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminAuthRequestUpdateData {
+    request_approved: bool,
+    encrypted_user_key: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BulkDenyAuthRequestData {
+    ids: Vec<AuthRequestId>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OrganizationAuthRequestUpdateData {
+    id: AuthRequestId,
+    approved: bool,
+    key: Option<String>,
+}
+
+#[post("/organizations/<org_id>/auth-requests/<request_id>", data = "<data>", rank = 2)]
+async fn update_organization_auth_request(
+    org_id: OrganizationId,
+    request_id: AuthRequestId,
+    data: Json<AdminAuthRequestUpdateData>,
+    headers: OrgMemberHeaders,
+    conn: DbConn,
+    ant: AnonymousNotify<'_>,
+    nt: Notify<'_>,
+) -> EmptyResult {
+    check_manage_reset_password(&org_id, &headers)?;
+    let data = data.into_inner();
+    validate_enc_string("EncryptedUserKey", data.encrypted_user_key.as_deref())?;
+
+    let Some((auth_request, member_id)) =
+        AuthRequest::find_admin_approvals_by_org_and_uuids(&org_id, vec![request_id], &conn).await.into_iter().next()
+    else {
+        err_code!("Resource not found.", "Auth request not found", Status::NotFound.code)
+    };
+    check_answerable(&auth_request)?;
+
+    let answers = AdminApprovalAnswers {
+        headers: &headers,
+        conn: &conn,
+        ant,
+        nt,
+    };
+    if !answers.answer(auth_request, &member_id, data.request_approved, data.encrypted_user_key).await? {
+        err!("An authentication request with the same device already exists.")
+    }
+    Ok(())
+}
+
+#[post("/organizations/<org_id>/auth-requests/deny", data = "<data>", rank = 1)]
+async fn deny_organization_auth_requests(
+    org_id: OrganizationId,
+    data: Json<BulkDenyAuthRequestData>,
+    headers: OrgMemberHeaders,
+    conn: DbConn,
+    ant: AnonymousNotify<'_>,
+    nt: Notify<'_>,
+) -> EmptyResult {
+    check_manage_reset_password(&org_id, &headers)?;
+
+    let answers = AdminApprovalAnswers {
+        headers: &headers,
+        conn: &conn,
+        ant,
+        nt,
+    };
+    // Like upstream, unknown ids are passed over and the first request that cannot be answered ends the call
+    for (auth_request, member_id) in
+        AuthRequest::find_admin_approvals_by_org_and_uuids(&org_id, data.into_inner().ids, &conn).await
+    {
+        check_answerable(&auth_request)?;
+        if !answers.answer(auth_request, &member_id, false, None).await? {
+            err!("An authentication request with the same device already exists.")
+        }
+    }
+
+    Ok(())
+}
+
+#[post("/organizations/<org_id>/auth-requests", data = "<data>")]
+async fn update_many_organization_auth_requests(
+    org_id: OrganizationId,
+    data: Json<Vec<OrganizationAuthRequestUpdateData>>,
+    headers: OrgMemberHeaders,
+    conn: DbConn,
+    ant: AnonymousNotify<'_>,
+    nt: Notify<'_>,
+) -> EmptyResult {
+    check_manage_reset_password(&org_id, &headers)?;
+    let updates = data.into_inner();
+    for update in &updates {
+        validate_enc_string("Key", update.key.as_deref())?;
+    }
+    let ids = updates.iter().map(|update| update.id.clone()).collect();
+
+    let answers = AdminApprovalAnswers {
+        headers: &headers,
+        conn: &conn,
+        ant,
+        nt,
+    };
+    // Like upstream's `BatchAuthRequestUpdateProcessor`, a request that cannot be processed is passed over
+    for (auth_request, member_id) in AuthRequest::find_admin_approvals_by_org_and_uuids(&org_id, ids, &conn).await {
+        let Some(update) = updates.iter().find(|update| update.id == auth_request.uuid) else {
+            continue;
+        };
+        let missing_key = update.approved && update.key.as_ref().is_none_or(|key| key.trim().is_empty());
+        if auth_request.is_expired() || auth_request.is_spent() || missing_key {
+            continue;
+        }
+        // One that was answered meanwhile is passed over as well
+        answers.answer(auth_request, &member_id, update.approved, update.key.clone()).await?;
+    }
+
+    Ok(())
+}
+
+/// The checks of upstream's `AuthRequestService.UpdateAuthRequestAsync` for an admin approval.
+fn check_answerable(auth_request: &AuthRequest) -> EmptyResult {
+    if auth_request.approved.is_some() {
+        err!("An authentication request with the same device already exists.")
+    }
+    if auth_request.is_expired() {
+        err_code!("Resource not found.", "Auth request has expired", Status::NotFound.code)
+    }
+    Ok(())
+}
+
+/// Answers the admin approvals of the organization of `headers`
+struct AdminApprovalAnswers<'a> {
+    headers: &'a OrgMemberHeaders,
+    conn: &'a DbConn,
+    ant: AnonymousNotify<'a>,
+    nt: Notify<'a>,
+}
+
+impl AdminApprovalAnswers<'_> {
+    /// Like upstream, a denial is not pushed so that whoever asked does not learn of it, and the member is mailed
+    /// about an approval. Returns false for a request that was answered or purged meanwhile.
+    async fn answer(
+        &self,
+        mut auth_request: AuthRequest,
+        member_id: &MembershipId,
+        approved: bool,
+        key: Option<String>,
+    ) -> ApiResult<bool> {
+        let response_date = Utc::now().naive_utc();
+        auth_request.approved = Some(approved);
+        auth_request.response_date = Some(response_date);
+        if approved {
+            auth_request.enc_key = key;
+        }
+        if !auth_request.save_answer(self.conn).await? {
+            return Ok(false);
+        }
+
+        let event_type = if approved {
+            EventType::OrganizationUserApprovedAuthRequest
+        } else {
+            EventType::OrganizationUserRejectedAuthRequest
+        };
+        log_event(
+            event_type,
+            member_id,
+            &self.headers.membership.org_uuid,
+            &self.headers.user.uuid,
+            self.headers.device.atype,
+            &self.headers.ip.ip,
+            self.conn,
+        )
+        .await;
+
+        if !approved {
+            return Ok(true);
+        }
+
+        self.ant.send_auth_response(&auth_request.user_uuid, &auth_request.uuid).await;
+        // No acting device: the answer did not come from one of the member's devices
+        self.nt.send_auth_response(&auth_request.user_uuid, &auth_request.uuid, None, self.conn).await;
+
+        if CONFIG.mail_enabled()
+            && let Some(user) = User::find_by_uuid(&auth_request.user_uuid, self.conn).await
+        {
+            let device_type = DeviceType::from_i32(auth_request.device_type).to_string();
+            if let Err(e) = mail::send_trusted_device_admin_approval(
+                &user.email,
+                &response_date,
+                &auth_request.request_ip,
+                &device_type,
+            )
+            .await
+            {
+                error!("Error sending trusted device approval email: {e:#?}");
+            }
+        }
+
+        Ok(true)
+    }
+}
+
 // NOTE: It seems clients can't handle uppercase-first keys!!
 //       We need to convert all keys so they have the first character to be a lowercase.
 //       Else the export will be just an empty JSON file.
@@ -3826,7 +4109,7 @@ async fn api_key(
     let org_api_key = if let Some(mut org_api_key) = OrganizationApiKey::find_by_org_uuid(org_id, &conn).await {
         if rotate {
             org_api_key.api_key = crate::crypto::generate_api_key();
-            org_api_key.revision_date = chrono::Utc::now().naive_utc();
+            org_api_key.revision_date = Utc::now().naive_utc();
             org_api_key.save(&conn).await.expect("Error rotating organization API Key");
         }
         org_api_key

@@ -9,13 +9,16 @@ use crate::{
     CONFIG,
     api::{ApiResult, EmptyResult},
     crypto::ct_eq,
-    db::{DbConn, schema::auth_requests},
+    db::{
+        DbConn,
+        schema::{auth_requests, users, users_organizations},
+    },
     error::MapResult,
     util::format_date,
 };
 use macros::UuidFromParam;
 
-use super::{DeviceId, DeviceType, OrganizationId, UserId};
+use super::{DeviceId, DeviceType, MembershipId, OrganizationId, UserId};
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset, Deserialize, Serialize)]
 #[diesel(table_name = auth_requests)]
@@ -57,10 +60,13 @@ pub enum AuthRequestType {
 impl AuthRequest {
     // Upstream's `PasswordlessAuth` defaults
     pub const USER_REQUEST_EXPIRATION: TimeDelta = TimeDelta::minutes(15);
+    pub const ADMIN_REQUEST_EXPIRATION: TimeDelta = TimeDelta::days(7);
+    pub const AFTER_ADMIN_APPROVAL_EXPIRATION: TimeDelta = TimeDelta::hours(12);
     /// Not upstream, which allows the whole `USER_REQUEST_EXPIRATION`: vaultwarden logs in with a request only
     /// within its first five minutes
     pub const LOGIN_EXPIRATION: TimeDelta = TimeDelta::minutes(5);
 
+    /// A request without an organization; an admin approval then sets the organization it goes to
     pub fn new(
         user_uuid: UserId,
         atype: AuthRequestType,
@@ -115,9 +121,27 @@ impl AuthRequest {
         })
     }
 
-    /// Like upstream's `AuthRequestService.IsAuthRequestValid`
+    pub fn is_admin_approval(&self) -> bool {
+        self.atype == AuthRequestType::AdminApproval as i32
+    }
+
+    /// Like upstream's `AuthRequestService.IsAuthRequestValid`: an approved admin approval counts from its answer
     pub fn is_expired(&self) -> bool {
-        Utc::now().naive_utc() > self.creation_date + Self::USER_REQUEST_EXPIRATION
+        let now = Utc::now().naive_utc();
+
+        if self.is_admin_approval() {
+            if let (Some(true), Some(response_date)) = (self.approved, self.response_date) {
+                return now > response_date + Self::AFTER_ADMIN_APPROVAL_EXPIRATION;
+            }
+            return now > self.creation_date + Self::ADMIN_REQUEST_EXPIRATION;
+        }
+
+        now > self.creation_date + Self::USER_REQUEST_EXPIRATION
+    }
+
+    /// Answered or used, like the check of upstream's `AuthRequestUpdateProcessor`
+    pub fn is_spent(&self) -> bool {
+        self.approved.is_some() || self.response_date.is_some() || self.authentication_date.is_some()
     }
 
     /// Like upstream's `AuthRequest.IsValidForAuthentication`: only an approved and unused request that asked to log in
@@ -142,6 +166,23 @@ impl AuthRequest {
         json!({
             "id": self.uuid,
             "creationDate": format_date(&self.creation_date),
+        })
+    }
+
+    /// Like upstream's `PendingOrganizationAuthRequestResponseModel`
+    pub fn to_json_for_organization(&self, email: &str, member_id: &MembershipId) -> Value {
+        json!({
+            "id": self.uuid,
+            "userId": self.user_uuid,
+            "organizationUserId": member_id,
+            "email": email,
+            "publicKey": self.public_key,
+            "requestDeviceIdentifier": self.request_device_identifier,
+            "requestDeviceType": DeviceType::from_i32(self.device_type).to_string(),
+            "requestIpAddress": self.request_ip,
+            "requestCountryName": null,
+            "creationDate": format_date(&self.creation_date),
+            "object": "pending-org-auth-request",
         })
     }
 }
@@ -254,6 +295,64 @@ impl AuthRequest {
             .collect()
     }
 
+    /// The unanswered admin approvals of an organization with the member and email of whoever asked
+    /// Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Sql/dbo/Auth/Stored%20Procedures/AuthRequest_ReadPendingByOrganizationId.sql>
+    pub async fn find_pending_admin_approvals_by_org(
+        org_uuid: &OrganizationId,
+        conn: &DbConn,
+    ) -> Vec<(Self, MembershipId, String)> {
+        conn.run(move |conn| {
+            auth_requests::table
+                .inner_join(users::table)
+                .inner_join(
+                    users_organizations::table.on(users_organizations::user_uuid
+                        .eq(auth_requests::user_uuid)
+                        .and(users_organizations::org_uuid.eq(org_uuid))),
+                )
+                .filter(auth_requests::organization_uuid.eq(org_uuid))
+                .filter(auth_requests::atype.eq(AuthRequestType::AdminApproval as i32))
+                .filter(auth_requests::response_date.is_null())
+                .order_by(auth_requests::creation_date.desc())
+                .select((auth_requests::all_columns, users_organizations::uuid, users::email))
+                .load::<(Self, MembershipId, String)>(conn)
+                .expect("Error loading auth_requests")
+        })
+        .await
+    }
+
+    /// Admin approvals of an organization by id, with the member who asked
+    /// Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Sql/dbo/Auth/Stored%20Procedures/AuthRequest_ReadAdminApprovalsByIds.sql>
+    pub async fn find_admin_approvals_by_org_and_uuids(
+        org_uuid: &OrganizationId,
+        uuids: Vec<AuthRequestId>,
+        conn: &DbConn,
+    ) -> Vec<(Self, MembershipId)> {
+        conn.run(move |conn| {
+            auth_requests::table
+                .inner_join(
+                    users_organizations::table.on(users_organizations::user_uuid
+                        .eq(auth_requests::user_uuid)
+                        .and(users_organizations::org_uuid.eq(org_uuid))),
+                )
+                .filter(auth_requests::organization_uuid.eq(org_uuid))
+                .filter(auth_requests::atype.eq(AuthRequestType::AdminApproval as i32))
+                .filter(auth_requests::uuid.eq_any(uuids))
+                .select((auth_requests::all_columns, users_organizations::uuid))
+                .load::<(Self, MembershipId)>(conn)
+                .expect("Error loading auth_requests")
+        })
+        .await
+    }
+
+    pub async fn delete_all_by_organization(org_uuid: &OrganizationId, conn: &DbConn) -> EmptyResult {
+        conn.run(move |conn| {
+            diesel::delete(auth_requests::table.filter(auth_requests::organization_uuid.eq(org_uuid)))
+                .execute(conn)
+                .map_res("Error deleting auth requests for organization")
+        })
+        .await
+    }
+
     pub async fn delete_all_by_user(user_uuid: &UserId, conn: &DbConn) -> EmptyResult {
         conn.run(move |conn| {
             diesel::delete(auth_requests::table.filter(auth_requests::user_uuid.eq(user_uuid)))
@@ -305,13 +404,40 @@ impl AuthRequest {
 
     /// Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Sql/dbo/Auth/Stored%20Procedures/AuthRequest_DeleteIfExpired.sql>
     pub async fn purge_expired_auth_requests(conn: &DbConn) {
-        let expired = Utc::now().naive_utc() - Self::USER_REQUEST_EXPIRATION;
+        let now = Utc::now().naive_utc();
+        let admin = AuthRequestType::AdminApproval as i32;
+
+        let between_devices = now - Self::USER_REQUEST_EXPIRATION;
+        let for_an_admin = now - Self::ADMIN_REQUEST_EXPIRATION;
+        let after_approval = now - Self::AFTER_ADMIN_APPROVAL_EXPIRATION;
 
         let result = conn
             .run(move |conn| -> EmptyResult {
-                diesel::delete(auth_requests::table.filter(auth_requests::creation_date.lt(expired)))
-                    .execute(conn)
-                    .map_res("Error purging the expired auth requests")
+                let _: () = diesel::delete(
+                    auth_requests::table
+                        .filter(auth_requests::atype.ne(admin))
+                        .filter(auth_requests::creation_date.lt(between_devices)),
+                )
+                .execute(conn)
+                .map_res("Error purging the expired auth requests")?;
+
+                let _: () = diesel::delete(
+                    auth_requests::table
+                        .filter(auth_requests::atype.eq(admin))
+                        .filter(auth_requests::approved.eq(true))
+                        .filter(auth_requests::response_date.lt(after_approval)),
+                )
+                .execute(conn)
+                .map_res("Error purging the approved auth requests")?;
+
+                diesel::delete(
+                    auth_requests::table
+                        .filter(auth_requests::atype.eq(admin))
+                        .filter(auth_requests::approved.is_null().or(auth_requests::approved.eq(false)))
+                        .filter(auth_requests::creation_date.lt(for_an_admin)),
+                )
+                .execute(conn)
+                .map_res("Error purging the unanswered auth requests")
             })
             .await;
 
@@ -408,10 +534,41 @@ mod tests {
     }
 
     #[test]
+    fn an_answered_or_used_request_is_spent() {
+        let minute = TimeDelta::try_minutes(1).unwrap();
+        assert!(!request(AuthRequestType::AdminApproval, minute).is_spent());
+        assert!(approved(AuthRequestType::AdminApproval, minute).is_spent());
+
+        let mut used = request(AuthRequestType::AdminApproval, minute);
+        used.authentication_date = Some(Utc::now().naive_utc());
+        assert!(used.is_spent());
+    }
+
+    #[test]
     fn each_request_type_expires_after_its_own_window() {
         assert!(!request(AuthRequestType::AuthenticateAndUnlock, TimeDelta::try_minutes(14).unwrap()).is_expired());
         assert!(request(AuthRequestType::AuthenticateAndUnlock, TimeDelta::try_minutes(16).unwrap()).is_expired());
         assert!(request(AuthRequestType::Unlock, TimeDelta::try_minutes(16).unwrap()).is_expired());
+
+        let week = TimeDelta::try_days(7).unwrap();
+        assert!(!request(AuthRequestType::AdminApproval, week - TimeDelta::minutes(1)).is_expired());
+        assert!(request(AuthRequestType::AdminApproval, week + TimeDelta::seconds(1)).is_expired());
+    }
+
+    #[test]
+    fn the_answer_of_an_administrator_starts_its_own_clock() {
+        let mut auth_request = request(AuthRequestType::AdminApproval, TimeDelta::try_days(7).unwrap());
+        auth_request.approved = Some(true);
+
+        auth_request.response_date = Some(Utc::now().naive_utc() - TimeDelta::try_hours(11).unwrap());
+        assert!(!auth_request.is_expired());
+
+        auth_request.response_date = Some(Utc::now().naive_utc() - TimeDelta::try_hours(13).unwrap());
+        assert!(auth_request.is_expired());
+
+        auth_request.approved = Some(false);
+        auth_request.response_date = Some(Utc::now().naive_utc());
+        assert!(auth_request.is_expired());
     }
 
     #[test]

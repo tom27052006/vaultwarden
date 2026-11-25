@@ -570,11 +570,12 @@ impl WebSocketUsers {
         }
     }
 
+    /// `acting_device` answered the request and is not notified itself; `None` when an administrator answered
     pub async fn send_auth_response(
         &self,
         user_id: &UserId,
         auth_request_id: &AuthRequestId,
-        device: &Device,
+        acting_device: Option<&Device>,
         conn: &DbConn,
     ) {
         // Skip any processing if both WebSockets and Push are not active
@@ -584,14 +585,14 @@ impl WebSocketUsers {
         let data = create_update(
             vec![("Id".into(), auth_request_id.to_string().into()), ("UserId".into(), user_id.to_string().into())],
             UpdateType::AuthRequestResponse,
-            Some(&device.uuid),
+            acting_device.map(|device| &device.uuid),
         );
         if CONFIG.enable_websocket() {
             self.send_update(user_id, &data).await;
         }
 
         if CONFIG.push_enabled() {
-            push_auth_response(user_id, auth_request_id, device, conn).await;
+            push_auth_response(user_id, auth_request_id, acting_device, conn).await;
         }
     }
 }

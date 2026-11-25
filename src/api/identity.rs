@@ -534,13 +534,14 @@ async fn trusted_device_option(user: &User, device: &Device, conn: &DbConn) -> O
         .any(|other| other.uuid != device.uuid && DeviceType::can_approve_login_requests(other.atype));
 
     // Like upstream, every active membership counts
-    let has_manage_reset_password_permission = Membership::find_by_user(&user.uuid, conn)
-        .await
-        .iter()
-        .any(|membership| membership.is_not_revoked() && membership.has_manage_reset_password_role());
+    let memberships = Membership::find_by_user(&user.uuid, conn).await;
+    let has_manage_reset_password_permission =
+        memberships.iter().any(|membership| membership.is_not_revoked() && membership.has_manage_reset_password_role());
+    // They are only able to be approved by an admin if they have enrolled in account recovery
+    let has_admin_approval = memberships.iter().any(Membership::has_admin_approval);
 
     Some(json!({
-        "HasAdminApproval": false,
+        "HasAdminApproval": has_admin_approval,
         "HasLoginApprovingDevice": has_login_approving_device,
         "HasManageResetPasswordPermission": has_manage_reset_password_permission,
         "IsTdeOffboarding": false,

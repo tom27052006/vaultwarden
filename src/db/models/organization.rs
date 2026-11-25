@@ -24,8 +24,8 @@ use crate::{
 use macros::UuidFromParam;
 
 use super::{
-    Cipher, CipherId, Collection, CollectionId, CollectionUser, Group, GroupId, GroupUser, KeyId, OrgPolicy,
-    OrgPolicyType, TwoFactor, User, UserId,
+    AuthRequest, Cipher, CipherId, Collection, CollectionId, CollectionUser, Group, GroupId, GroupUser, KeyId,
+    OrgPolicy, OrgPolicyType, TwoFactor, User, UserId,
 };
 
 /// A membership whose account recovery key still wraps the member's V1 user key: an upgrade to V2 encryption can't
@@ -490,6 +490,21 @@ impl Membership {
         self.atype >= MembershipType::Admin || self.grants_custom_permission(CustomPermission::ManageResetPassword)
     }
 
+    /// Like upstream's `IsEnrolledInAccountRecovery`
+    pub fn is_enrolled_in_account_recovery(&self) -> bool {
+        self.reset_password_key.as_ref().is_some_and(|key| !key.trim().is_empty())
+    }
+
+    /// Whether the administrators of the organization can approve a new device of the member, upstream's
+    /// `HasAdminApproval`: they answer with the user key that the account recovery enrollment left them. Not for a
+    /// revoked membership: upstream's SSO login turns a revoked member of the SSO organization away before this is ever
+    /// asked, which the server-wide SSO here doesn't. An invitation does count, the trusted device enrollment of a new
+    /// account accepts it, and an enrollment whose acceptance a policy refused is all that member has.
+    /// Ref: <https://github.com/bitwarden/server/blob/9c109b6b4addad5eb821e263e5cdc25657dc6563/bitwarden_license/src/Sso/Controllers/AccountController.cs#L1054-L1077>
+    pub fn has_admin_approval(&self) -> bool {
+        self.is_not_revoked() && self.is_enrolled_in_account_recovery()
+    }
+
     fn custom_permission_mut(&mut self, permission: CustomPermission) -> &mut bool {
         match permission {
             CustomPermission::ManageUsers => &mut self.manage_users,
@@ -727,6 +742,8 @@ impl Organization {
     }
 
     pub async fn delete(self, conn: &DbConn) -> EmptyResult {
+        // First, as their foreign key would refuse the deletion of the organization after everything else is gone
+        AuthRequest::delete_all_by_organization(&self.uuid, conn).await?;
         Cipher::delete_all_by_organization(&self.uuid, conn).await?;
         Collection::delete_all_by_organization(&self.uuid, conn).await?;
         Membership::delete_all_by_organization(&self.uuid, conn).await?;
@@ -801,7 +818,7 @@ impl Membership {
         let permissions = self.custom_permissions_json();
 
         // https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Api/AdminConsole/Models/Response/ProfileOrganizationResponseModel.cs
-        json!({
+        let mut json = json!({
             "id": self.org_uuid,
             "identifier": null, // Not supported
             "name": org.name,
@@ -821,8 +838,10 @@ impl Membership {
             "resetPasswordEnrolled": self.reset_password_key.is_some(),
             "useResetPassword": CONFIG.mail_enabled(),
             "ssoBound": false, // Not supported
-            "useSso": false, // Not supported
-            "ssoEnabled": false,
+            // `useSso` stays false: SSO is not configured per organization here, and announcing it
+            // would offer the clients an organization SSO settings page that does not exist.
+            "useSso": false,
+            "ssoEnabled": CONFIG.sso_enabled(),
             "useKeyConnector": false,
             "useSecretsManager": false, // Not supported (Not AGPLv3 Licensed)
             "usePasswordManager": true,
@@ -873,7 +892,16 @@ impl Membership {
             "enabled": true,
 
             "object": "profileOrganization",
-        })
+        });
+
+        // How a member of this organization unlocks, which decides whether device approvals are on the table at all.
+        // Set here, the `json!` above is at the recursion limit.
+        json["ssoMemberDecryptionType"] = if CONFIG.sso_trusted_device_encryption() {
+            json!(2) // MemberDecryptionType.TrustedDeviceEncryption
+        } else {
+            json!(0) // MemberDecryptionType.MasterPassword
+        };
+        json
     }
 
     // Used by admins to view other members, so nothing here may depend on this member's status
@@ -1585,7 +1613,7 @@ impl Membership {
         conn.run(move |conn| {
             users_organizations::table
                 .filter(users_organizations::user_uuid.eq(user_uuid))
-                .filter(users_organizations::status.ne(MembershipStatus::Revoked as i32))
+                .filter(users_organizations::status.ge(MembershipStatus::Invited as i32))
                 .order(users_organizations::atype.asc())
                 .first::<Self>(conn)
                 .ok()
@@ -1969,5 +1997,33 @@ mod tests {
             assert_eq!(membership.has_manage_reset_password_role(), enabled);
         }
         test_flag::CUSTOM_ROLES_ENABLED.set(None);
+    }
+
+    #[test]
+    fn an_empty_reset_password_key_is_no_enrollment() {
+        let mut membership = Membership::new(String::from("user").into(), String::from("org").into(), None);
+        for (key, enrolled) in [(None, false), (Some(""), false), (Some("  "), false), (Some("4.a2V5"), true)] {
+            membership.reset_password_key = key.map(String::from);
+            assert_eq!(membership.is_enrolled_in_account_recovery(), enrolled, "{key:?}");
+        }
+    }
+
+    /// Every active enrolled membership can get its devices approved, an invitation too, which the trusted device
+    /// enrollment accepts. A revoked one can't, whatever status it was revoked from, nor a membership without the key.
+    #[test]
+    fn admin_approval_needs_an_active_enrolled_membership() {
+        let mut membership = Membership::new(String::from("user").into(), String::from("org").into(), None);
+        for status in [MembershipStatus::Invited, MembershipStatus::Accepted, MembershipStatus::Confirmed] {
+            let status = status as i32;
+            membership.status = status;
+            membership.reset_password_key = None;
+            assert!(!membership.has_admin_approval(), "status {status} without enrollment");
+            membership.reset_password_key = Some(String::from("4.a2V5"));
+            assert!(membership.has_admin_approval(), "status {status}");
+            assert!(membership.revoke());
+            assert!(!membership.has_admin_approval(), "revoked from status {status}");
+        }
+        membership.status = MembershipStatus::Revoked as i32;
+        assert!(!membership.has_admin_approval());
     }
 }

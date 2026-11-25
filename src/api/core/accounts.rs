@@ -13,7 +13,9 @@ use crate::{
     CONFIG,
     api::{
         AnonymousNotify, ApiResult, EmptyResult, JsonResult, LogOutReason, Notify, PasswordOrOtpData,
-        core::{accept_org_invite, log_user_event, two_factor::email},
+        core::{
+            accept_org_invite, log_event, log_user_event, log_user_event_including_accepted_orgs, two_factor::email,
+        },
         master_password_policy, push_logout_to_relay, register_push_device, unregister_push_device,
     },
     auth::{ClientHeaders, ClientIp, Headers, decode_delete, decode_invite, decode_verify_email},
@@ -23,8 +25,8 @@ use crate::{
         models::{
             AuthRequest, AuthRequestId, AuthRequestType, Cipher, CipherId, Device, DeviceId, DeviceType,
             DeviceWithAuthRequest, EmergencyAccess, EmergencyAccessId, EventType, Folder, FolderId, Invitation, KeyId,
-            Membership, MembershipId, OrgPolicy, OrgPolicyType, Organization, OrganizationId, Send, SendId,
-            SignatureAlgorithm, User, UserId, UserKdfType, UserSignatureKeyPair,
+            Membership, MembershipId, MembershipStatus, OrgPolicy, OrgPolicyType, Organization, OrganizationId, Send,
+            SendId, SignatureAlgorithm, User, UserId, UserKdfType, UserSignatureKeyPair,
         },
     },
     mail,
@@ -83,6 +85,7 @@ pub fn routes() -> Vec<rocket::Route> {
         post_deactivate_device,
         get_tasks,
         post_auth_request,
+        post_admin_auth_request,
         get_auth_request,
         put_auth_request,
         get_auth_request_response,
@@ -2716,6 +2719,107 @@ async fn post_auth_request(
     Ok(Json(auth_request.to_json()))
 }
 
+/// Upstream makes one request per organization of the user and the clients follow the first one only. Its TDE
+/// organization requires the single organization policy, so there is the one request, to the organization that holds
+/// the user key through account recovery, as its own TODO intends. Here every membership counts as one of the SSO
+/// organization and none has to be the only one, so the one request goes to an organization that can approve it: the
+/// one the account enrolled in when it was created, which `find_main_user_org` names, or else the first enrolled. An
+/// approval of a second request would only tell the user so, while the client keeps waiting for the first.
+/// Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Core/Auth/Services/Implementations/AuthRequestService.cs>
+/// Ref: <https://github.com/bitwarden/server/blob/9c109b6b4addad5eb821e263e5cdc25657dc6563/src/Core/Auth/Services/Implementations/SsoConfigService.cs#L68-L90>
+#[post("/auth-requests/admin-request", data = "<data>")]
+async fn post_admin_auth_request(data: Json<AuthRequestRequest>, headers: Headers, conn: DbConn) -> JsonResult {
+    // Every request mails the approvers, which upstream's limit on every POST of an IP keeps in check
+    crate::ratelimit::check_limit_admin_auth_request(&headers.ip.ip)?;
+
+    let data = data.into_inner();
+
+    data.validate()?;
+    if data.atype() != Some(AuthRequestType::AdminApproval) {
+        err!("Invalid AuthRequestType. Expected AdminApproval.")
+    }
+
+    // The user of the email has to be the caller, and the device one of theirs
+    if User::find_by_mail(&data.email, &conn).await.is_none_or(|user| user.uuid != headers.user.uuid)
+        || Device::find_by_uuid_and_user(&data.device_identifier, &headers.user.uuid, &conn).await.is_none()
+    {
+        err!("User or known device not found.")
+    }
+
+    let memberships: Vec<Membership> = Membership::find_by_user(&headers.user.uuid, &conn)
+        .await
+        .into_iter()
+        .filter(Membership::has_admin_approval)
+        .collect();
+    let main_org =
+        Membership::find_main_user_org(&headers.user.uuid, &conn).await.map(|membership| membership.org_uuid);
+    let Some(membership) = memberships
+        .iter()
+        .find(|membership| main_org.as_ref() == Some(&membership.org_uuid))
+        .or_else(|| memberships.first())
+    else {
+        err!("User does not belong to any organizations.")
+    };
+
+    log_user_event_including_accepted_orgs(
+        EventType::UserRequestedDeviceApproval,
+        &headers.user.uuid,
+        headers.device.atype,
+        &headers.ip.ip,
+        &conn,
+    )
+    .await;
+
+    let auth_request = create_admin_auth_request(&data, &headers, &membership.org_uuid, &conn).await?;
+
+    Ok(Json(auth_request.to_json()))
+}
+
+/// The admin approval request for the organization, whose approvers are mailed about it
+async fn create_admin_auth_request(
+    data: &AuthRequestRequest,
+    headers: &Headers,
+    org_id: &OrganizationId,
+    conn: &DbConn,
+) -> ApiResult<AuthRequest> {
+    let mut auth_request = AuthRequest::new(
+        headers.user.uuid.clone(),
+        AuthRequestType::AdminApproval,
+        data.device_identifier.clone(),
+        headers.device.atype,
+        headers.ip.ip.to_string(),
+        data.access_code.clone(),
+        data.public_key.clone(),
+    );
+    auth_request.organization_uuid = Some(org_id.clone());
+    auth_request.save(conn).await?;
+
+    notify_device_approval_requested(&headers.user, org_id, conn).await;
+    Ok(auth_request)
+}
+
+/// Mails the confirmed members who may answer, like upstream's `NotifyAdminsOfDeviceApprovalRequestAsync`.
+async fn notify_device_approval_requested(user: &User, org_id: &OrganizationId, conn: &DbConn) {
+    if !CONFIG.mail_enabled() {
+        return;
+    }
+
+    let approvers = Membership::find_by_org(org_id, conn)
+        .await
+        .into_iter()
+        .filter(|member| member.has_status(MembershipStatus::Confirmed) && member.has_manage_reset_password_role());
+
+    for approver in approvers {
+        let Some(admin) = User::find_by_uuid(&approver.user_uuid, conn).await else {
+            continue;
+        };
+
+        if let Err(e) = mail::send_device_approval_requested(&admin.email, org_id, &user.email, &user.name).await {
+            error!("Error sending device approval request email: {e:#?}");
+        }
+    }
+}
+
 /// Like upstream, a request that is gone is not found, which has the clients make a new one, and one that ran out is
 /// returned until it is purged.
 /// Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Api/Auth/Controllers/AuthRequestsController.cs>
@@ -2776,11 +2880,14 @@ async fn put_auth_request(
         err_code!("Resource not found.", "Request has expired", Status::NotFound.code)
     }
 
-    // Like upstream, any device of the user can answer
-    let Some(device) = Device::find_by_uuid_and_user(&data.device_identifier, &headers.user.uuid, &conn).await else {
-        err!("Invalid device.")
-    };
-    auth_request.response_device_id = Some(device.uuid);
+    // Like upstream, any device of the user can answer a request between devices, an admin approval names none
+    if !auth_request.is_admin_approval() {
+        let Some(device) = Device::find_by_uuid_and_user(&data.device_identifier, &headers.user.uuid, &conn).await
+        else {
+            err!("Invalid device.")
+        };
+        auth_request.response_device_id = Some(device.uuid);
+    }
 
     // Like upstream, a denial is kept as the answer, which is not pushed, but which the asking device sees when it checks
     auth_request.approved = Some(data.request_approved);
@@ -2795,7 +2902,20 @@ async fn put_auth_request(
 
     if data.request_approved {
         ant.send_auth_response(&auth_request.user_uuid, &auth_request.uuid).await;
-        nt.send_auth_response(&auth_request.user_uuid, &auth_request.uuid, &headers.device, &conn).await;
+        nt.send_auth_response(&auth_request.user_uuid, &auth_request.uuid, Some(&headers.device), &conn).await;
+    }
+
+    // Like upstream, only the answer to a request of an organization is an event, one of that organization
+    if let Some(org_id) = &auth_request.organization_uuid
+        && let Some(member) = Membership::find_by_user_and_org(&auth_request.user_uuid, org_id, &conn).await
+    {
+        let event_type = if data.request_approved {
+            EventType::OrganizationUserApprovedAuthRequest
+        } else {
+            EventType::OrganizationUserRejectedAuthRequest
+        };
+        log_event(event_type, &member.uuid, org_id, &headers.user.uuid, headers.device.atype, &headers.ip.ip, &conn)
+            .await;
     }
 
     Ok(Json(auth_request.to_json()))
@@ -2815,9 +2935,11 @@ async fn get_auth_request_response(
         err_code!("Resource not found.", "Record not found", Status::NotFound.code)
     };
 
-    // Unlike upstream, from the IP that asked
+    // Unlike upstream, from the IP that asked, except for an admin approval: it waits for days and its device moves
+    // between networks meanwhile, while the iOS app polls it here. Its answer is the user key for the public key of
+    // the request, which only the device that asked can unwrap, and only an authenticated session can ask for one.
     if auth_request.device_type != client_headers.device_type
-        || auth_request.request_ip != client_headers.ip.ip.to_string()
+        || (!auth_request.is_admin_approval() && auth_request.request_ip != client_headers.ip.ip.to_string())
         || !auth_request.check_access_code(code)
     {
         err_code!("Resource not found.", "Invalid device, IP or code", Status::NotFound.code)
