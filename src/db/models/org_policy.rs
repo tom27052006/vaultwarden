@@ -15,7 +15,7 @@ use crate::{
     util::format_date,
 };
 
-use super::{Membership, MembershipId, MembershipStatus, MembershipType, OrganizationId, TwoFactor, UserId};
+use super::{Membership, MembershipId, MembershipStatus, MembershipType, OrganizationId, TwoFactor, User, UserId};
 
 mod send_controls;
 
@@ -298,15 +298,33 @@ impl OrgPolicy {
     }
 
     pub async fn check_user_allowed(m: &Membership, action: &str, conn: &DbConn) -> EmptyResult {
+        Self::check_user_allowed_impl(m, action, true, conn).await
+    }
+
+    /// Whether `check_user_allowed` would let the member do `action`, without turning on the email 2FA it needs for that
+    pub async fn is_user_allowed(m: &Membership, action: &str, conn: &DbConn) -> bool {
+        Self::check_user_allowed_impl(m, action, false, conn).await.is_ok()
+    }
+
+    async fn check_user_allowed_impl(
+        m: &Membership,
+        action: &str,
+        enable_email_2fa: bool,
+        conn: &DbConn,
+    ) -> EmptyResult {
         if m.atype < MembershipType::Admin && m.status > (MembershipStatus::Invited as i32) {
             // Enforce TwoFactor/TwoStep login
             if let Some(p) = Self::find_by_org_and_type(&m.org_uuid, OrgPolicyType::TwoFactorAuthentication, conn).await
                 && p.enabled
                 && TwoFactor::find_by_user(&m.user_uuid, conn).await.is_empty()
             {
-                if CONFIG.email_2fa_auto_fallback() {
+                if !CONFIG.email_2fa_auto_fallback() {
+                    err!(format!("Cannot {} because 2FA is required (membership {})", action, m.uuid));
+                }
+                if enable_email_2fa {
                     two_factor::email::find_and_activate_email_2fa(&m.user_uuid, conn).await?;
-                } else {
+                } else if User::find_by_uuid(&m.user_uuid, conn).await.is_none_or(|user| user.verified_at.is_none()) {
+                    // What `find_and_activate_email_2fa` refuses
                     err!(format!("Cannot {} because 2FA is required (membership {})", action, m.uuid));
                 }
             }

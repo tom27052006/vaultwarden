@@ -1217,7 +1217,10 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
         validate_internal_sso_redirect_url(&cfg.sso_callback_path)?;
         validate_sso_master_password_policy(cfg.sso_master_password_policy.as_ref())?;
     } else if cfg.sso_trusted_device_encryption {
-        err!("`SSO_TRUSTED_DEVICE_ENCRYPTION` requires `SSO_ENABLED`")
+        err!(
+            "`SSO_TRUSTED_DEVICE_ENCRYPTION` requires `SSO_ENABLED`. To turn it off, clear it and keep `SSO_ENABLED` \
+             until every user without a master password has set one"
+        )
     }
 
     if cfg._enable_yubico {

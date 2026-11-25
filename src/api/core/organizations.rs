@@ -3808,28 +3808,64 @@ async fn put_reset_password_enrollment(
         err!("Reset password can't be withdrawn due to an enterprise policy");
     }
 
-    if reset_password_key.is_some() {
-        PasswordOrOtpData {
-            master_password_hash: reset_request.master_password_hash,
-            otp: reset_request.otp,
-        }
-        .validate(&mut user, true, &conn)
-        .await?;
+    // Like upstream, an enrollment for trusted devices is not verified. Upstream decides that by the organization, here
+    // it is the enrollment of an account without a master password, which has nothing to verify with.
+    // Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Api/AdminConsole/Controllers/OrganizationUsersController.cs>
+    let trusted_device_enrollment = CONFIG.sso_trusted_device_encryption() && user.password_hash.is_empty();
+
+    // Upstream turns on the automatic enrollment, which forbids withdrawing, together with trusted devices. Here an
+    // administrator sets the policy, so an account that only account recovery can restore can't withdraw either.
+    if reset_password_key.is_none() && trusted_device_enrollment {
+        err!(
+            "Accounts without a master password can't withdraw from account recovery while trusted devices are in use."
+        );
     }
 
-    membership.reset_password_key = reset_password_key;
+    if let Some(key) = &reset_password_key {
+        if !trusted_device_enrollment {
+            PasswordOrOtpData {
+                master_password_hash: reset_request.master_password_hash,
+                otp: reset_request.otp,
+            }
+            .validate(&mut user, true, &conn)
+            .await?;
+        }
+
+        // Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Core/AdminConsole/OrganizationFeatures/OrganizationUsers/UpdateUserResetPasswordEnrollment/UpdateUserResetPasswordEnrollmentCommand.cs>
+        if !crate::util::is_valid_enc_string(key) {
+            err!("Invalid account recovery key.")
+        }
+    }
+
+    let enrolled = reset_password_key.is_some();
+    let membership_id = membership.uuid.clone();
     // A new key already wraps the current user key and a withdrawal leaves none. An upgrade token left from an earlier
     // V2 upgrade would only get the member unenrolled by the account recovery V2 upgrade.
     membership.v2_upgrade_token = None;
+    membership.reset_password_key = reset_password_key;
     membership.save(&conn).await?;
 
-    let event_type = if membership.reset_password_key.is_some() {
+    let event_type = if enrolled {
         EventType::OrganizationUserResetPasswordEnroll
     } else {
         EventType::OrganizationUserResetPasswordWithdraw
     };
 
-    log_event(event_type, &membership.uuid, &org_id, &user.uuid, headers.device.atype, &headers.ip.ip, &conn).await;
+    log_event(event_type, &membership_id, &org_id, &user.uuid, headers.device.atype, &headers.ip.ip, &conn).await;
+
+    // Like upstream, an enrollment then accepts the invitation. Here only for an account without a master password,
+    // which only logs in with SSO, and only if the identity provider confirmed its email address; any other account
+    // accepts with the mailed token. `account_creation_blocker` in identity.rs foresees this acceptance. Should a
+    // policy refuse it, the enrollment stays, so that an administrator can still approve the member's devices.
+    if enrolled
+        && trusted_device_enrollment
+        && !CONFIG.sso_allow_unknown_email_verification()
+        && membership.status == MembershipStatus::Invited as i32
+    {
+        let reset_password_key = membership.reset_password_key.clone();
+        accept_org_invite(&user, membership, reset_password_key, &conn).await?;
+        Invitation::take(&user.email, &conn).await;
+    }
 
     Ok(())
 }

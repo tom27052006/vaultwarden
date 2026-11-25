@@ -26,7 +26,7 @@ use crate::{
             AuthRequest, AuthRequestId, AuthRequestType, Cipher, CipherId, Device, DeviceId, DeviceType,
             DeviceWithAuthRequest, EmergencyAccess, EmergencyAccessId, EventType, Folder, FolderId, Invitation, KeyId,
             Membership, MembershipId, MembershipStatus, OrgPolicy, OrgPolicyType, Organization, OrganizationId, Send,
-            SendId, SignatureAlgorithm, User, UserId, UserKdfType, UserSignatureKeyPair,
+            SendId, SignatureAlgorithm, SsoUser, User, UserId, UserKdfType, UserSignatureKeyPair,
         },
     },
     mail,
@@ -50,6 +50,7 @@ pub fn routes() -> Vec<rocket::Route> {
         post_keys,
         post_password,
         post_set_password,
+        put_update_tde_offboarding_password,
         post_kdf,
         get_key_rotation_data,
         post_rotatekey,
@@ -587,7 +588,9 @@ pub async fn register(data: Json<RegisterData>, conn: DbConn) -> JsonResult {
     let is_new_user = existing_user.is_none();
     let mut user = match existing_user {
         Some(user) => {
-            if !user.password_hash.is_empty() {
+            // Only an invited or SSO provisioned stub registers. A trusted device account has keys but no master
+            // password, and registering would replace both. Like upstream, which never registers an existing user.
+            if !user.password_hash.is_empty() || user.private_key.is_some() || user.public_key.is_some() {
                 err!("Registration not allowed or user already exists")
             }
 
@@ -724,8 +727,9 @@ async fn post_set_password(data: Json<Value>, headers: Headers, conn: DbConn) ->
     }
     let mut user = headers.user;
 
-    if user.private_key.is_some() || !user.password_hash.is_empty() {
-        err!("Account already initialized, cannot set password")
+    // A trusted device account has its keys but no master password yet
+    if !user.password_hash.is_empty() {
+        err!("User already has a master password set.")
     }
 
     if data.compat.unprocessable(&user.email) {
@@ -739,7 +743,7 @@ async fn post_set_password(data: Json<Value>, headers: Headers, conn: DbConn) ->
 
     // Like upstream, `accountKeys` only through the v2 JIT flow
     // Ref: <https://github.com/bitwarden/server/blob/9030c42bf7d8f9ac2ff9fee85c39588d5eb81499/src/Api/Auth/Controllers/AccountsController.cs#L314-L359>
-    let account_keys = match data.account_keys {
+    let mut account_keys = match data.account_keys {
         Some(account_keys) => {
             if !matches!(data.compat, RegisterDataCompat::RegisterDataCur(_))
                 || !crate::util::is_client_feature_flag_enabled(
@@ -756,6 +760,33 @@ async fn post_set_password(data: Json<Value>, headers: Headers, conn: DbConn) ->
         }
         None => data.keys.map(ValidatedAccountKeys::from),
     };
+
+    // A trusted device account, which has its keys already
+    let has_keys = user.private_key.is_some() || user.public_key.is_some();
+    if has_keys {
+        // Like upstream's `KeysRequestModel.ToUser`, the account keeps the keys it has, so only the same key pair may come
+        // along. Never V2 keys, which upstream's V2 path would write over the existing ones.
+        if let Some(keys) = account_keys.take()
+            && (keys.is_v2()
+                || user.private_key.as_ref() != Some(&keys.private_key)
+                || user.public_key.as_ref() != Some(&keys.public_key))
+        {
+            err!("Cannot replace existing key(s) with new key(s).")
+        }
+
+        // Not upstream: the clients ask a trusted device account for a master password only for the account recovery
+        // permission. Upstream turns on its Require SSO policy together with trusted devices, so that a password
+        // doesn't log in past SSO for anyone else; here only `SSO_ONLY` would prevent that.
+        if !Membership::find_by_user(&user.uuid, &conn)
+            .await
+            .iter()
+            .any(|membership| membership.is_not_revoked() && membership.has_manage_reset_password_role())
+        {
+            err!(
+                "Only a member with the account recovery permission sets a master password on a trusted device account."
+            )
+        }
+    }
 
     set_kdf_data(&mut user, data.compat.kdf())?;
 
@@ -789,13 +820,19 @@ async fn post_set_password(data: Json<Value>, headers: Headers, conn: DbConn) ->
             err!("Failed to retrieve the invitation")
         };
 
-        accept_org_invite(&user, membership, None, &conn).await?;
+        // Like upstream's `TdeSetPasswordCommand`, a trusted device account keeps its membership as it is
+        if !has_keys {
+            accept_org_invite(&user, membership, None, &conn).await?;
+        }
     }
 
-    if CONFIG.mail_enabled() {
-        mail::send_welcome(&user.email.to_lowercase()).await?;
-    } else {
-        Membership::accept_user_invitations(&user.uuid, &conn).await?;
+    // A trusted device account was set up before, upstream neither welcomes it nor accepts anything for it
+    if !has_keys {
+        if CONFIG.mail_enabled() {
+            mail::send_welcome(&user.email.to_lowercase()).await?;
+        } else {
+            Membership::accept_user_invitations(&user.uuid, &conn).await?;
+        }
     }
 
     log_user_event(EventType::UserChangedPassword, &user.uuid, headers.device.atype, &headers.ip.ip, &conn).await;
@@ -809,6 +846,110 @@ async fn post_set_password(data: Json<Value>, headers: Headers, conn: DbConn) ->
     Ok(Json(json!({
       "object": "set-password",
     })))
+}
+
+/// Upstream's `UpdateTdeOffboardingPasswordRequestModel`, shaped like `ChangePassData`
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateTdeOffboardingPasswordData {
+    master_password_hint: Option<String>,
+    authentication_data: Option<AuthenticationData>,
+    unlock_data: Option<UnlockData>,
+
+    // Outdated values, might still be used by older clients
+    new_master_password_hash: Option<String>,
+    key: Option<String>,
+}
+
+/// The master password of a trusted device account once trusted devices are switched off. Upstream asks for the SSO
+/// organization's member decryption to be the master password, here that is `SSO_ENABLED` without
+/// `SSO_TRUSTED_DEVICE_ENCRYPTION`.
+/// Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Core/Auth/UserFeatures/TdeOffboardingPassword/TdeOffboardingPasswordCommand.cs>
+#[put("/accounts/update-tde-offboarding-password", data = "<data>")]
+async fn put_update_tde_offboarding_password(
+    data: Json<UpdateTdeOffboardingPasswordData>,
+    headers: Headers,
+    conn: DbConn,
+    nt: Notify<'_>,
+) -> EmptyResult {
+    let data = data.into_inner();
+    let mut user = headers.user;
+
+    if data.master_password_hint.as_ref().is_some_and(|hint| hint.encode_utf16().count() > 50) {
+        err!("The field MasterPasswordHint must be a string with a maximum length of 50.")
+    }
+    if data.new_master_password_hash.as_ref().is_some_and(|hash| hash.encode_utf16().count() > 300) {
+        err!("The field NewMasterPasswordHash must be a string with a maximum length of 300.")
+    }
+
+    // Like upstream, the current fields win over the outdated ones
+    let (password_hash, key) = if let (Some(authentication), Some(unlock)) =
+        (data.authentication_data, data.unlock_data)
+    {
+        required(Some(authentication.master_password_authentication_hash.clone()), "MasterPasswordAuthenticationHash")?;
+        authentication.check(&user, &unlock)?;
+        // Like upstream's `KdfSettingsValidator.ValidateAuthenticationAndUnlockData`, the first master password has to
+        // meet the current KDF ranges, `set_kdf_data` below only knows the lower ones every other flow still accepts
+        unlock.kdf.validate_new_settings()?;
+        validate_enc_string("MasterKeyWrappedUserKey", Some(&unlock.master_key_wrapped_user_key))?;
+        check_tde_offboarding(&user, &conn).await?;
+        if !user.password_hash.is_empty() {
+            err!("User already has a master password set.")
+        }
+        if !user.akey.is_empty() {
+            err!("User already has a key set.")
+        }
+        set_kdf_data(&mut user, &unlock.kdf)?;
+        (authentication.master_password_authentication_hash, unlock.master_key_wrapped_user_key)
+    } else {
+        let (Some(password_hash), Some(key)) = (data.new_master_password_hash, data.key) else {
+            err!(
+                "Must provide either new payloads (UnlockData/AuthenticationData) or legacy payloads (NewMasterPasswordHash/Key)."
+            )
+        };
+        if password_hash.trim().is_empty() {
+            err!("Master password is required.")
+        }
+        if key.trim().is_empty() {
+            err!("Key is required.")
+        }
+        if !user.password_hash.is_empty() {
+            err!("User already has a master password.")
+        }
+        check_tde_offboarding(&user, &conn).await?;
+        (password_hash, key)
+    };
+
+    let password_hint = clean_password_hint(data.master_password_hint.as_ref());
+    enforce_password_hint_setting(password_hint.as_ref())?;
+
+    user.set_password(&password_hash, Some(key), true, None, &conn).await?;
+    user.password_hint = password_hint;
+    user.save(&conn).await?;
+
+    log_user_event(EventType::UserTdeOffboardingPasswordSet, &user.uuid, headers.device.atype, &headers.ip.ip, &conn)
+        .await;
+    nt.send_logout(&user, None, &conn).await;
+
+    Ok(())
+}
+
+/// The organization checks of upstream's `TdeOffboardingPasswordCommand`. SSO is configured for the whole server, so
+/// every membership counts as one of an organization with SSO, and the user's SSO link is to the only configuration.
+async fn check_tde_offboarding(user: &User, conn: &DbConn) -> EmptyResult {
+    if Membership::find_by_user(&user.uuid, conn).await.is_empty() {
+        err!("User is not part of any organization that has SSO enabled.")
+    }
+    if SsoUser::find_by_mail(&user.email, conn).await.and_then(|(_, sso_user)| sso_user).is_none() {
+        err!("User is part of no or multiple SSO configurations.")
+    }
+    if !CONFIG.sso_enabled() {
+        err!("Organization SSO configuration not found.")
+    }
+    if CONFIG.sso_trusted_device_encryption() {
+        err!("Organization SSO Member Decryption Type is not Master Password.")
+    }
+    Ok(())
 }
 
 #[get("/accounts/profile")]
@@ -1342,6 +1483,20 @@ struct UnlockMethodData {
     key_connector_key_wrapped_user_key: Option<String>,
 }
 
+impl UnlockMethodData {
+    fn validate_tde(&self, user: &User) -> EmptyResult {
+        if self.master_password_unlock_data.is_some() || self.key_connector_key_wrapped_user_key.is_some() {
+            err!(
+                "Invalid Tde unlock method request, MasterPasswordUnlockData must be null and KeyConnectorKeyWrappedUserKey must be null"
+            )
+        }
+        if !user.password_hash.is_empty() || !user.akey.is_empty() {
+            err!("User is in an invalid state for TDE key rotation.")
+        }
+        Ok(())
+    }
+}
+
 /// Ref: <https://github.com/bitwarden/server/blob/9030c42bf7d8f9ac2ff9fee85c39588d5eb81499/src/Api/KeyManagement/Enums/UnlockMethod.cs#L3-L8>
 #[derive(num_derive::FromPrimitive)]
 enum UnlockMethod {
@@ -1582,6 +1737,29 @@ impl KDFData {
             }
         } else {
             err!("Invalid KdfType")
+        }
+        Ok(())
+    }
+
+    /// Upstream's `KdfSettingsValidator.Validate`, the ranges the KDF of a master password that is being set must be
+    /// in. Like upstream, a type it doesn't know isn't checked.
+    /// Ref: <https://github.com/bitwarden/server/blob/9c109b6b4addad5eb821e263e5cdc25657dc6563/src/Core/Utilities/KdfSettingsValidator.cs#L111-L139>
+    /// Ref: <https://github.com/bitwarden/server/blob/9c109b6b4addad5eb821e263e5cdc25657dc6563/src/Core/KeyManagement/Kdf/KdfConstants.cs#L10-L14>
+    fn validate_new_settings(&self) -> EmptyResult {
+        if self.kdf == UserKdfType::Pbkdf2 as i32 {
+            if !(600_000..=2_000_000).contains(&self.kdf_iterations) {
+                err!("KDF iterations must be between 600000 and 2000000.")
+            }
+        } else if self.kdf == UserKdfType::Argon2id as i32 {
+            if !(2..=10).contains(&self.kdf_iterations) {
+                err!("Argon2 iterations must be between 2 and 10.")
+            }
+            if !self.kdf_memory.is_some_and(|memory| (15..=1024).contains(&memory)) {
+                err!("Argon2 memory must be between 15mb and 1024mb.")
+            }
+            if !self.kdf_parallelism.is_some_and(|parallelism| (1..=16).contains(&parallelism)) {
+                err!("Argon2 parallelism must be between 1 and 16.")
+            }
         }
         Ok(())
     }
@@ -1904,7 +2082,11 @@ async fn post_rotate_user_keys(
             validate_contained_key_id(unlock_data.contained_key_id.as_ref(), data.new_user_key_id.as_ref())?;
             unlock_data.master_key_wrapped_user_key
         }
-        Some(UnlockMethod::Tde) => err!("Trusted device encryption is not supported"),
+        Some(UnlockMethod::Tde) => {
+            data.unlock_method_data.validate_tde(&headers.user)?;
+            // A passwordless account has no master-key-wrapped user key to replace.
+            String::new()
+        }
         Some(UnlockMethod::KeyConnector) => err!("Key connector is not supported"),
         None => err!("Unrecognized unlock method"),
     };
@@ -1951,12 +2133,12 @@ async fn post_sstamp(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbCo
 
     data.validate(&mut user, true, &conn).await?;
 
+    // Ends the sessions of the devices, which are kept, so that trusted devices still unlock after the next login, as
+    // upstream's do
     user.reset_security_stamp(&conn).await?;
     let save_result = user.save(&conn).await;
 
     nt.send_logout(&user, None, &conn).await;
-
-    Device::delete_all_by_user(&user.uuid, &conn).await?;
 
     save_result
 }
@@ -3075,6 +3257,38 @@ mod tests {
             body[field] = serde_json::json!(value);
             let request: AuthRequestRequest = serde_json::from_value(body).unwrap();
             assert!(request.validate().is_err(), "{field}: {value:?}");
+        }
+    }
+
+    #[test]
+    fn a_new_master_password_needs_the_current_kdf_ranges() {
+        let kdf = |kdf, kdf_iterations, kdf_memory, kdf_parallelism| KDFData {
+            kdf,
+            kdf_iterations,
+            kdf_memory,
+            kdf_parallelism,
+        };
+        let (pbkdf2, argon2) = (UserKdfType::Pbkdf2 as i32, UserKdfType::Argon2id as i32);
+        for (settings, valid) in [
+            (kdf(pbkdf2, 600_000, None, None), true),
+            (kdf(pbkdf2, 2_000_000, None, None), true),
+            (kdf(pbkdf2, 599_999, None, None), false),
+            (kdf(pbkdf2, 100_000, None, None), false),
+            (kdf(pbkdf2, 2_000_001, None, None), false),
+            (kdf(argon2, 2, Some(15), Some(1)), true),
+            (kdf(argon2, 10, Some(1024), Some(16)), true),
+            (kdf(argon2, 1, Some(64), Some(4)), false),
+            (kdf(argon2, 11, Some(64), Some(4)), false),
+            (kdf(argon2, 3, Some(14), Some(4)), false),
+            (kdf(argon2, 3, Some(1025), Some(4)), false),
+            (kdf(argon2, 3, None, Some(4)), false),
+            (kdf(argon2, 3, Some(64), Some(0)), false),
+            (kdf(argon2, 3, Some(64), Some(17)), false),
+            (kdf(argon2, 3, Some(64), None), false),
+            // Like upstream, a type it doesn't know isn't checked here
+            (kdf(7, 1, None, None), true),
+        ] {
+            assert_eq!(settings.validate_new_settings().is_ok(), valid, "{settings:?}");
         }
     }
 
