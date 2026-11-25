@@ -1,0 +1,1 @@
+-- The timestamps keep their fractional seconds here, only MySQL needed the change

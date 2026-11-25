@@ -21,10 +21,10 @@ use crate::{
     db::{
         DbConn, DbPool,
         models::{
-            AuthRequest, AuthRequestId, Cipher, CipherId, Device, DeviceId, DeviceType, DeviceWithAuthRequest,
-            EmergencyAccess, EmergencyAccessId, EventType, Folder, FolderId, Invitation, KeyId, Membership,
-            MembershipId, OrgPolicy, OrgPolicyType, Organization, OrganizationId, Send, SendId, SignatureAlgorithm,
-            User, UserId, UserKdfType, UserSignatureKeyPair,
+            AuthRequest, AuthRequestId, AuthRequestType, Cipher, CipherId, Device, DeviceId, DeviceType,
+            DeviceWithAuthRequest, EmergencyAccess, EmergencyAccessId, EventType, Folder, FolderId, Invitation, KeyId,
+            Membership, MembershipId, OrgPolicy, OrgPolicyType, Organization, OrganizationId, Send, SendId,
+            SignatureAlgorithm, User, UserId, UserKdfType, UserSignatureKeyPair,
         },
     },
     mail,
@@ -2645,9 +2645,29 @@ struct AuthRequestRequest {
     device_identifier: DeviceId,
     email: String,
     public_key: String,
-    // Not used for now
-    // #[serde(alias = "type")]
-    // _type: i32,
+    #[serde(rename = "type")]
+    atype: Option<i32>,
+}
+
+impl AuthRequestRequest {
+    /// Upstream's `[Required]` fields, which a blank value doesn't meet either, and `[StringLength(25)]` on the access
+    /// code. A blank email or device identifier finds no user or device.
+    fn validate(&self) -> EmptyResult {
+        if self.access_code.trim().is_empty()
+            || self.access_code.encode_utf16().count() > 25
+            || self.public_key.trim().is_empty()
+        {
+            err!("Invalid auth request")
+        }
+        if self.atype.is_none() {
+            err!("The Type field is required.")
+        }
+        Ok(())
+    }
+
+    fn atype(&self) -> Option<AuthRequestType> {
+        self.atype.and_then(AuthRequestType::from_i32)
+    }
 }
 
 #[post("/auth-requests", data = "<data>")]
@@ -2661,18 +2681,27 @@ async fn post_auth_request(
 
     let data = data.into_inner();
 
-    let Some(user) = User::find_by_mail(&data.email, &conn).await else {
-        err!("AuthRequest doesn't exist", "User not found")
+    // Before looking up the user, so that the answer tells nothing about them
+    data.validate()?;
+    let atype = match data.atype() {
+        Some(AuthRequestType::AdminApproval) => err!("You must be authenticated to create a request of that type."),
+        Some(atype) => atype,
+        None => err!("Unknown auth request type"),
     };
 
-    // Validate device uuid and type
+    let Some(user) = User::find_by_mail(&data.email, &conn).await else {
+        err!("User or known device not found.", "User not found")
+    };
+
+    // Like upstream, only from a known device of the user, here also of the type it has
     let device = match Device::find_by_uuid_and_user(&data.device_identifier, &user.uuid, &conn).await {
         Some(device) if device.atype == client_headers.device_type => device,
-        _ => err!("AuthRequest doesn't exist", "Device verification failed"),
+        _ => err!("User or known device not found.", "Device verification failed"),
     };
 
     let auth_request = AuthRequest::new(
         user.uuid.clone(),
+        atype,
         data.device_identifier.clone(),
         client_headers.device_type,
         client_headers.ip.ip.to_string(),
@@ -2681,25 +2710,20 @@ async fn post_auth_request(
     );
     auth_request.save(&conn).await?;
 
+    // Like upstream, only pushed to the other devices, an event is only logged for an admin approval
     nt.send_auth_request(&user.uuid, &auth_request.uuid, &device, &conn).await;
-
-    log_user_event(
-        EventType::UserRequestedDeviceApproval,
-        &user.uuid,
-        client_headers.device_type,
-        &client_headers.ip.ip,
-        &conn,
-    )
-    .await;
 
     Ok(Json(auth_request.to_json()))
 }
 
+/// Like upstream, a request that is gone is not found, which has the clients make a new one, and one that ran out is
+/// returned until it is purged.
+/// Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Api/Auth/Controllers/AuthRequestsController.cs>
 #[get("/auth-requests/<auth_request_id>")]
 async fn get_auth_request(auth_request_id: AuthRequestId, headers: Headers, conn: DbConn) -> JsonResult {
     let Some(auth_request) = AuthRequest::find_by_uuid_and_user(&auth_request_id, &headers.user.uuid, &conn).await
     else {
-        err!("AuthRequest doesn't exist", "Record not found or user uuid does not match")
+        err_code!("Resource not found.", "Record not found or user uuid does not match", Status::NotFound.code)
     };
 
     Ok(Json(auth_request.to_json()))
@@ -2709,7 +2733,7 @@ async fn get_auth_request(auth_request_id: AuthRequestId, headers: Headers, conn
 #[serde(rename_all = "camelCase")]
 struct AuthResponseRequest {
     device_identifier: DeviceId,
-    key: String,
+    key: Option<String>,
     master_password_hash: Option<String>,
     request_approved: bool,
 }
@@ -2726,49 +2750,52 @@ async fn put_auth_request(
     let data = data.into_inner();
     let Some(mut auth_request) = AuthRequest::find_by_uuid_and_user(&auth_request_id, &headers.user.uuid, &conn).await
     else {
-        err!("AuthRequest doesn't exist", "Record not found or user uuid does not match")
+        err_code!("Resource not found.", "Record not found or user uuid does not match", Status::NotFound.code)
     };
 
-    if headers.device.uuid != data.device_identifier {
-        err!("AuthRequest doesn't exist", "Device verification failed")
+    // Like upstream, only the newest request of a device can be approved
+    // Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Api/Auth/Controllers/AuthRequestsController.cs>
+    if data.request_approved
+        && AuthRequest::find_by_user_and_requested_device(
+            &headers.user.uuid,
+            &auth_request.request_device_identifier,
+            &conn,
+        )
+        .await
+        .is_none_or(|newest| newest.uuid != auth_request.uuid)
+    {
+        err!("This request is no longer valid. Make sure to approve the most recent request.")
     }
 
+    // Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Core/Auth/Services/Implementations/AuthRequestService.cs>
     if auth_request.approved.is_some() {
-        err!("An authentication request with the same device already exists")
+        err!("An authentication request with the same device already exists.")
     }
 
-    // Set the date now so that the response returns it
+    if auth_request.is_expired() {
+        err_code!("Resource not found.", "Request has expired", Status::NotFound.code)
+    }
+
+    // Like upstream, any device of the user can answer
+    let Some(device) = Device::find_by_uuid_and_user(&data.device_identifier, &headers.user.uuid, &conn).await else {
+        err!("Invalid device.")
+    };
+    auth_request.response_device_id = Some(device.uuid);
+
+    // Like upstream, a denial is kept as the answer, which is not pushed, but which the asking device sees when it checks
+    auth_request.approved = Some(data.request_approved);
     auth_request.response_date = Some(Utc::now().naive_utc());
+    if data.request_approved {
+        auth_request.enc_key = data.key;
+        auth_request.master_password_hash = data.master_password_hash;
+    }
+    if !auth_request.save_answer(&conn).await? {
+        err!("An authentication request with the same device already exists.")
+    }
 
     if data.request_approved {
-        auth_request.approved = Some(data.request_approved);
-        auth_request.enc_key = Some(data.key);
-        auth_request.master_password_hash = data.master_password_hash;
-        auth_request.response_device_id = Some(data.device_identifier.clone());
-        auth_request.save(&conn).await?;
-
         ant.send_auth_response(&auth_request.user_uuid, &auth_request.uuid).await;
         nt.send_auth_response(&auth_request.user_uuid, &auth_request.uuid, &headers.device, &conn).await;
-
-        log_user_event(
-            EventType::OrganizationUserApprovedAuthRequest,
-            &headers.user.uuid,
-            headers.device.atype,
-            &headers.ip.ip,
-            &conn,
-        )
-        .await;
-    } else {
-        // If denied, there's no reason to keep the request
-        auth_request.delete(&conn).await?;
-        log_user_event(
-            EventType::OrganizationUserRejectedAuthRequest,
-            &headers.user.uuid,
-            headers.device.atype,
-            &headers.ip.ip,
-            &conn,
-        )
-        .await;
     }
 
     Ok(Json(auth_request.to_json()))
@@ -2783,37 +2810,52 @@ async fn get_auth_request_response(
 ) -> JsonResult {
     crate::ratelimit::check_limit_unauthenticated(&client_headers.ip.ip)?;
 
+    // Like upstream's `GetValidatedAuthRequestAsync`, anything but a valid request is not found
     let Some(auth_request) = AuthRequest::find_by_uuid(&auth_request_id, &conn).await else {
-        err!("AuthRequest doesn't exist", "User not found")
+        err_code!("Resource not found.", "Record not found", Status::NotFound.code)
     };
 
+    // Unlike upstream, from the IP that asked
     if auth_request.device_type != client_headers.device_type
         || auth_request.request_ip != client_headers.ip.ip.to_string()
         || !auth_request.check_access_code(code)
     {
-        err!("AuthRequest doesn't exist", "Invalid device, IP or code")
+        err_code!("Resource not found.", "Invalid device, IP or code", Status::NotFound.code)
+    }
+
+    if auth_request.is_expired() {
+        err_code!("Resource not found.", "Request has expired", Status::NotFound.code)
     }
 
     Ok(Json(auth_request.to_json()))
 }
 
-// Now unused but not yet removed
-// cf https://github.com/bitwarden/clients/blob/9b2fbdba1c028bf3394064609630d2ec224baefa/libs/common/src/services/api.service.ts#L245
+/// Like upstream, every request of the user
 #[get("/auth-requests")]
 async fn get_auth_requests(headers: Headers, conn: DbConn) -> JsonResult {
-    get_auth_requests_pending(headers, conn).await
-}
-
-#[get("/auth-requests/pending")]
-async fn get_auth_requests_pending(headers: Headers, conn: DbConn) -> JsonResult {
     let auth_requests = AuthRequest::find_by_user(&headers.user.uuid, &conn).await;
 
     Ok(Json(json!({
-        "data": auth_requests
-            .iter()
-            .filter(|request| request.approved.is_none())
-            .map(AuthRequest::to_json)
-            .collect::<Vec<Value>>(),
+        "data": auth_requests.iter().map(AuthRequest::to_json).collect::<Vec<Value>>(),
+        "continuationToken": null,
+        "object": "list"
+    })))
+}
+
+/// Like upstream's `PendingAuthRequestResponseModel`, the pending request of each device, with the device if it is known
+#[get("/auth-requests/pending")]
+async fn get_auth_requests_pending(headers: Headers, conn: DbConn) -> JsonResult {
+    let mut auth_requests = Vec::new();
+    for auth_request in AuthRequest::find_pending_by_user(&headers.user.uuid, &conn).await {
+        let device =
+            Device::find_by_uuid_and_user(&auth_request.request_device_identifier, &headers.user.uuid, &conn).await;
+        let mut json = auth_request.to_json();
+        json["requestDeviceId"] = json!(device.map(|device| device.uuid));
+        auth_requests.push(json);
+    }
+
+    Ok(Json(json!({
+        "data": auth_requests,
         "continuationToken": null,
         "object": "list"
     })))
@@ -2884,6 +2926,33 @@ mod tests {
         ] {
             let err = validate_device_keydata(&updates, &devices).unwrap_err();
             assert!(format!("{err}").contains(expected), "expected {expected:?}, got {err}");
+        }
+    }
+
+    #[test]
+    fn an_auth_request_needs_its_type() {
+        let mut body = serde_json::json!({
+            "accessCode": "code",
+            "deviceIdentifier": "device",
+            "email": "user@example.com",
+            "publicKey": "key"
+        });
+        let request: AuthRequestRequest = serde_json::from_value(body.clone()).unwrap();
+        assert!(request.validate().is_err());
+
+        body["type"] = serde_json::json!(2);
+        let request: AuthRequestRequest = serde_json::from_value(body.clone()).unwrap();
+        assert!(request.validate().is_ok());
+        assert_eq!(request.atype(), Some(AuthRequestType::AdminApproval));
+
+        // Upstream's `[Required]` refuses a blank value, and `[StringLength(25)]` a longer access code
+        for (field, value) in
+            [("accessCode", String::from(" ")), ("accessCode", "a".repeat(26)), ("publicKey", String::from("\t "))]
+        {
+            let mut body = body.clone();
+            body[field] = serde_json::json!(value);
+            let request: AuthRequestRequest = serde_json::from_value(body).unwrap();
+            assert!(request.validate().is_err(), "{field}: {value:?}");
         }
     }
 

@@ -417,16 +417,10 @@ async fn password_login(
             )
         };
 
-        let expiration_time = auth_request.creation_date + chrono::Duration::minutes(5);
-        let request_expired = Utc::now().naive_utc() >= expiration_time;
-
-        if auth_request.user_uuid != user.uuid
-            || !auth_request.approved.unwrap_or(false)
-            || auth_request.authentication_date.is_some()
-            || request_expired
-            || ip.ip.to_string() != auth_request.request_ip
-            || !auth_request.check_access_code(password)
-        {
+        // Like upstream, only a request that asked to authenticate can be used to log in. An unlock request or an
+        // administrator's approval only hands the asking device the user key. Unlike upstream, the login has to come
+        // from the IP that asked, within five minutes.
+        if !auth_request.is_valid_for_login(&user.uuid, password) || ip.ip.to_string() != auth_request.request_ip {
             err!(
                 "Username or access code is incorrect. Try again",
                 format!("IP: {}. Username: {log_username}.", ip.ip),
