@@ -586,6 +586,131 @@ pub fn is_valid_email(email: &str) -> bool {
     email_url.domain().is_some() && email_url.path() == "/" && email_url.query().is_none()
 }
 
+/// The decoded byte length of every piece of an `EncString` type, `None` for any length, like upstream.
+fn enc_string_pieces(enc_type: &str) -> Option<&'static [Option<usize>]> {
+    const IV: Option<usize> = Some(16);
+    const MAC: Option<usize> = Some(32);
+    Some(match enc_type {
+        "0" | "AesCbc256_B64" => &[IV, None],
+        "2" | "AesCbc256_HmacSha256_B64" => &[IV, None, MAC],
+        "3" | "4" | "7" | "Rsa2048_OaepSha256_B64" | "Rsa2048_OaepSha1_B64" | "CoseEncrypt0B64" => &[None],
+        "5" | "6" | "Rsa2048_OaepSha256_HmacSha256_B64" | "Rsa2048_OaepSha1_HmacSha256_B64" => &[None, None],
+        _ => return None,
+    })
+}
+
+/// Base64 that may have non-zero padding bits, as upstream accepts.
+fn is_valid_base64_permissive(piece: &str) -> bool {
+    if piece.is_empty() || !piece.len().is_multiple_of(4) {
+        return false;
+    }
+    let data = piece.strip_suffix("==").or_else(|| piece.strip_suffix('=')).unwrap_or(piece);
+    !data.is_empty() && data.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+}
+
+/// The number of bytes a valid base64 piece decodes to: three per four characters, less the padding.
+fn decoded_len(piece: &str) -> usize {
+    let padding = piece.len() - piece.trim_end_matches('=').len();
+    piece.len() / 4 * 3 - padding
+}
+
+/// Like upstream's `EncryptedStringAttribute`: `<type>.<piece>|<piece>...`, or the header-less legacy forms. As lenient
+/// as upstream's model validation, unlike [`is_valid_rsa_encrypted_string`], which is as strict as the clients' parser.
+/// Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Core/Utilities/EncryptedStringAttribute.cs>
+pub fn is_valid_enc_string(value: &str) -> bool {
+    let (pieces, data) = match value.split_once('.') {
+        // A number header is read as a byte
+        Some((header, data)) => match header.parse::<u8>() {
+            Ok(number) => (enc_string_pieces(&number.to_string()), data),
+            Err(_) => (enc_string_pieces(header), data),
+        },
+        None if value.matches('|').count() == 2 => (enc_string_pieces("2"), value),
+        None => (enc_string_pieces("0"), value),
+    };
+    let Some(pieces) = pieces else {
+        return false;
+    };
+
+    let parts: Vec<&str> = data.split('|').collect();
+    parts.len() == pieces.len()
+        && parts.iter().zip(pieces).all(|(part, length)| {
+            is_valid_base64_permissive(part) && length.is_none_or(|length| decoded_len(part) == length)
+        })
+}
+
+/// Upstream's `[EncryptedString]` on a field: refuses a value, if there is one, that isn't an `EncString`.
+pub fn validate_enc_string(field: &str, value: Option<&str>) -> Result<(), crate::Error> {
+    if value.is_some_and(|value| !is_valid_enc_string(value)) {
+        err!(format!("{field} is not a valid encrypted string."))
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod enc_string_tests {
+    use super::{is_valid_enc_string, validate_enc_string};
+
+    #[test]
+    fn a_missing_value_passes_and_an_invalid_one_names_its_field() {
+        assert!(validate_enc_string("Key", None).is_ok());
+        assert!(validate_enc_string("Key", Some("4.Y2lwaGVy")).is_ok());
+        let err = validate_enc_string("Key", Some("not-an-enc-string")).unwrap_err();
+        assert_eq!(err.message(), "Key is not a valid encrypted string.");
+    }
+
+    const IV: &str = "AAAAAAAAAAAAAAAAAAAAAA==";
+    const MAC: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    #[test]
+    fn well_formed_enc_strings_are_accepted() {
+        for value in [
+            format!("0.{IV}|Y2lwaGVy"),
+            format!("2.{IV}|Y2lwaGVy|{MAC}"),
+            String::from("3.Y2lwaGVy"),
+            String::from("4.Y2lwaGVy"),
+            String::from("5.Y2lwaGVy|bWFj"),
+            String::from("6.Y2lwaGVy|bWFj"),
+            String::from("7.Y29zZWJ5dGVz"),
+            String::from("07.Y29zZWJ5dGVz"),
+            String::from("Rsa2048_OaepSha1_B64.Y2lwaGVy"),
+            format!("AesCbc256_HmacSha256_B64.{IV}|Y2lwaGVy|{MAC}"),
+            format!("{IV}|Y2lwaGVy"),
+            format!("{IV}|Y2lwaGVy|{MAC}"),
+            String::from("4.QR=="),
+        ] {
+            assert!(is_valid_enc_string(&value), "{value}");
+        }
+    }
+
+    #[test]
+    fn anything_else_is_refused() {
+        for value in [
+            String::new(),
+            String::from("not-an-enc-string"),
+            String::from("2."),
+            String::from(".Y2lwaGVy"),
+            format!("1.{IV}|Y2lwaGVy|{MAC}"),
+            String::from("8.Y2lwaGVy"),
+            String::from("256.Y2lwaGVy"),
+            String::from("-1.Y2lwaGVy"),
+            String::from("AesCbc128_HmacSha256_B64.Y2lwaGVy"),
+            format!("2.{IV}|Y2lwaGVy"),
+            format!("2.{IV}|Y2lwaGVy|{MAC}|Y2lwaGVy"),
+            format!("2.aXY=|Y2lwaGVy|{MAC}"),
+            format!("2.{IV}|Y2lwaGVy|bWFj"),
+            format!("2.{IV}||{MAC}"),
+            String::from("4.Y2lwaGVy|bWFj"),
+            String::from("4.Y2lwaGV"),
+            String::from("4.===="),
+            String::from("4.Y2lw=GVy"),
+            String::from("4.Y2lw-GVy"),
+            String::from("Y2lwaGVy"),
+        ] {
+            assert!(!is_valid_enc_string(&value), "{value}");
+        }
+    }
+}
+
 //
 // Deployment environment methods
 //

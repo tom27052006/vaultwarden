@@ -29,9 +29,9 @@ use crate::{
     db::{
         DbConn,
         models::{
-            AuthRequest, AuthRequestId, Device, DeviceId, DeviceType, EventType, Invitation, OIDCCodeResponseError,
-            OrganizationApiKey, OrganizationId, SendId, SsoAuth, SsoUser, TwoFactor, TwoFactorIncomplete,
-            TwoFactorType, User, UserId,
+            AuthRequest, AuthRequestId, Device, DeviceId, DeviceType, EventType, Invitation, Membership,
+            OIDCCodeResponseError, OrganizationApiKey, OrganizationId, SendId, SsoAuth, SsoUser, TwoFactor,
+            TwoFactorIncomplete, TwoFactorType, User, UserId,
         },
     },
     error::MapResult,
@@ -377,7 +377,7 @@ async fn sso_login(
     // We passed 2FA get auth tokens
     let auth_tokens = sso::redeem(&device, &user, data.client_id, sso_user, sso_auth, user_infos, conn).await?;
 
-    authenticated_response(&user, &mut device, auth_tokens, twofactor_token, conn, ip).await
+    authenticated_response(&user, &mut device, auth_tokens, twofactor_token, true, conn, ip).await
 }
 
 async fn password_login(
@@ -516,7 +516,43 @@ async fn password_login(
 
     let auth_tokens = auth::AuthTokens::new(&device, &user, AuthMethod::Password, data.client_id);
 
-    authenticated_response(&user, &mut device, auth_tokens, twofactor_token, conn, ip).await
+    authenticated_response(&user, &mut device, auth_tokens, twofactor_token, false, conn, ip).await
+}
+
+/// Like upstream, `SSO_TRUSTED_DEVICE_ENCRYPTION` standing for the member decryption type of the SSO organization.
+/// SSO is configured for the whole server, so every membership counts as that organization's. Only for an account with
+/// a master password: one without sets a master password first.
+/// Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Identity/IdentityServer/UserDecryptionOptionsBuilder.cs>
+async fn trusted_device_option(user: &User, device: &Device, conn: &DbConn) -> Option<Value> {
+    if !CONFIG.sso_trusted_device_encryption() || user.password_hash.is_empty() {
+        return None;
+    }
+
+    let (encrypted_private_key, encrypted_user_key) = if device.is_trusted() {
+        (device.encrypted_private_key.as_ref(), device.encrypted_user_key.as_ref())
+    } else {
+        (None, None)
+    };
+
+    let has_login_approving_device = Device::find_by_user(&user.uuid, conn)
+        .await
+        .iter()
+        .any(|other| other.uuid != device.uuid && DeviceType::can_approve_login_requests(other.atype));
+
+    // Like upstream, every active membership counts
+    let has_manage_reset_password_permission = Membership::find_by_user(&user.uuid, conn)
+        .await
+        .iter()
+        .any(|membership| membership.is_not_revoked() && membership.has_manage_reset_password_role());
+
+    Some(json!({
+        "HasAdminApproval": false,
+        "HasLoginApprovingDevice": has_login_approving_device,
+        "HasManageResetPasswordPermission": has_manage_reset_password_permission,
+        "IsTdeOffboarding": false,
+        "EncryptedPrivateKey": encrypted_private_key,
+        "EncryptedUserKey": encrypted_user_key,
+    }))
 }
 
 /// Like upstream's `ClientVersionValidator`, every login needs the `Bitwarden-Client-Version` header, and a V2 account
@@ -584,6 +620,7 @@ async fn authenticated_response(
     device: &mut Device,
     auth_tokens: auth::AuthTokens,
     twofactor_token: Option<String>,
+    sso_login: bool,
     conn: &DbConn,
     ip: &ClientIp,
 ) -> JsonResult {
@@ -643,6 +680,16 @@ async fn authenticated_response(
 
     let account_keys = user.account_keys_json(conn).await;
 
+    let mut user_decryption_options = json!({
+        "HasMasterPassword": has_master_password,
+        "MasterPasswordUnlock": master_password_unlock,
+        "Object": "userDecryptionOptions"
+    });
+
+    if sso_login && let Some(option) = trusted_device_option(user, device, conn).await {
+        user_decryption_options["TrustedDeviceOption"] = option;
+    }
+
     let mut result = json!({
         "access_token": auth_tokens.access_token(),
         "expires_in": auth_tokens.expires_in(),
@@ -657,11 +704,7 @@ async fn authenticated_response(
         "MasterPasswordPolicy": master_password_policy,
         "scope": auth_tokens.scope(),
         "AccountKeys": account_keys,
-        "UserDecryptionOptions": {
-            "HasMasterPassword": has_master_password,
-            "MasterPasswordUnlock": master_password_unlock,
-            "Object": "userDecryptionOptions"
-        },
+        "UserDecryptionOptions": user_decryption_options,
     });
 
     if !user.akey.is_empty() {

@@ -479,6 +479,17 @@ impl Membership {
         }
     }
 
+    /// Revoking moves the status out of the range `MembershipStatus::from_i32` knows.
+    pub fn is_not_revoked(&self) -> bool {
+        MembershipStatus::from_i32(self.status).is_some()
+    }
+
+    /// Owners and Admins hold the account recovery permission by their role, Custom members when granted. Unlike
+    /// `ManageResetPasswordHeaders`, any status counts.
+    pub fn has_manage_reset_password_role(&self) -> bool {
+        self.atype >= MembershipType::Admin || self.grants_custom_permission(CustomPermission::ManageResetPassword)
+    }
+
     fn custom_permission_mut(&mut self, permission: CustomPermission) -> &mut bool {
         match permission {
             CustomPermission::ManageUsers => &mut self.manage_users,
@@ -1931,6 +1942,32 @@ mod tests {
         assert!(!empty.can_edit_any_collection() && !empty.can_view_all_collections());
         assert!(empty.shown_custom_permissions().is_empty());
         assert!(!empty.can_list_all_collections() && !empty.can_list_all_ciphers());
+        test_flag::CUSTOM_ROLES_ENABLED.set(None);
+    }
+
+    #[test]
+    fn the_account_recovery_role_counts_for_every_active_membership() {
+        let mut membership = Membership::new(String::from("user").into(), String::from("org").into(), None);
+        test_flag::CUSTOM_ROLES_ENABLED.set(Some(true));
+
+        for (atype, holds_role) in [(Owner, true), (Admin, true), (Manager, false), (User, false)] {
+            membership.atype = atype as i32;
+            for status in [MembershipStatus::Invited, MembershipStatus::Accepted, MembershipStatus::Confirmed] {
+                membership.status = status as i32;
+                assert!(membership.is_not_revoked());
+                assert_eq!(membership.has_manage_reset_password_role(), holds_role);
+                assert!(membership.revoke());
+                assert!(!membership.is_not_revoked());
+            }
+        }
+
+        membership.atype = Custom as i32;
+        membership.status = MembershipStatus::Invited as i32;
+        membership.manage_reset_password = true;
+        for enabled in [true, false] {
+            test_flag::CUSTOM_ROLES_ENABLED.set(Some(enabled));
+            assert_eq!(membership.has_manage_reset_password_role(), enabled);
+        }
         test_flag::CUSTOM_ROLES_ENABLED.set(None);
     }
 }

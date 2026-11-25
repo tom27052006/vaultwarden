@@ -21,14 +21,14 @@ use crate::{
     db::{
         DbConn, DbPool,
         models::{
-            AuthRequest, AuthRequestId, Cipher, CipherId, Device, DeviceId, DeviceWithAuthRequest, EmergencyAccess,
-            EmergencyAccessId, EventType, Folder, FolderId, Invitation, KeyId, Membership, MembershipId, OrgPolicy,
-            OrgPolicyType, Organization, OrganizationId, Send, SendId, SignatureAlgorithm, User, UserId, UserKdfType,
-            UserSignatureKeyPair,
+            AuthRequest, AuthRequestId, Cipher, CipherId, Device, DeviceId, DeviceType, DeviceWithAuthRequest,
+            EmergencyAccess, EmergencyAccessId, EventType, Folder, FolderId, Invitation, KeyId, Membership,
+            MembershipId, OrgPolicy, OrgPolicyType, Organization, OrganizationId, Send, SendId, SignatureAlgorithm,
+            User, UserId, UserKdfType, UserSignatureKeyPair,
         },
     },
     mail,
-    util::{NumberOrString, deser_opt_nonempty_str, format_date},
+    util::{NumberOrString, deser_opt_nonempty_str, format_date, validate_enc_string},
 };
 
 use super::{
@@ -74,6 +74,13 @@ pub fn routes() -> Vec<rocket::Route> {
         put_device_token,
         put_clear_device_token,
         post_clear_device_token,
+        put_device_keys,
+        post_device_keys,
+        post_device_retrieve_keys,
+        post_devices_untrust,
+        post_devices_lost_trust,
+        delete_device,
+        post_deactivate_device,
         get_tasks,
         post_auth_request,
         get_auth_request,
@@ -1231,6 +1238,14 @@ struct RotateAccountUnlockData {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct UpdateDeviceKeysData {
+    device_id: DeviceId,
+    encrypted_user_key: String,
+    encrypted_public_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct MasterPasswordUnlockData {
     #[serde(flatten)]
     kdf: KDFData,
@@ -1242,7 +1257,7 @@ struct MasterPasswordUnlockData {
     contained_key_id: Option<KeyId>,
 }
 
-/// The unlock data of both rotation endpoints; passkey and device keys are ignored, as we support neither.
+/// The unlock data of both rotation endpoints; passkey keys remain unsupported.
 ///
 /// Ref: <https://github.com/bitwarden/server/blob/9030c42bf7d8f9ac2ff9fee85c39588d5eb81499/src/Api/KeyManagement/Models/Requests/CommonUnlockDataRequestModel.cs#L7-L14>
 #[derive(Deserialize)]
@@ -1252,8 +1267,7 @@ struct CommonUnlockData {
     organization_account_recovery_unlock_data: Vec<UpdateResetPasswordData>,
     #[expect(dead_code, reason = "Required like upstream, but unused")]
     passkey_unlock_data: Vec<Value>,
-    #[expect(dead_code, reason = "Required like upstream, but unused")]
-    device_key_unlock_data: Vec<Value>,
+    device_key_unlock_data: Vec<UpdateDeviceKeysData>,
     v2_upgrade_token: Option<V2UpgradeTokenData>,
 }
 
@@ -1272,6 +1286,28 @@ struct RotateAccountData {
     ciphers: Vec<CipherData>,
     folders: Vec<UpdateFolderData>,
     sends: Vec<SendData>,
+}
+
+/// The new keys of every trusted device; entries for any other device are ignored, like upstream.
+/// Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Api/KeyManagement/Validators/DeviceRotationValidator.cs>
+fn validate_device_keydata(
+    updates: &[UpdateDeviceKeysData],
+    existing_devices: &[Device],
+) -> ApiResult<Vec<(DeviceId, String, String)>> {
+    for update in updates {
+        validate_enc_string("EncryptedPublicKey", Some(&update.encrypted_public_key))?;
+        validate_enc_string("EncryptedUserKey", Some(&update.encrypted_user_key))?;
+    }
+
+    let mut rotated = Vec::new();
+    for device in existing_devices.iter().filter(|device| device.is_trusted()) {
+        let Some(update) = updates.iter().find(|update| update.device_id == device.uuid) else {
+            err!("All existing trusted devices must be included in the rotation.")
+        };
+        rotated.push((device.uuid.clone(), update.encrypted_user_key.clone(), update.encrypted_public_key.clone()));
+    }
+
+    Ok(rotated)
 }
 
 /// Body of `rotate-user-keys`, which rotates the keys without touching the master password.
@@ -1483,10 +1519,24 @@ async fn get_key_rotation_data(headers: Headers, conn: DbConn) -> JsonResult {
         }));
     }
 
+    let trusted_device_data: Vec<_> = Device::find_by_user(user_id, &conn)
+        .await
+        .into_iter()
+        .filter(Device::is_trusted)
+        .map(|device| {
+            json!({
+                "id": device.uuid,
+                "encryptedPublicKey": device.encrypted_public_key,
+                "encryptedUserKey": device.encrypted_user_key,
+                "object": "trustedDeviceKeyData",
+            })
+        })
+        .collect();
+
     Ok(Json(json!({
         "organizationPasswordResetKeyData": organization_data,
         "emergencyAccessKeyData": emergency_access_data,
-        "trustedDeviceKeyData": [],
+        "trustedDeviceKeyData": trusted_device_data,
         "passkeyKeyData": [],
         "object": "keyRotationData",
     })))
@@ -1649,6 +1699,7 @@ async fn rotate_account(data: RotateData, headers: Headers, conn: DbConn, nt: No
     // We only rotate the reset password key if it is set.
     existing_memberships.retain(|m| m.reset_password_key.is_some());
     let mut existing_sends = Send::find_by_user(user_id, &conn).await;
+    let existing_devices = Device::find_by_user(user_id, &conn).await;
 
     validate_rotation_data(
         &data,
@@ -1658,6 +1709,8 @@ async fn rotate_account(data: RotateData, headers: Headers, conn: DbConn, nt: No
         &existing_memberships,
         &existing_sends,
     )?;
+
+    let rotated_devices = validate_device_keydata(&data.unlock_data.device_key_unlock_data, &existing_devices)?;
 
     // Like upstream, a client that rotates a user key that was already replaced has to sync first
     // Ref: <https://github.com/bitwarden/server/blob/15c94ac58bf361a162381749c146d254a21b2098/src/Core/KeyManagement/UserKey/Models/Data/BaseRotateUserAccountKeysData.cs#L34-L46>
@@ -1770,6 +1823,8 @@ async fn rotate_account(data: RotateData, headers: Headers, conn: DbConn, nt: No
             rotate_cipher_data(saved_cipher, cipher_data, &headers, &conn, &nt).await?;
         }
     }
+
+    Device::update_keys_for_rotation(&headers.user.uuid, rotated_devices, &conn).await?;
 
     // Update user data
     let mut user = headers.user;
@@ -2458,6 +2513,123 @@ async fn post_clear_device_token(device_id: DeviceId, ip: ClientIp, conn: DbConn
     put_clear_device_token(device_id, ip, conn).await
 }
 
+// Trusted device encryption
+// Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Api/Controllers/DevicesController.cs>
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrustedDeviceKeysData {
+    encrypted_user_key: String,
+    encrypted_public_key: String,
+    encrypted_private_key: String,
+}
+
+#[put("/devices/<device_id>/keys", data = "<data>")]
+async fn put_device_keys(
+    device_id: DeviceId,
+    data: Json<TrustedDeviceKeysData>,
+    headers: Headers,
+    conn: DbConn,
+) -> JsonResult {
+    let data = data.into_inner();
+
+    validate_enc_string("EncryptedUserKey", Some(&data.encrypted_user_key))?;
+    validate_enc_string("EncryptedPublicKey", Some(&data.encrypted_public_key))?;
+    validate_enc_string("EncryptedPrivateKey", Some(&data.encrypted_private_key))?;
+
+    let Some(mut device) = Device::find_by_uuid_and_user(&device_id, &headers.user.uuid, &conn).await else {
+        err_code!("Resource not found.", "No device found", Status::NotFound.code)
+    };
+
+    device.encrypted_user_key = Some(data.encrypted_user_key);
+    device.encrypted_public_key = Some(data.encrypted_public_key);
+    device.encrypted_private_key = Some(data.encrypted_private_key);
+    device.save_trust_keys(&conn).await?;
+
+    Ok(Json(device.to_json()))
+}
+
+#[post("/devices/<device_id>/keys", data = "<data>")]
+async fn post_device_keys(
+    device_id: DeviceId,
+    data: Json<TrustedDeviceKeysData>,
+    headers: Headers,
+    conn: DbConn,
+) -> JsonResult {
+    put_device_keys(device_id, data, headers, conn).await
+}
+
+#[post("/devices/<device_id>/retrieve-keys")]
+async fn post_device_retrieve_keys(device_id: DeviceId, headers: Headers, conn: DbConn) -> JsonResult {
+    let Some(device) = Device::find_by_uuid_and_user(&device_id, &headers.user.uuid, &conn).await else {
+        err_code!("Resource not found.", "No device found", Status::NotFound.code)
+    };
+
+    Ok(Json(device.to_protected_json()))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UntrustDevicesData {
+    devices: Vec<DeviceId>,
+}
+
+#[post("/devices/untrust", data = "<data>")]
+async fn post_devices_untrust(data: Json<UntrustDevicesData>, headers: Headers, conn: DbConn) -> EmptyResult {
+    let data = data.into_inner();
+
+    let owned: HashSet<DeviceId> =
+        Device::find_by_user(&headers.user.uuid, &conn).await.into_iter().map(|device| device.uuid).collect();
+
+    if let Some(unknown) = data.devices.iter().find(|device_id| !owned.contains(*device_id)) {
+        err_code!(
+            "Unauthorized.",
+            format!("User {} does not have access to device {unknown}", headers.user.uuid),
+            Status::Unauthorized.code
+        )
+    }
+
+    Device::untrust_many(&headers.user.uuid, data.devices, &conn).await
+}
+
+// No `POST /devices/update-trust`: no client calls it, the key rotation re-wraps the device keys, and upstream removed
+// it for that reason.
+// Ref: <https://github.com/bitwarden/server/commit/9edf11112df3de36de87b20635f9f1ac591fd883>
+
+#[expect(clippy::needless_pass_by_value, reason = "Not beneficial for Headers")]
+#[post("/devices/lost-trust")]
+fn post_devices_lost_trust(headers: Headers) -> EmptyResult {
+    error!(
+        "User {} has a device key, but didn't receive decryption keys for device {} of type {}",
+        headers.user.uuid,
+        headers.device.uuid,
+        DeviceType::from_i32(headers.device.atype)
+    );
+
+    Ok(())
+}
+
+/// Upstream deactivates the device, which hides it and drops its keys. Removing it does both here, and also ends its
+/// session, as its refresh token goes with it.
+/// Ref: <https://github.com/bitwarden/server/blob/341acc9d3d8988cec8fe05debfa6d557cf5ab749/src/Core/Services/Implementations/DeviceService.cs>
+#[delete("/devices/<device_id>")]
+async fn delete_device(device_id: DeviceId, headers: Headers, conn: DbConn) -> EmptyResult {
+    let Some(device) = Device::find_by_uuid_and_user(&device_id, &headers.user.uuid, &conn).await else {
+        err_code!("Resource not found.", "No device found", Status::NotFound.code)
+    };
+
+    if let Err(e) = unregister_push_device(device.push_uuid.as_ref()).await {
+        error!("Unable to unregister the device {} from the push relay: {e}", device.uuid);
+    }
+
+    device.delete(&conn).await
+}
+
+#[post("/devices/<device_id>/deactivate")]
+async fn post_deactivate_device(device_id: DeviceId, headers: Headers, conn: DbConn) -> EmptyResult {
+    delete_device(device_id, headers, conn).await
+}
+
 #[get("/tasks")]
 fn get_tasks(_client_headers: ClientHeaders) -> JsonResult {
     Ok(Json(json!({
@@ -2660,6 +2832,61 @@ pub async fn purge_auth_requests(pool: DbPool) {
 mod tests {
     use super::*;
 
+    const AES_KEY: &str = "2.AAAAAAAAAAAAAAAAAAAAAA==|Y2lwaGVy|AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    fn device(id: &str, trusted: bool) -> Device {
+        let mut device = Device::new(id.to_owned().into(), String::from("user").into(), String::new(), 9);
+        if trusted {
+            device.encrypted_user_key = Some(String::from("4.b2xk"));
+            device.encrypted_public_key = Some(String::from(AES_KEY));
+            device.encrypted_private_key = Some(String::from(AES_KEY));
+        }
+        device
+    }
+
+    fn update(device_id: &str) -> UpdateDeviceKeysData {
+        UpdateDeviceKeysData {
+            device_id: device_id.to_owned().into(),
+            encrypted_user_key: String::from("4.bmV3"),
+            encrypted_public_key: String::from(AES_KEY),
+        }
+    }
+
+    fn rotated(result: &[(DeviceId, String, String)]) -> Vec<String> {
+        result.iter().map(|(device_id, ..)| device_id.to_string()).collect()
+    }
+
+    #[test]
+    fn only_trusted_devices_are_rotated() {
+        let mut half_trusted = device("d", true);
+        half_trusted.encrypted_user_key = None;
+        let devices = [device("a", true), device("b", true), device("c", false), half_trusted];
+
+        // Entries for untrusted, unknown or repeated devices are ignored, like upstream.
+        let updates = [update("a"), update("b"), update("b"), update("c"), update("d"), update("stranger")];
+        assert_eq!(rotated(&validate_device_keydata(&updates, &devices).unwrap()), ["a", "b"]);
+        assert_eq!(rotated(&validate_device_keydata(&[update("a"), update("b")], &devices).unwrap()), ["a", "b"]);
+        assert_eq!(rotated(&validate_device_keydata(&[], &devices[2..]).unwrap()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_rotation_must_cover_every_trusted_device_with_valid_keys() {
+        let devices = [device("a", true), device("b", true)];
+        let mut bad_user_key = update("a");
+        bad_user_key.encrypted_user_key = String::from("not an enc string");
+        let mut bad_public_key = update("c");
+        bad_public_key.encrypted_public_key = String::new();
+
+        for (updates, expected) in [
+            (vec![update("a")], "All existing trusted devices must be included"),
+            (vec![bad_user_key, update("b")], "EncryptedUserKey"),
+            (vec![update("a"), update("b"), bad_public_key], "EncryptedPublicKey"),
+        ] {
+            let err = validate_device_keydata(&updates, &devices).unwrap_err();
+            assert!(format!("{err}").contains(expected), "expected {expected:?}, got {err}");
+        }
+    }
+
     #[cfg(sqlite)]
     fn account_keys(name: &str, v2: bool) -> ValidatedAccountKeys {
         ValidatedAccountKeys {
@@ -2709,6 +2936,29 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn rotation_requires_device_key_unlock_data() {
+        let mut unlock_data = serde_json::json!({
+            "emergencyAccessUnlockData": [],
+            "masterPasswordUnlockData": {
+                "kdfType": 0,
+                "kdfIterations": 600_000,
+                "email": "user@example.com",
+                "masterKeyAuthenticationHash": "hash",
+                "masterKeyEncryptedUserKey": "key"
+            },
+            "organizationAccountRecoveryUnlockData": [],
+            "passkeyUnlockData": [],
+            "deviceKeyUnlockData": []
+        });
+
+        let data: RotateAccountUnlockData = serde_json::from_value(unlock_data.clone()).unwrap();
+        assert!(data.common.device_key_unlock_data.is_empty());
+
+        unlock_data.as_object_mut().unwrap().remove("deviceKeyUnlockData");
+        assert!(serde_json::from_value::<RotateAccountUnlockData>(unlock_data).is_err());
     }
 
     #[test]
