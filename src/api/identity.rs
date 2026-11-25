@@ -161,9 +161,8 @@ async fn refresh_login(data: ConnectData, conn: &DbConn, ip: &ClientIp) -> JsonR
                 format!("Unable to refresh login credentials: {}", err.message())
             )
         }
-        Ok((mut device, auth_tokens)) => {
-            // Save to update `device.updated_at` to track usage and toggle new status
-            device.save(true, conn).await?;
+        Ok((_device, auth_tokens)) => {
+            // `refresh_tokens` saved `device.updated_at` already, only while the refresh token was still the device's
 
             let result = json!({
                 "refresh_token": auth_tokens.refresh_token(),
@@ -616,6 +615,10 @@ async fn authenticated_response(
 
     // Save to update `device.updated_at` to track usage and toggle new status
     device.save(true, conn).await?;
+    // The remembered two-step login this login issued, see `twofactor_auth`
+    if twofactor_token.is_some() {
+        device.save_twofactor_remember(conn).await?;
+    }
 
     let master_password_policy = identity_master_password_policy(user, conn).await;
 
@@ -861,9 +864,9 @@ async fn get_device(data: &ConnectData, conn: &DbConn, user: &User) -> ApiResult
     if let Some(device) = Device::find_by_uuid_and_user(&device_id, &user.uuid, conn).await {
         Ok(device)
     } else {
-        let mut device = Device::new(device_id, user.uuid.clone(), device_name, device_type);
+        let device = Device::new(device_id, user.uuid.clone(), device_name, device_type);
         // save device without updating `device.updated_at`
-        device.save(false, conn).await?;
+        device.create(conn).await?;
         Ok(device)
     }
 }
@@ -946,7 +949,7 @@ async fn twofactor_auth(
                     if device.twofactor_remember.is_some() {
                         device.delete_twofactor_remember();
                         // We need to save here, since we send a err_json!() which prevents saving `device` at a later stage
-                        device.save(true, conn).await?;
+                        device.save_twofactor_remember(conn).await?;
                     }
                     err_json!(
                         json_err_twofactor(&twofactor_ids, user, data, conn).await?,

@@ -953,10 +953,7 @@ async fn post_keys(data: Json<PostKeysData>, headers: Headers, conn: DbConn) -> 
         .into(),
     };
 
-    account_keys.apply(&mut user)?;
-    // The key pair first, as in a rotation: if saving the user then fails, the account stays without keys
-    account_keys.save_signature_key_pair(&user.uuid, &conn).await?;
-    user.save(&conn).await?;
+    save_initial_account_keys(&account_keys, &mut user, &conn).await?;
 
     Ok(Json(json!({
         "key": (!user.akey.is_empty()).then_some(&user.akey),
@@ -965,6 +962,20 @@ async fn post_keys(data: Json<PostKeysData>, headers: Headers, conn: DbConn) -> 
         "accountKeys": user.account_keys_json(&conn).await,
         "object":"keys"
     })))
+}
+
+/// Writes the first keys of the account together with its signature key pair, in one transaction like upstream's, and
+/// only while the account still has none: of two requests that set up the keys at once, only one lands, and whole.
+async fn save_initial_account_keys(account_keys: &ValidatedAccountKeys, user: &mut User, conn: &DbConn) -> EmptyResult {
+    account_keys.apply(user)?;
+
+    conn.transaction(async || {
+        if !user.save_if_keys_unset(conn).await? {
+            err!("User has existing keypair")
+        }
+        account_keys.save_signature_key_pair(&user.uuid, conn).await
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -2648,6 +2659,57 @@ pub async fn purge_auth_requests(pool: DbPool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(sqlite)]
+    fn account_keys(name: &str, v2: bool) -> ValidatedAccountKeys {
+        ValidatedAccountKeys {
+            private_key: format!("2.{name}-private"),
+            public_key: format!("{name}-public"),
+            v2: v2.then(|| ValidatedV2AccountKeys {
+                signed_public_key: format!("{name}-signed-public"),
+                signing_key: format!("{name}-signing"),
+                verifying_key: format!("{name}-verifying"),
+                signature_algorithm: SignatureAlgorithm::Ed25519,
+                security_state: format!("{name}-security-state"),
+                security_version: 2,
+            }),
+        }
+    }
+
+    /// Two key setups of one account read it before either wrote: only the first lands, and the second leaves neither
+    /// its key pair on the user nor its signature key pair behind.
+    #[cfg(sqlite)]
+    #[test]
+    fn only_one_of_two_concurrent_key_setups_lands() {
+        crate::db::test_db::run(async |db| {
+            let conn = db.conn();
+            for v2 in [true, false] {
+                let mut user = User::new(&format!("{}@example.com", crate::util::get_uuid()), None);
+                user.save(&conn).await.unwrap();
+                let mut first = User::find_by_uuid(&user.uuid, &conn).await.unwrap();
+                let mut second = User::find_by_uuid(&user.uuid, &conn).await.unwrap();
+
+                save_initial_account_keys(&account_keys("first", v2), &mut first, &conn).await.unwrap();
+                let err = save_initial_account_keys(&account_keys("second", v2), &mut second, &conn).await.unwrap_err();
+                assert_eq!(err.message(), "User has existing keypair");
+
+                let saved = User::find_by_uuid(&user.uuid, &conn).await.unwrap();
+                assert_eq!(saved.private_key.as_deref(), Some("2.first-private"));
+                assert_eq!(saved.public_key.as_deref(), Some("first-public"));
+                let pair = UserSignatureKeyPair::find_by_user(&user.uuid, &conn).await;
+                if v2 {
+                    assert_eq!(saved.signed_public_key.as_deref(), Some("first-signed-public"));
+                    let pair = pair.unwrap();
+                    assert_eq!(
+                        (pair.signing_key.as_str(), pair.verifying_key.as_str()),
+                        ("first-signing", "first-verifying")
+                    );
+                } else {
+                    assert!(saved.signed_public_key.is_none() && pair.is_none());
+                }
+            }
+        });
+    }
 
     #[test]
     fn test_register_data_current_format() {

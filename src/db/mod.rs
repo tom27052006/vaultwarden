@@ -568,7 +568,9 @@ mod postgresql_migrations {
     }
 }
 
-/// A throwaway SQLite database with the real schema, for tests that need to run queries.
+/// A throwaway SQLite database with the real schema, for tests that need to run queries. With `VW_TEST_DATABASE_URL`
+/// set to a MySQL or PostgreSQL server, as `mysql://user:password@host:3306` or `postgresql://user:password@host:5432`,
+/// a new database on that server instead.
 #[cfg(all(test, sqlite))]
 pub mod test_db {
     use super::{DbConn, DbConnManager, sqlite_migrations::MIGRATIONS};
@@ -580,18 +582,57 @@ pub mod test_db {
     pub struct TestDb {
         pool: Pool<DbConnManager>,
         // Keep the named in-memory database alive across pooled connections.
-        _keeper: SqliteConnection,
+        _keeper: Option<SqliteConnection>,
     }
 
     impl TestDb {
         fn new() -> Self {
+            if let Ok(server) = std::env::var("VW_TEST_DATABASE_URL") {
+                return Self::on_server(server.trim_end_matches('/'));
+            }
             let url = format!("sqlite://{}?mode=memory&cache=shared", crate::util::get_uuid());
             let mut keeper = SqliteConnection::establish(&url).unwrap();
             keeper.run_pending_migrations(MIGRATIONS).unwrap();
             let pool = Pool::builder().max_size(2).build(DbConnManager::new(&url)).unwrap();
             Self {
                 pool,
-                _keeper: keeper,
+                _keeper: Some(keeper),
+            }
+        }
+
+        /// A new database on the server, migrated as on startup
+        fn on_server(server: &str) -> Self {
+            let name = format!("vw_test_{}", crate::util::get_uuid().replace('-', ""));
+            let url = format!("{server}/{name}");
+            let created = match server.split(':').next() {
+                #[cfg(mysql)]
+                Some("mysql") => {
+                    let mut admin = diesel::mysql::MysqlConnection::establish(server).unwrap();
+                    admin
+                        .batch_execute(&format!(
+                            "CREATE DATABASE {name} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                        ))
+                        .unwrap();
+                    super::mysql_migrations::run_migrations(&url).unwrap();
+                    true
+                }
+                #[cfg(postgresql)]
+                Some("postgresql" | "postgres") => {
+                    let mut admin = diesel::pg::PgConnection::establish(&format!("{server}/postgres")).unwrap();
+                    admin.batch_execute(&format!("CREATE DATABASE {name}")).unwrap();
+                    super::postgresql_migrations::run_migrations(&url).unwrap();
+                    true
+                }
+                _ => false,
+            };
+            assert!(
+                created,
+                "`VW_TEST_DATABASE_URL` needs a mysql:// or postgresql:// URL and the feature of its database"
+            );
+            let pool = Pool::builder().max_size(2).build(DbConnManager::new(&url)).unwrap();
+            Self {
+                pool,
+                _keeper: None,
             }
         }
 

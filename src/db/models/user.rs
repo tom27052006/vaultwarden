@@ -6,7 +6,7 @@ use std::cmp;
 
 use crate::{
     CONFIG,
-    api::EmptyResult,
+    api::{ApiResult, EmptyResult},
     auth::DEFAULT_ACCESS_VALIDITY,
     crypto,
     db::{
@@ -504,6 +504,26 @@ impl User {
         } else {
             Ok(())
         }
+    }
+
+    /// Saves the user, but only while the account still has no key pair: of two requests that set up its keys at
+    /// once, one succeeds and the other gets false, instead of the two mixing their keys.
+    pub async fn save_if_keys_unset(&mut self, conn: &DbConn) -> ApiResult<bool> {
+        self.updated_at = Utc::now().naive_utc();
+
+        conn.run(move |conn| {
+            diesel::update(
+                users::table
+                    .filter(users::uuid.eq(&self.uuid))
+                    .filter(users::private_key.is_null())
+                    .filter(users::public_key.is_null()),
+            )
+            .set(&*self)
+            .execute(conn)
+            .map(|updated| updated == 1)
+            .map_res("Error saving user")
+        })
+        .await
     }
 
     pub async fn delete(&self, conn: &DbConn) -> EmptyResult {

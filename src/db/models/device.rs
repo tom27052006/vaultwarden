@@ -15,9 +15,10 @@ use macros::{IdFromParam, UuidFromParam};
 
 use super::{AuthRequest, UserId};
 
-#[derive(Identifiable, Queryable, Insertable, AsChangeset)]
+// No `AsChangeset`: every write names its columns, so that a device read before a concurrent change, as a revoked
+// session or a removal, can't undo that change when it is written back. See `Device::save`.
+#[derive(Identifiable, Queryable, Insertable)]
 #[diesel(table_name = devices)]
-#[diesel(treat_none_as_null = true)]
 #[diesel(primary_key(uuid, user_uuid))]
 pub struct Device {
     pub uuid: DeviceId,
@@ -140,35 +141,80 @@ impl DeviceWithAuthRequest {
 
 /// Database methods
 impl Device {
+    /// Inserts a new device. A known device is only ever updated, by the methods below, so that a request that read it
+    /// before it was removed can't bring it back.
+    pub async fn create(&self, conn: &DbConn) -> EmptyResult {
+        conn.run(move |conn| {
+            crate::util::retry(|| diesel::insert_into(devices::table).values(self).execute(conn), 10)
+                .map_res("Error saving device")
+        })
+        .await
+    }
+
+    /// Saves the activity and the push registration of the device, its `updated_at` with `update_time`, but only while
+    /// this copy is of the current session. A logout or a security stamp change replaces the refresh token and a
+    /// removal drops the device, and either makes this fail, instead of writing back what they replaced or removed.
     pub async fn save(&mut self, update_time: bool, conn: &DbConn) -> EmptyResult {
         if update_time {
             self.updated_at = Utc::now().naive_utc();
         }
+        let device = &*self;
 
-        db_run! { conn:
-            mysql {
-                crate::util::retry(||
-                    diesel::insert_into(devices::table)
-                        .values(&*self)
-                        .on_conflict(diesel::dsl::DuplicatedKeys)
-                        .do_update()
-                        .set(&*self)
-                        .execute(conn),
+        let updated = conn
+            .run(move |conn| {
+                crate::util::retry(
+                    || {
+                        diesel::update(
+                            devices::table
+                                .filter(devices::uuid.eq(&device.uuid))
+                                .filter(devices::user_uuid.eq(&device.user_uuid))
+                                .filter(devices::refresh_token.eq(&device.refresh_token)),
+                        )
+                        .set((
+                            devices::updated_at.eq(device.updated_at),
+                            devices::push_uuid.eq(&device.push_uuid),
+                            devices::push_token.eq(&device.push_token),
+                        ))
+                        .execute(conn)
+                    },
                     10,
-                ).map_res("Error saving device")
-            }
-            postgresql, sqlite {
-                crate::util::retry(||
-                    diesel::insert_into(devices::table)
-                        .values(&*self)
-                        .on_conflict((devices::uuid, devices::user_uuid))
-                        .do_update()
-                        .set(&*self)
-                        .execute(conn),
-                    10,
-                ).map_res("Error saving device")
-            }
+                )
+                .map(|updated| updated == 1)
+                .map_res("Error saving device")
+            })
+            .await?;
+
+        if !updated {
+            err!("The session of this device has ended", format!("Device {} no longer has this session", device.uuid))
         }
+        Ok(())
+    }
+
+    /// Saves the remembered two-step login of the device: a new token only while this copy is of the current session,
+    /// see `save`, its removal in any case.
+    pub async fn save_twofactor_remember(&self, conn: &DbConn) -> EmptyResult {
+        let updated = conn
+            .run(move |conn| {
+                let device =
+                    devices::table.filter(devices::uuid.eq(&self.uuid)).filter(devices::user_uuid.eq(&self.user_uuid));
+                match &self.twofactor_remember {
+                    None => diesel::update(device)
+                        .set(devices::twofactor_remember.eq::<Option<String>>(None))
+                        .execute(conn)
+                        .map(|_| true),
+                    Some(token) => diesel::update(device.filter(devices::refresh_token.eq(&self.refresh_token)))
+                        .set(devices::twofactor_remember.eq(token))
+                        .execute(conn)
+                        .map(|updated| updated == 1),
+                }
+                .map_res("Error saving the remembered two-step login")
+            })
+            .await?;
+
+        if !updated {
+            err!("The session of this device has ended", format!("Device {} no longer has this session", self.uuid))
+        }
+        Ok(())
     }
 
     pub async fn delete_all_by_user(user_uuid: &UserId, conn: &DbConn) -> EmptyResult {
@@ -263,16 +309,32 @@ impl Device {
         .await
     }
 
+    /// Ends the session of every device of the user: a new refresh token invalidates the ones handed out, and the
+    /// remembered two-step login is forgotten.
     pub async fn rotate_refresh_tokens_by_user(user_uuid: &UserId, conn: &DbConn) -> EmptyResult {
+        let device_ids: Vec<DeviceId> = Self::find_by_user(user_uuid, conn).await.into_iter().map(|d| d.uuid).collect();
+
         // Generate a new token per device.
         // We cannot do a single UPDATE with one value because each device needs a unique token.
-        let devices = Self::find_by_user(user_uuid, conn).await;
-        for mut device in devices {
-            device.refresh_token = Self::generate_refresh_token();
-            device.twofactor_remember = None;
-            device.save(false, conn).await?;
-        }
-        Ok(())
+        // Only these two columns: writing back whole devices read before would undo what changed meanwhile, and bring
+        // back a device that was removed.
+        conn.run(move |conn| {
+            conn.transaction(|conn| -> EmptyResult {
+                for device_id in device_ids {
+                    let _: () = diesel::update(
+                        devices::table.filter(devices::uuid.eq(device_id)).filter(devices::user_uuid.eq(&user_uuid)),
+                    )
+                    .set((
+                        devices::refresh_token.eq(Self::generate_refresh_token()),
+                        devices::twofactor_remember.eq::<Option<String>>(None),
+                    ))
+                    .execute(conn)
+                    .map_res("Error rotating the refresh tokens")?;
+                }
+                Ok(())
+            })
+        })
+        .await
     }
 
     pub async fn clear_twofactor_remember_by_user(user_uuid: &UserId, conn: &DbConn) -> EmptyResult {
@@ -388,3 +450,86 @@ pub struct DeviceId(String);
 
 #[derive(Clone, Debug, DieselNewType, Display, From, FromForm, Serialize, Deserialize, UuidFromParam)]
 pub struct PushId(pub String);
+
+#[cfg(all(test, sqlite))]
+mod tests {
+    use super::*;
+
+    async fn saved_device(conn: &DbConn) -> Device {
+        let mut user = crate::db::models::User::new(&format!("{}@example.com", get_uuid()), None);
+        user.save(conn).await.unwrap();
+        let mut device = Device::new(get_uuid().into(), user.uuid, String::new(), 9);
+        device.twofactor_remember = Some(String::from("remembered"));
+        device.create(conn).await.unwrap();
+        device
+    }
+
+    async fn reload(device: &Device, conn: &DbConn) -> Option<Device> {
+        Device::find_by_uuid_and_user(&device.uuid, &device.user_uuid, conn).await
+    }
+
+    /// Each copy below is read before the change it races with, as by a request that is still running when another one
+    /// changes the device, and written back after it.
+    #[test]
+    fn a_device_read_before_a_change_cannot_undo_it() {
+        crate::db::test_db::run(async |db| {
+            let conn = db.conn();
+
+            // A logout or security stamp change: neither the refresh token nor the remembered two-step login come back,
+            // and the copy can't save anything anymore
+            let mut stale = saved_device(&conn).await;
+            Device::rotate_refresh_tokens_by_user(&stale.user_uuid, &conn).await.unwrap();
+            let rotated = reload(&stale, &conn).await.unwrap();
+            stale.push_token = Some(String::from("stale push token"));
+            assert!(stale.save(true, &conn).await.is_err());
+            assert!(stale.save_twofactor_remember(&conn).await.is_err());
+            let saved = reload(&stale, &conn).await.unwrap();
+            assert_eq!(saved.refresh_token, rotated.refresh_token);
+            assert!(saved.twofactor_remember.is_none());
+            assert!(saved.push_token.is_none());
+            // A removal of the remembered two-step login works on any copy
+            stale.delete_twofactor_remember();
+            stale.save_twofactor_remember(&conn).await.unwrap();
+
+            // Two-step login forgotten without a new session, as removing the second factors does: the copy still has the
+            // session and saves its activity, but not the remembered login it read
+            let mut stale = saved_device(&conn).await;
+            Device::clear_twofactor_remember_by_user(&stale.user_uuid, &conn).await.unwrap();
+            stale.save(true, &conn).await.unwrap();
+            assert!(reload(&stale, &conn).await.unwrap().twofactor_remember.is_none());
+
+            // A removal, as the deauthorization of all sessions does: the device stays removed, with its session
+            let mut stale = saved_device(&conn).await;
+            Device::delete_all_by_user(&stale.user_uuid, &conn).await.unwrap();
+            assert!(stale.save(true, &conn).await.is_err());
+            assert!(stale.save_twofactor_remember(&conn).await.is_err());
+            assert!(reload(&stale, &conn).await.is_none());
+        });
+    }
+
+    #[test]
+    fn only_a_new_device_is_inserted() {
+        crate::db::test_db::run(async |db| {
+            let conn = db.conn();
+            let device = saved_device(&conn).await;
+            // Its first save is an insert, a second one fails instead of overwriting it
+            assert!(device.create(&conn).await.is_err());
+
+            // An update never inserts
+            let mut unknown = Device::new(get_uuid().into(), device.user_uuid.clone(), String::new(), 9);
+            assert!(unknown.save(true, &conn).await.is_err());
+            assert!(reload(&unknown, &conn).await.is_none());
+
+            // The current copy saves its activity, push registration and a new remembered two-step login
+            let mut current = reload(&device, &conn).await.unwrap();
+            current.push_token = Some(String::from("push token"));
+            current.save(true, &conn).await.unwrap();
+            current.twofactor_remember = Some(String::from("remembered again"));
+            current.save_twofactor_remember(&conn).await.unwrap();
+            let saved = reload(&device, &conn).await.unwrap();
+            assert_eq!(saved.push_token.as_deref(), Some("push token"));
+            assert_eq!(saved.twofactor_remember.as_deref(), Some("remembered again"));
+            assert_eq!(saved.refresh_token, device.refresh_token);
+        });
+    }
+}
